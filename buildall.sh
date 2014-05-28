@@ -145,12 +145,12 @@ then
   # clean be
   cd $IMPALA_HOME/be
   # remove everything listed in .gitignore
-  git clean -Xdf
+  # git clean -Xdf
 
   # clean shell build artifacts
   cd $IMPALA_HOME/shell
   # remove everything listed in .gitignore
-  git clean -Xdf
+  # git clean -Xdf
 
   # clean llvm
   rm -f $IMPALA_HOME/llvm-ir/impala*.ll

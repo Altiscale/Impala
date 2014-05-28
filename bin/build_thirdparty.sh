@@ -109,7 +109,8 @@ function build_preamble() {
   cd $1
   if [ $CLEAN_ACTION -eq 1 ]; then
     # remove everything that is not checked in
-    git clean -dfx
+    # git clean -dfx
+    echo "ignoring - git clean for $2 in $1"
   fi
 }
 
