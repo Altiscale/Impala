@@ -30,5 +30,5 @@ rm gtest-${IMPALA_GTEST_VERSION}.zip
 
 echo "Fetching snappy"
 wget http://snappy.googlecode.com/files/snappy-${IMPALA_SNAPPY_VERSION}.tar.gz
-tar xpzf --overwrite snappy-${IMPALA_SNAPPY_VERSION}.tar.gz
+tar xpzf snappy-${IMPALA_SNAPPY_VERSION}.tar.gz
 rm snappy-${IMPALA_SNAPPY_VERSION}.tar.gz
