@@ -12,15 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 # Source this file from the $IMPALA_HOME directory to
 # setup your environment. If $IMPALA_HOME is undefined
 # this script will set it to the current working directory.
 
 export JAVA_HOME=${JAVA_HOME-/usr/java/default}
 if [ ! -d $JAVA_HOME ] ; then
+  export JAVA_HOME="/usr/lib/jvm/java-openjdk"
+  echo "ok - trying to look for openjdk path $JAVA_HOME"
+  if [ ! -d $JAVA_HOME ] ; then
     echo "Error! JAVA_HOME must be set to the location of your JDK!"
     exit 1
+  fi
 fi
+echo "ok - exist JAVA_HOME=$JAVA_HOME"
 
 if [ -z $IMPALA_HOME ]; then
     this=${0/-/} # login-shells often have leading '-' chars
@@ -87,16 +93,42 @@ export IMPALA_AUX_DATASET_DIR=$IMPALA_AUX_TEST_HOME/testdata/datasets
 export IMPALA_COMMON_DIR=$IMPALA_HOME/common
 export PATH=$IMPALA_HOME/bin:$PATH
 
-export HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/
-export HADOOP_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
+export HADOOP_HOME=/opt/hadoop
+if [ ! -d "$HADOOP_HOME" ] ; then
+  export HADOOP_HOME=/opt/hadoop-$HADOOP_VERSION
+  if [ ! -d "$HADOOP_HOME" ] ; then
+    echo "error - $HADOOP_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
+export HADOOP_CONF_DIR=/etc/hadoop
+if [ ! -d "$HADOOP_CONF_DIR" ] ; then
+  export HADOOP_CONF_DIR=/etc/hadoop-$HADOOP_VERSION
+  if [ ! -d "$HADOOP_CONF_DIR" ] ; then
+    echo "error - $HADOOP_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
+
 export MINI_DFS_BASE_DATA_DIR=$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data
 export PATH=$HADOOP_HOME/bin:$PATH
 
 export LLAMA_HOME=$IMPALA_HOME/thirdparty/llama-${IMPALA_LLAMA_VERSION}/
 
-export HIVE_HOME=$IMPALA_HOME/thirdparty/hive-${IMPALA_HIVE_VERSION}/
+export HIVE_HOME=/opt/hive
+if [ ! -d "$HIVE_HOME" ] ; then
+  export HIVE_HOME=/opt/hive-$HIVE_VERSION
+  if [ ! -d "$HIVE_HOME" ] ; then
+    echo "error - $HIVE_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
+export HIVE_CONF_DIR=/etc/hive
+if [ ! -d "$HIVE_CONF_DIR" ] ; then
+  export HIVE_CONF_DIR=/etc/hive-$HIVE_VERSION
+  if [ ! -d "$HIVE_CONF_DIR" ] ; then
+    echo "error - $HIVE_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
+
 export PATH=$HIVE_HOME/bin:$PATH
-export HIVE_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 
 ### Hive looks for jar files in a single directory from HIVE_AUX_JARS_PATH plus
 ### any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)
