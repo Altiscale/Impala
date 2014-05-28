@@ -164,16 +164,16 @@ fi
 # Kill any processes that may be accessing postgres metastore
 # TODO: figure out how to make postgres ignore other users
 # Disable error on exit for kill-all.sh
-set +e
-${IMPALA_HOME}/testdata/bin/kill-all.sh
-set -e
+# set +e
+# ${IMPALA_HOME}/testdata/bin/kill-all.sh
+# set -e
 
 # Generate the Hadoop configs needed by Impala
-if [ $FORMAT_METASTORE -eq 1 ]; then
-  ${IMPALA_HOME}/bin/create-test-configuration.sh -create_metastore
-else
-  ${IMPALA_HOME}/bin/create-test-configuration.sh
-fi
+# if [ $FORMAT_METASTORE -eq 1 ]; then
+#   ${IMPALA_HOME}/bin/create-test-configuration.sh -create_metastore
+# else
+#   ${IMPALA_HOME}/bin/create-test-configuration.sh
+# fi
 
 # build common and backend
 cd $IMPALA_HOME
