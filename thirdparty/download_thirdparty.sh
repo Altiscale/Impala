@@ -21,7 +21,7 @@ fi
 cd ${IMPALA_HOME}/thirdparty
 
 echo "Removing everything in ${IMPALA_HOME}/thirdparty"
-git clean -xdf
+# git clean -xdf
 
 echo "Fetching gtest"
 wget http://googletest.googlecode.com/files/gtest-${IMPALA_GTEST_VERSION}.zip
