@@ -15,7 +15,7 @@
 # Without this option Squeasel looks up the SSL library at run-time
 # and may not guess the correct name on some distributions
 SET_SOURCE_FILES_PROPERTIES(${SQUEASEL_SRC_DIR}/squeasel.c PROPERTIES
-  COMPILE_FLAGS -DNO_SSL_DL)
+  COMPILE_FLAGS "-DNO_SSL_DL -std=c99")
 
 # where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/util")
