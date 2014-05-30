@@ -57,7 +57,8 @@ if [ -z $IMPALA_HOME ]; then
     fi
 fi
 
-export HADOOP_LZO=${HADOOP_LZO-~/hadoop-lzo}
+HADOOP_LZO_JAR=`find /opt/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
+export HADOOP_LZO=${HADOOP_LZO-/opt/hadoop-$HADOOP_VERSION}
 export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
 export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-~/impala-auxiliary-tests}
 
@@ -116,7 +117,7 @@ export HIVE_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 ### Hive looks for jar files in a single directory from HIVE_AUX_JARS_PATH plus
 ### any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)
 export HIVE_AUX_JARS_PATH=$IMPALA_FE_DIR/target
-export AUX_CLASSPATH=$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar
+export AUX_CLASSPATH=$HADOOP_LZO_JAR
 
 export HBASE_HOME=$IMPALA_HOME/thirdparty/hbase-${IMPALA_HBASE_VERSION}/
 export PATH=$HBASE_HOME/bin:$PATH
@@ -168,7 +169,7 @@ export LD_PRELOAD="${LD_PRELOAD}:${LIB_JSIG}"
 CLASSPATH=$IMPALA_FE_DIR/target/dependency:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/target/classes:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/src/test/resources:$CLASSPATH
-CLASSPATH=$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar:$CLASSPATH
+CLASSPATH=$HADOOP_LZO_JAR:$CLASSPATH
 export CLASSPATH
 
 # Setup aliases
