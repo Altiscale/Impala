@@ -70,7 +70,7 @@ fi
 
 HADOOP_LZO_JAR=`find /opt/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
 export HADOOP_LZO=${HADOOP_LZO-/opt/hadoop-$HADOOP_VERSION}
-export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
+export IMPALA_LZO=${HADOOP_LZO-/opt/hadoop-$HADOOP_VERSION}
 
 # Directory where local cluster logs will go when running tests or loading data
 
@@ -109,9 +109,24 @@ if [ ! -d "$HADOOP_CONF_DIR" ] ; then
   fi
 fi
 
+export HIVE_HOME=/opt/hive
+if [ ! -d "$HIVE_HOME" ] ; then
+  export HIVE_HOME=/opt/hive-$HIVE_VERSION
+  if [ ! -d "$HIVE_HOME" ] ; then
+    echo "error - $HIVE_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
+export HIVE_CONF_DIR=/etc/hive
+if [ ! -d "$HIVE_CONF_DIR" ] ; then
+  export HIVE_CONF_DIR=/etc/hive-$HIVE_VERSION
+  if [ ! -d "$HIVE_CONF_DIR" ] ; then
+    echo "error - $HIVE_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
+
 export PATH=$HADOOP_HOME/bin:$PATH
 export PATH=$HIVE_HOME/bin:$PATH
-
+export CLASSPATH=$CLASSPATH:$HADOOP_CONF_DIR:$HIVE_CONF_DIR
 ### Hive looks for jar files in a single directory from HIVE_AUX_JARS_PATH plus
 ### any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)
 export HIVE_AUX_JARS_PATH=$IMPALA_FE_DIR/target
