@@ -31,8 +31,14 @@
 # Should-Stop:
 ### END INIT INFO
 
-. /lib/lsb/init-functions
-. /etc/default/hadoop
+# . /lib/lsb/init-functions
+# . /etc/default/hadoop
+
+if [ "x${IMPALA_HOME}" = "x" ] ; then
+  export IMPALA_HOME=/opt/alti-impala-1.2.2
+fi
+
+. ${IMPALA_HOME}/bin/impala-release-config.sh
 
 if [ -f /etc/default/impala ] ; then
   . /etc/default/impala
