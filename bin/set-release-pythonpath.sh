@@ -28,7 +28,7 @@ PYTHONPATH=/usr/lib/impala-shell/gen-py
 PYTHONPATH=$PYTHONPATH:$HIVE_HOME/lib/py
 
 # Add all the built eggs to the python path
-for EGG in /usr/lib/impala-/shell/ext-py/*/dist/*.egg; do
+for EGG in /usr/lib/impala-shell/ext-py/*/dist/*.egg; do
   PYTHONPATH=${PYTHONPATH}:${EGG}
 done
 export PYTHONPATH
