@@ -14,14 +14,18 @@ IMPALA_SERVER_ARGS=" \
 
 ENABLE_CORE_DUMPS=false
 
-# LIBHDFS_OPTS=-Djava.library.path=/usr/lib/impala/lib
+LIBHDFS_OPTS=-Djava.library.path=/usr/lib/impala/lib
 # MYSQL_CONNECTOR_JAR=/usr/share/java/mysql-connector-java.jar
-# IMPALA_BIN=/usr/lib/impala/sbin
-# IMPALA_HOME=/usr/lib/impala
-# HIVE_HOME=/usr/lib/hive
+IMPALA_BIN=/usr/bin
+IMPALA_HOME=/usr/lib/impala
+if [ "x${HIVE_VERSION}" = "x" ] ; then
+  HIVE_HOME=/opt/hive-0.12.0
+else
+  HIVE_HOME=/opt/hive-${HIVE_VERSION}
+fi
 # HBASE_HOME=/usr/lib/hbase
-# IMPALA_CONF_DIR=/etc/impala/conf
-# HADOOP_CONF_DIR=/etc/impala/conf
-# HIVE_CONF_DIR=/etc/impala/conf
-# HBASE_CONF_DIR=/etc/impala/conf
+IMPALA_CONF_DIR=/etc/impala/conf
+HADOOP_CONF_DIR=/etc/impala/conf
+HIVE_CONF_DIR=/etc/impala/conf
+HBASE_CONF_DIR=/etc/impala/conf
 
