@@ -14,7 +14,7 @@ IMPALA_SERVER_ARGS=" \
 
 ENABLE_CORE_DUMPS=false
 
-LIBHDFS_OPTS=-Djava.library.path=/usr/lib/impala/lib
+LIBHDFS_OPTS=-Djava.library.path=/usr/lib/impala/lib:/opt/hadoop/lib/native
 # MYSQL_CONNECTOR_JAR=/usr/share/java/mysql-connector-java.jar
 IMPALA_BIN=/usr/bin
 IMPALA_HOME=/usr/lib/impala
