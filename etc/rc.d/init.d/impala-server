@@ -31,7 +31,7 @@
 # Should-Stop:
 ### END INIT INFO
 
-# . /lib/lsb/init-functions
+. /lib/lsb/init-functions
 # . /etc/default/hadoop
 
 if [ "x${IMPALA_HOME}" = "x" ] ; then
