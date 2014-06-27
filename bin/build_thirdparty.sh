@@ -114,7 +114,8 @@ function build_preamble() {
   cd $1
   if [ $CLEAN_ACTION -eq 1 ]; then
     # remove everything that is not checked in
-    git clean -dfx
+    # git clean -dfx
+    echo "ignoring $2 in $1 command: git clean -dfx"
   fi
 }
 
@@ -232,5 +233,5 @@ fi
 # Build cdh4-extras
 if [ $BUILD_ALL -eq 1 ] || [ $BUILD_CDH4EXTRAS -eq 1 ]; then
   build_preamble $IMPALA_HOME/thirdparty/cdh4-extras cdh4-extras
-  mvn package -DskipTests
+  mvn -X package -DskipTests
 fi
