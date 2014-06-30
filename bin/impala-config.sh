@@ -28,6 +28,16 @@ if [ ! -d $JAVA_HOME ] ; then
 fi
 echo "ok - exist JAVA_HOME=$JAVA_HOME"
 
+# Default hadoop and hive version is 2.2.0 and 0.12.0
+if [ "x${HADOOP_VERSION}" = "x" ] ; then
+  export HADOOP_VERSION=2.2.0
+  echo "ok - applying HADOOP_VERSION=$HADOOP_VERSION"
+fi
+if [ "x${HIVE_VERSION}" = "x" ] ; then
+  export HIVE_VERSION=0.12.0
+  echo "ok - applying HIVE_VERSION=$HIVE_VERSION"
+fi
+
 if [ -z $IMPALA_HOME ]; then
     this=${0/-/} # login-shells often have leading '-' chars
     shell_exec=`basename $SHELL`
@@ -58,7 +68,8 @@ if [ -z $IMPALA_HOME ]; then
 fi
 
 export CDH_MAJOR_VERSION=4
-export HADOOP_LZO=${HADOOP_LZO-~/hadoop-lzo}
+HADOOP_LZO_JAR=`find /opt/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
+export HADOOP_LZO=${HADOOP_LZO-/opt/hadoop-$HADOOP_VERSION}
 export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
 export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-~/impala-auxiliary-tests}
 
@@ -182,6 +193,7 @@ LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:`dirname ${LIB_JVM}`:`dirname ${LIB_HDFS}`"
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${IMPALA_HOME}/be/build/debug/service"
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${IMPALA_HOME}/thirdparty/snappy-${IMPALA_SNAPPY_VERSION}/build/lib"
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$IMPALA_LZO/build"
+LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/lib/impala/lib"
 export LD_LIBRARY_PATH
 LD_PRELOAD="${LD_PRELOAD-}"
 export LD_PRELOAD="${LD_PRELOAD}:${LIB_JSIG}"
@@ -190,7 +202,7 @@ CLASSPATH="${CLASSPATH-}"
 CLASSPATH=$IMPALA_FE_DIR/target/dependency:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/target/classes:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/src/test/resources:$CLASSPATH
-CLASSPATH=$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar:$CLASSPATH
+CLASSPATH=$HADOOP_LZO_JAR:$CLASSPATH:$HADOOP_CONF_DIR:$HIVE_CONF_DIR
 export CLASSPATH
 
 # Setup aliases
