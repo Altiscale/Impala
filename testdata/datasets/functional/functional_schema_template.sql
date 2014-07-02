@@ -966,6 +966,8 @@ b string
 c string
 d int
 e double
+f string
+g string
 ---- ROW_FORMAT
 delimited fields terminated by ','
 ---- DEPENDENT_LOAD
@@ -984,6 +986,8 @@ b string
 c string
 d int
 e double
+f string
+g string
 ---- ROW_FORMAT
 delimited fields terminated by ',' escaped by '\\'
 ---- DEPENDENT_LOAD
@@ -1225,3 +1229,71 @@ d2 DECIMAL(10, 0)
 d3 DECIMAL(20, 10)
 d4 DECIMAL(38, 38)
 d5 DECIMAL(10, 5)
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- LOAD
+`hadoop fs -mkdir -p /test-warehouse/decimal_tbl && hadoop fs -put -f \
+${IMPALA_HOME}/testdata/data/decimal_tbl.txt /test-warehouse/decimal_tbl/
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+select * from functional.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+decimal_tiny
+---- COLUMNS
+c1 DECIMAL(10, 4)
+c2 DECIMAL(15, 5)
+c3 DECIMAL(1,1)
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- LOAD
+`hadoop fs -mkdir -p /test-warehouse/decimal_tiny && hadoop fs -put -f \
+${IMPALA_HOME}/testdata/data/decimal-tiny.txt /test-warehouse/decimal_tiny/
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+select * from functional.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+widetable_250_cols
+---- COLUMNS
+`${IMPALA_HOME}/testdata/common/widetable.py --get_columns -n 250
+---- ROW_FORMAT
+delimited fields terminated by ','  escaped by '\\'
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+select * from functional.{table_name};
+---- LOAD
+`${IMPALA_HOME}/testdata/common/widetable.py --create_data -n 250 -o /tmp/widetable_data.csv
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+widetable_500_cols
+---- COLUMNS
+`${IMPALA_HOME}/testdata/common/widetable.py --get_columns -n 500
+---- ROW_FORMAT
+delimited fields terminated by ','  escaped by '\\'
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+select * from functional.{table_name};
+---- LOAD
+`${IMPALA_HOME}/testdata/common/widetable.py --create_data -n 500 -o /tmp/widetable_data.csv
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+widetable_1000_cols
+---- COLUMNS
+`${IMPALA_HOME}/testdata/common/widetable.py --get_columns -n 1000
+---- ROW_FORMAT
+delimited fields terminated by ','  escaped by '\\'
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+select * from functional.{table_name};
+---- LOAD
+`${IMPALA_HOME}/testdata/common/widetable.py --create_data -n 1000 -o /tmp/widetable_data.csv
+====

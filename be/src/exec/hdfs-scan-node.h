@@ -119,6 +119,7 @@ class HdfsScanNode : public ScanNode {
   // Returns number of materialized partition key slots
   int num_materialized_partition_keys() const { return partition_key_slots_.size(); }
 
+  // Number of columns, including partition keys
   int num_cols() const { return column_idx_to_materialized_slot_idx_.size(); }
 
   const TupleDescriptor* tuple_desc() { return tuple_desc_; }
@@ -137,6 +138,12 @@ class HdfsScanNode : public ScanNode {
   // that column is not materialized.
   int GetMaterializedSlotIdx(int col_idx) const {
     return column_idx_to_materialized_slot_idx_[col_idx];
+  }
+
+  // The result array is of length num_cols(). The i-th element is true iff column i
+  // should be materialized.
+  const bool* is_materialized_col() {
+    return reinterpret_cast<const bool*>(&is_materialized_col_[0]);
   }
 
   // Returns the per format codegen'd function.  Scanners call this to get the
@@ -288,6 +295,11 @@ class HdfsScanNode : public ScanNode {
   typedef std::map<THdfsFileFormat::type, std::vector<HdfsFileDesc*> > FileFormatsMap;
   FileFormatsMap per_type_files_;
 
+  // The estimated memory required to start up a new scanner thread. If the memory
+  // left (due to limits) is less than this value, we won't start up optional
+  // scanner threads.
+  int64_t scanner_thread_bytes_required_;
+
   // Number of files that have not been issued from the scanners.
   AtomicInt<int> num_unqueued_files_;
 
@@ -331,6 +343,13 @@ class HdfsScanNode : public ScanNode {
   // the slot_desc's col_pos.  Non-materialized slots and partition key slots will
   // have SKIP_COLUMN as its entry.
   std::vector<int> column_idx_to_materialized_slot_idx_;
+
+  // is_materialized_col_[i] = <true i-th column should be materialized, false otherwise>
+  // for 0 <= i < total # columns
+  //
+  // This should be a vector<bool>, but bool vectors are special-cased and not stored
+  // internally as arrays, so instead we store as chars and cast to bools as needed
+  std::vector<char> is_materialized_col_;
 
   // Vector containing slot descriptors for all materialized non-partition key
   // slots.  These descriptors are sorted in order of increasing col_pos
@@ -443,7 +462,14 @@ class HdfsScanNode : public ScanNode {
   // processed from the IoMgr and then processes the entire range end to end.
   // This thread terminates when all scan ranges are complete or an error occurred.
   void ScannerThread();
-  void ScannerThreadHelper();
+
+  // Returns true if there is enough memory (against the mem tracker limits) to
+  // have a scanner thread.
+  // If new_thread is true, the calculation is for starting a new scanner thread.
+  // If false, it determines whether there's adequate memory for the existing
+  // set of scanner threads.
+  // lock_ must be taken before calling this.
+  bool EnoughMemoryForScannerThread(bool new_thread);
 
   // Checks for eos conditions and returns batches from materialized_row_batches_.
   Status GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos);

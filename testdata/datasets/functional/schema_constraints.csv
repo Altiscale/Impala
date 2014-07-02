@@ -43,8 +43,6 @@ table_name:alltypeserror, constraint:exclude, table_format:parquet/none/none
 table_name:alltypeserrornonulls, constraint:exclude, table_format:parquet/none/none
 table_name:unsupported_types, constraint:exclude, table_format:parquet/none/none
 table_name:escapechartesttable, constraint:exclude, table_format:parquet/none/none
-table_name:nulltable, constraint:exclude, table_format:parquet/none/none
-table_name:nullescapedtable, constraint:exclude, table_format:parquet/none/none
 table_name:TblWithRaggedColumns, constraint:exclude, table_format:parquet/none/none
 
 # the text_ tables are for testing test delimiters and escape chars in text files
@@ -91,5 +89,13 @@ table_name:widerow, constraint:exclude, table_format:hbase/none/none
 table_name:nullformat_custom, constraint:exclude, table_format:hbase/none/none
 table_name:unsupported_types, constraint:exclude, table_format:hbase/none/none
 
-# Decimal is only supported for text for now.
+# On CDH4, decimal can only be tested on formats Impala can write to (text and parquet)
 table_name:decimal_tbl, constraint:restrict_to, table_format:text/none/none
+table_name:decimal_tiny, constraint:restrict_to, table_format:text/none/none
+table_name:decimal_tbl, constraint:restrict_to, table_format:parquet/none/none
+table_name:decimal_tiny, constraint:restrict_to, table_format:parquet/none/none
+
+# hbase doesn't seem to like very wide tables
+table_name:widetable_250_cols, constraint:exclude, table_format:hbase/none/none
+table_name:widetable_500_cols, constraint:exclude, table_format:hbase/none/none
+table_name:widetable_1000_cols, constraint:exclude, table_format:hbase/none/none

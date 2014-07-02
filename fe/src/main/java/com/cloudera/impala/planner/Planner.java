@@ -50,7 +50,6 @@ import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.ColumnStats;
 import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.HdfsTable;
-import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.IdGenerator;
 import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
@@ -58,6 +57,7 @@ import com.cloudera.impala.common.NotImplementedException;
 import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.common.PrintUtils;
 import com.cloudera.impala.common.RuntimeEnv;
+import com.cloudera.impala.service.FeSupport;
 import com.cloudera.impala.thrift.TExplainLevel;
 import com.cloudera.impala.thrift.TPartitionType;
 import com.cloudera.impala.thrift.TQueryExecRequest;
@@ -159,7 +159,12 @@ public class Planner {
       // set up table sink for root fragment
       rootFragment.setSink(insertStmt.createDataSink());
     }
-    rootFragment.setOutputExprs(queryStmt.getBaseTblResultExprs());
+
+    if (analysisResult.isInsertStmt()) {
+      rootFragment.setOutputExprs(analysisResult.getInsertStmt().getResultExprs());
+    } else {
+      rootFragment.setOutputExprs(queryStmt.getBaseTblResultExprs());
+    }
 
     LOG.debug("finalize plan fragments");
     for (PlanFragment fragment: fragments) {
@@ -602,9 +607,9 @@ public class Planner {
       Analyzer analyzer) throws InternalException, AuthorizationException {
     Preconditions.checkState(mergeNode.getChildren().size() == childFragments.size());
 
-    // If the mergeNode only has constant exprs, return it in an unpartitioned fragment.
+    // A MergeNode could have no children or constant selects if all of its operands
+    // were dropped because of constant predicates that evaluated to false.
     if (mergeNode.getChildren().isEmpty()) {
-      Preconditions.checkState(!mergeNode.getConstExprLists().isEmpty());
       return new PlanFragment(
           fragmentIdGenerator_.getNextId(), mergeNode, DataPartition.UNPARTITIONED);
     }
@@ -1453,8 +1458,10 @@ public class Planner {
       List<Expr> viewPredicates = Expr.cloneList(preds, inlineViewRef.getSmap());
 
       // "migrate" conjuncts_ by marking them as assigned and re-registering them with
-      // new ids
-      analyzer.markConjunctsAssigned(viewPredicates);
+      // new ids.
+      // Mark pre-substitution conjuncts as assigned, since the ids of the new exprs may
+      // have changed.
+      analyzer.markConjunctsAssigned(preds);
       analyzer.registerConjuncts(viewPredicates);
     }
 
@@ -1599,15 +1606,15 @@ public class Planner {
         continue;
       }
 
-      // ignore predicates that express an equivalence relationship if that
-      // relationship is already captured via another predicate; we still
-      // return those predicates in joinPredicates so they get marked as assigned
-      // TODO: The code block below is not quite correct because it only selects
-      // a *single* predicate per equivalence class. Instead, we must select
-      // a minimal set of predicates that are able to express the equivalence
-      // class (the minimal spanning tree).
-      /*
-      Pair<SlotId, SlotId> joinSlots = ((Predicate) e).getEqSlots();
+      // Ignore predicates that express a redundant equivalence relationship. We assume
+      // that for each equivalence class, the equivalences between slots from only the
+      // lhs or rhs are already enforced by predicates in the lhs/rhs plan trees,
+      // respectively (see Analyzer.enforceSlotEquivalences()). Therefore, it is
+      // sufficient to establish equivalence between the lhs and rhs slots by assigning
+      // a single join predicate per equivalence class, i.e., any join predicates beyond
+      // that are redundant. We still return those predicates in joinPredicates so they
+      // get marked as assigned.
+      Pair<SlotId, SlotId> joinSlots = BinaryPredicate.getEqSlots(e);
       if (joinSlots != null) {
         EquivalenceClassId id1 = analyzer.getEquivClassId(joinSlots.first);
         EquivalenceClassId id2 = analyzer.getEquivClassId(joinSlots.second);
@@ -1621,7 +1628,6 @@ public class Planner {
         }
         joinEquivClasses.add(id1);
       }
-      */
 
       // e is a non-redundant join predicate
       Preconditions.checkState(lhsExpr != rhsExpr);
@@ -1637,20 +1643,10 @@ public class Planner {
     for (SlotDescriptor slotDesc: rhs.getDesc().getSlots()) {
       analyzer.getEquivSlots(slotDesc.getId(), lhsIds, lhsSlotIds);
       if (!lhsSlotIds.isEmpty()) {
-        SlotId lhsSlotId = lhsSlotIds.get(0);
         // construct a BinaryPredicates in order to get correct casting;
         // we only do this for one of the equivalent slots, all the other implied
         // equalities are redundant
-        BinaryPredicate pred = new BinaryPredicate(BinaryPredicate.Operator.EQ,
-            new SlotRef(analyzer.getDescTbl().getSlotDesc(lhsSlotId)),
-            new SlotRef(analyzer.getDescTbl().getSlotDesc(slotDesc.getId())));
-        // analyze() creates casts, if needed
-        try {
-          pred.analyze(analyzer);
-        } catch(AnalysisException e) {
-          throw new IllegalStateException(
-              "constructed predicate failed analysis: " + pred.toSql());
-        }
+        Expr pred = analyzer.createEqPredicate(lhsSlotIds.get(0), slotDesc.getId());
         joinConjuncts.add(new Pair<Expr, Expr>(pred.getChild(0), pred.getChild(1)));
       }
     }
@@ -1729,6 +1725,7 @@ public class Planner {
         new MergeNode(nodeIdGenerator_.getNextId(), unionStmt.getTupleId());
     for (UnionOperand op: unionOperands) {
       QueryStmt queryStmt = op.getQueryStmt();
+      if (op.isDropped()) continue;
       if (queryStmt instanceof SelectStmt) {
         SelectStmt selectStmt = (SelectStmt) queryStmt;
         if (selectStmt.getTableRefs().isEmpty()) {
@@ -1741,29 +1738,6 @@ public class Planner {
     }
     mergeNode.init(analyzer);
     return mergeNode;
-  }
-
-  private boolean isConstantSelect(QueryStmt queryStmt) {
-    if (!(queryStmt instanceof SelectStmt)) return false;
-    SelectStmt stmt = (SelectStmt) queryStmt;
-    return stmt.getTableRefs().isEmpty();
-  }
-
-  /**
-   * Removes constant exprs in 'exprs' and returns true if any elements
-   * of 'exprs' were removed.
-   */
-  private boolean removeConstantExprs(List<Expr> exprs) {
-    ListIterator<Expr> i = exprs.listIterator();
-    boolean result = false;
-    while (i.hasNext()) {
-      Expr e = i.next();
-      if (e.isConstant()) {
-        i.remove();
-        result = true;
-      }
-    }
-    return result;
   }
 
   /**
@@ -1779,33 +1753,30 @@ public class Planner {
     // the individual operands.
     // Do this prior to creating the operands' plan trees so they get a chance to
     // pick up propagated predicates.
-    // The exceptions are constant selects, for which we need to evaluate the
-    // predicates in the merge node itself.
+    // Drop operands that have constant conjuncts evaluating to false, and drop
+    // constant conjuncts evaluating to true.
     List<Expr> conjuncts =
         analyzer.getUnassignedConjuncts(unionStmt.getTupleId().asList(), false);
-    boolean markAssigned = true;
     for (UnionOperand op: unionStmt.getOperands()) {
-      if (isConstantSelect(op.getQueryStmt())) {
-        // if we have constant selects, the MergeNode needs to evaluate
-        // all conjuncts_ as well
-        // TODO: evaluate predicates directly against constant selects and drop
-        // non-matching rows right away
-        markAssigned = false;
-        continue;
-      }
       List<Expr> opConjuncts = Expr.cloneList(conjuncts, op.getSmap());
-
-      // eliminate constant predicates: they would (incorrectly) get picked up by
-      // the first call to Analyzer.getUnassignedConjuncts()
-      // TODO: drop the operand if one of its conjuncts_ is always false
-      if (removeConstantExprs(opConjuncts)) {
-        // in this case, we still need to evaluate the conjuncts_ in the MergeNode
-        // itself
-        markAssigned = false;
+      List<Expr> nonConstOpConjuncts = Lists.newArrayList();
+      for (int i = 0; i < opConjuncts.size(); ++i) {
+        // analyze after expr substitution to insert casts, etc.
+        Expr opConjunct = opConjuncts.get(i);
+        opConjunct.reanalyze(analyzer);
+        if (!opConjunct.isConstant()) {
+          nonConstOpConjuncts.add(opConjunct);
+          continue;
+        }
+        // Evaluate constant conjunct and drop operand if it evals to false.
+        if (!FeSupport.EvalPredicate(opConjunct, analyzer.getQueryContext())) {
+          op.drop();
+          break;
+        }
       }
-      analyzer.registerConjuncts(opConjuncts);
+      if (!op.isDropped()) analyzer.registerConjuncts(nonConstOpConjuncts);
     }
-    if (markAssigned) analyzer.markConjunctsAssigned(conjuncts);
+    analyzer.markConjunctsAssigned(conjuncts);
 
     // mark slots after predicate propagation but prior to plan tree generation
     unionStmt.materializeRequiredSlots(analyzer);

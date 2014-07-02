@@ -2746,8 +2746,8 @@ select count(*) from (
 01:SCAN HDFS [functional.alltypes]
    partitions=24/24 size=478.45KB
 ====
-// UNION ALL in subquery with a WHERE condition in the outer select;
-// Where clause conjuncts are used as scan predicates and for partition pruning.
+# UNION ALL in subquery with a WHERE condition in the outer select;
+# Where clause conjuncts are used as scan predicates and for partition pruning.
 select x.int_col, x.bool_col, x.month from
   (select * from functional.alltypestiny where year=2009 
    union all
@@ -2777,4 +2777,37 @@ where x.int_col < 5 and x.bool_col = false and x.month = 1
 01:SCAN HDFS [functional.alltypestiny]
    partitions=1/4 size=115B
    predicates: functional.alltypestiny.int_col < 5, functional.alltypestiny.bool_col = FALSE
+====
+# Regression test for IMPALA-888. Tests proper materialization of slots in
+# the presence of conjuncts that become constant for union operands.
+select 1 from
+  (select 1 a, 2 b, int_col c, bigint_col d from functional.alltypestiny
+   union all
+   select tinyint_col, int_col, smallint_col, bigint_col from functional.alltypes
+   union all
+   select 1, tinyint_col, 3, bigint_col from functional.alltypessmall) t
+where a + b < 100 and c > 20 and d > 50
+---- PLAN
+00:MERGE
+|
+|--02:SCAN HDFS [functional.alltypes]
+|     partitions=24/24 size=478.45KB
+|     predicates: functional.alltypes.tinyint_col + functional.alltypes.int_col < 100, functional.alltypes.smallint_col > 20, functional.alltypes.bigint_col > 50
+|
+01:SCAN HDFS [functional.alltypestiny]
+   partitions=4/4 size=460B
+   predicates: functional.alltypestiny.int_col > 20, functional.alltypestiny.bigint_col > 50
+====
+# Test union where all operands are dropped because of constant conjuncts.
+select * from
+  (select 1 a, 2 b
+   union all
+   select 3, 4
+   union all
+   select 10, 20) t
+where a > b
+---- PLAN
+00:MERGE
+---- DISTRIBUTEDPLAN
+00:MERGE
 ====

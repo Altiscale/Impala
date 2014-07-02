@@ -10,6 +10,7 @@ from tests.common.custom_cluster_test_suite import CustomClusterTestSuite
 from tests.common.impala_cluster import ImpalaCluster
 from tests.common.impala_test_suite import ImpalaTestSuite
 from tests.common.test_dimensions import create_single_exec_option_dimension
+from tests.common.test_dimensions import create_uncompressed_text_dimension
 from tests.common.test_vector import TestDimension
 
 import logging
@@ -56,7 +57,8 @@ _STATESTORED_ARGS = "-statestore_heartbeat_frequency_ms=%s" % (STATESTORE_HEARTB
 
 def impalad_admission_ctrl_flags(max_requests, max_queued, mem_limit):
   return ("-vmodule admission-controller=3 -default_pool_max_requests %s "
-      "-default_pool_max_queued %s -default_pool_mem_limit %s" %\
+      "-default_pool_max_queued %s -default_pool_mem_limit %s "
+      "-disable_admission_control=false" %\
       (max_requests, max_queued, mem_limit))
 
 def impalad_admission_ctrl_config_args():
@@ -65,7 +67,8 @@ def impalad_admission_ctrl_config_args():
   fs_allocation_path = os.path.join(resources_dir, "fair-scheduler-test2.xml")
   llama_site_path = os.path.join(resources_dir, "llama-site-test2.xml")
   return ("-vmodule admission-controller=3 -fair_scheduler_allocation_path %s "
-        "-llama_site_path %s" % (fs_allocation_path, llama_site_path))
+        "-llama_site_path %s -disable_admission_control=false" %\
+        (fs_allocation_path, llama_site_path))
 
 def log_metrics(log_prefix, metrics, log_level=logging.DEBUG):
   LOG.log(log_level, "%sadmitted=%s, queued=%s, dequeued=%s, rejected=%s, "\
@@ -118,14 +121,13 @@ class TestAdmissionController(CustomClusterTestSuite):
   def add_test_dimensions(cls):
     super(TestAdmissionController, cls).add_test_dimensions()
     cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
+
+    # There's no reason to test this on other file formats/compression codecs right now
+    cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
+
     cls.TestMatrix.add_dimension(TestDimension('num_queries', *NUM_QUERIES))
     cls.TestMatrix.add_dimension(
         TestDimension('round_robin_submission', *ROUND_ROBIN_SUBMISSION))
-
-    # There's no reason to test this on other file formats/compression codecs right now
-    cls.TestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format == 'text' and\
-        v.get_value('table_format').compression_codec == 'none')
 
     cls.TestMatrix.add_dimension(
         TestDimension('submission_delay_ms', *SUBMISSION_DELAY_MS))

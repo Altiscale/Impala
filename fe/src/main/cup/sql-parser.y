@@ -211,13 +211,13 @@ terminal
   KW_IS, KW_JOIN, KW_LAST, KW_LEFT, KW_LIKE, KW_LIMIT, KW_LINES, KW_LOAD, KW_LOCATION,
   KW_MERGE_FN, KW_METADATA, KW_NOT, KW_NULL, KW_NULLS, KW_OFFSET, KW_ON, KW_OR,
   KW_ORDER, KW_OUTER, KW_OVERWRITE, KW_PARQUET, KW_PARQUETFILE, KW_PARTITION,
-  KW_PARTITIONED, KW_PREPARE_FN, KW_RCFILE, KW_REFRESH, KW_REGEXP, KW_RENAME,
-  KW_REPLACE, KW_RETURNS, KW_RIGHT, KW_RLIKE, KW_ROW, KW_SCHEMA, KW_SCHEMAS, KW_SELECT,
-  KW_SEMI, KW_SEQUENCEFILE, KW_SERDEPROPERTIES, KW_SERIALIZE_FN, KW_SET, KW_SHOW,
-  KW_SMALLINT, KW_STORED, KW_STRAIGHT_JOIN, KW_STRING, KW_SYMBOL, KW_TABLE, KW_TABLES,
-  KW_TBLPROPERTIES, KW_TERMINATED, KW_TEXTFILE, KW_THEN, KW_TIMESTAMP, KW_TINYINT,
-  KW_STATS, KW_TO, KW_TRUE, KW_UNION, KW_UPDATE_FN, KW_USE, KW_USING, KW_VALUES,
-  KW_VIEW, KW_WHEN, KW_WHERE, KW_WITH;
+  KW_PARTITIONED, KW_PARTITIONS, KW_PREPARE_FN, KW_RCFILE, KW_REFRESH, KW_REGEXP,
+  KW_RENAME, KW_REPLACE, KW_RETURNS, KW_RIGHT, KW_RLIKE, KW_ROW, KW_SCHEMA, KW_SCHEMAS,
+  KW_SELECT, KW_SEMI, KW_SEQUENCEFILE, KW_SERDEPROPERTIES, KW_SERIALIZE_FN, KW_SET,
+  KW_SHOW, KW_SMALLINT, KW_STORED, KW_STRAIGHT_JOIN, KW_STRING, KW_SYMBOL, KW_TABLE,
+  KW_TABLES, KW_TBLPROPERTIES, KW_TERMINATED, KW_TEXTFILE, KW_THEN, KW_TIMESTAMP,
+  KW_TINYINT, KW_STATS, KW_TO, KW_TRUE, KW_UNION, KW_UPDATE_FN, KW_USE, KW_USING,
+  KW_VALUES, KW_VIEW, KW_WHEN, KW_WHERE, KW_WITH;
 
 terminal COMMA, DOT, DOTDOTDOT, STAR, LPAREN, RPAREN, LBRACKET, RBRACKET,
   DIVIDE, MOD, ADD, SUBTRACT;
@@ -248,6 +248,7 @@ nonterminal List<UnionOperand> values_operand_list;
 nonterminal UseStmt use_stmt;
 nonterminal ShowTablesStmt show_tables_stmt;
 nonterminal ShowDbsStmt show_dbs_stmt;
+nonterminal ShowPartitionsStmt show_partitions_stmt;
 nonterminal ShowStatsStmt show_stats_stmt;
 nonterminal String show_pattern;
 nonterminal DescribeStmt describe_stmt;
@@ -300,6 +301,9 @@ nonterminal ColumnType column_type;
 nonterminal Expr sign_chain_expr;
 nonterminal InsertStmt insert_stmt;
 nonterminal StatementBase explain_stmt;
+// Optional partition spec
+nonterminal PartitionSpec opt_partition_spec;
+// Required partition spec
 nonterminal PartitionSpec partition_spec;
 nonterminal ArrayList<PartitionKeyValue> partition_clause;
 nonterminal ArrayList<PartitionKeyValue> static_partition_key_value_list;
@@ -401,6 +405,8 @@ stmt ::=
   {: RESULT = show_tables; :}
   | show_dbs_stmt:show_dbs
   {: RESULT = show_dbs; :}
+  | show_partitions_stmt:show_partitions
+  {: RESULT = show_partitions; :}
   | show_stats_stmt:show_stats
   {: RESULT = show_stats; :}
   | show_functions_stmt:show_functions
@@ -445,7 +451,7 @@ stmt ::=
 
 load_stmt ::=
   KW_LOAD KW_DATA KW_INPATH STRING_LITERAL:path overwrite_val:overwrite KW_INTO KW_TABLE
-  table_name:table partition_spec:partition
+  table_name:table opt_partition_spec:partition
   {: RESULT = new LoadDataStmt(table, new HdfsUri(path), overwrite, partition); :}
   ;
 
@@ -540,15 +546,15 @@ alter_tbl_stmt ::=
   | KW_ALTER KW_TABLE table_name:table KW_DROP if_exists_val:if_exists
     partition_spec:partition
   {: RESULT = new AlterTableDropPartitionStmt(table, partition, if_exists); :}
-  | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET KW_FILEFORMAT
+  | KW_ALTER KW_TABLE table_name:table opt_partition_spec:partition KW_SET KW_FILEFORMAT
     file_format_val:file_format
   {: RESULT = new AlterTableSetFileFormatStmt(table, partition, file_format); :}
-  | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET
+  | KW_ALTER KW_TABLE table_name:table opt_partition_spec:partition KW_SET
     KW_LOCATION STRING_LITERAL:location
   {: RESULT = new AlterTableSetLocationStmt(table, partition, new HdfsUri(location)); :}
   | KW_ALTER KW_TABLE table_name:table KW_RENAME KW_TO table_name:new_table
   {: RESULT = new AlterTableOrViewRenameStmt(table, new_table, true); :}
-  | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET
+  | KW_ALTER KW_TABLE table_name:table opt_partition_spec:partition KW_SET
     table_property_type:target LPAREN properties_map:properties RPAREN
   {: RESULT = new AlterTableSetTblProperties(table, partition, target, properties); :}
   ;
@@ -895,6 +901,11 @@ partition_key_value_list ::=
 partition_spec ::=
   KW_PARTITION LPAREN static_partition_key_value_list:list RPAREN
   {: RESULT = new PartitionSpec(list); :}
+  ;
+
+opt_partition_spec ::=
+  partition_spec:partition_spec
+  {: RESULT = partition_spec; :}
   | /* Empty */
   {: RESULT = null; :}
   ;
@@ -1210,6 +1221,11 @@ show_stats_stmt ::=
   {: RESULT = new ShowStatsStmt(table, false); :}
   | KW_SHOW KW_COLUMN KW_STATS table_name:table
   {: RESULT = new ShowStatsStmt(table, true); :}
+  ;
+
+show_partitions_stmt ::=
+  KW_SHOW KW_PARTITIONS table_name:table
+  {: RESULT = new ShowPartitionsStmt(table); :}
   ;
 
 show_functions_stmt ::=

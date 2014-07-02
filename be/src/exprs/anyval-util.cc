@@ -41,6 +41,7 @@ Type* CodegenAnyVal::GetType(LlvmCodeGen* cg, const ColumnType& type) {
       return StructType::get(cg->bigint_type(), cg->bigint_type(), NULL);
     default:
       DCHECK(false) << "Unsupported type: " << type;
+      return NULL;
   }
 }
 
@@ -221,6 +222,7 @@ AnyVal* CreateAnyVal(ObjectPool* pool, const ColumnType& type) {
     case TYPE_DOUBLE: return pool->Add(new DoubleVal);
     case TYPE_STRING: return pool->Add(new StringVal);
     case TYPE_TIMESTAMP: return pool->Add(new TimestampVal);
+    case TYPE_DECIMAL: return pool->Add(new DecimalVal);
     default:
       DCHECK(false) << "Unsupported type: " << type;
       return NULL;
@@ -259,6 +261,11 @@ void AnyValUtil::ColumnTypeToTypeDesc(
       break;
     case TYPE_CHAR:
       out->type = FunctionContext::TYPE_FIXED_BUFFER;
+      break;
+    case TYPE_DECIMAL:
+      out->type = FunctionContext::TYPE_DECIMAL;
+      out->precision = type.precision;
+      out->scale = type.scale;
       break;
     default:
       DCHECK(false) << "Unknown type: " << type;

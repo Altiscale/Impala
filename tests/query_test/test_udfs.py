@@ -21,9 +21,7 @@ class TestUdfs(ImpalaTestSuite):
     cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
 
     # There is no reason to run these tests using all dimensions.
-    cls.TestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format == 'text' and\
-        v.get_value('table_format').compression_codec == 'none')
+    cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
 
   def test_native_functions(self, vector):
     database = 'native_function_test'
@@ -53,9 +51,9 @@ class TestUdfs(ImpalaTestSuite):
   def test_libs_with_same_filenames(self, vector):
     self.run_test_case('QueryTest/libs_with_same_filenames', vector)
 
-  def test_udf_update(self, vector):
-    # Test updating the UDF binary without restarting Impala. Dropping
-    # the function should remove the binary from the local cache.
+  def test_udf_update_via_drop(self, vector):
+    """Test updating the UDF binary without restarting Impala. Dropping
+    the function should remove the binary from the local cache."""
     # Run with sync_ddl to guarantee the drop is processed by all impalads.
     exec_options = vector.get_value('exec_option')
     exec_options['sync_ddl'] = 1
@@ -65,10 +63,10 @@ class TestUdfs(ImpalaTestSuite):
         'tests/test-hive-udfs/target/test-hive-udfs-1.0.jar')
     udf_dst = '/test-warehouse/impala-hive-udfs2.jar'
 
-    drop_fn_stmt = 'drop function if exists default.udf_update_test()'
-    create_fn_stmt = "create function default.udf_update_test() returns string "\
+    drop_fn_stmt = 'drop function if exists default.udf_update_test_drop()'
+    create_fn_stmt = "create function default.udf_update_test_drop() returns string "\
         "LOCATION '" + udf_dst + "' SYMBOL='com.cloudera.impala.TestUpdateUdf'"
-    query_stmt = "select default.udf_update_test()"
+    query_stmt = "select default.udf_update_test_drop()"
 
     # Put the old UDF binary on HDFS, make the UDF in Impala and run it.
     call(["hadoop", "fs", "-put", "-f", old_udf, udf_dst])
@@ -82,6 +80,49 @@ class TestUdfs(ImpalaTestSuite):
     self.execute_query_expect_success(self.client, drop_fn_stmt, exec_options)
     self.execute_query_expect_success(self.client, create_fn_stmt, exec_options)
     self.__run_query_all_impalads(exec_options, query_stmt, ["New UDF"])
+
+  def test_udf_update_via_create(self, vector):
+    """Test updating the UDF binary without restarting Impala. Creating a new function
+    from the library should refresh the cache."""
+    # Run with sync_ddl to guarantee the create is processed by all impalads.
+    exec_options = vector.get_value('exec_option')
+    exec_options['sync_ddl'] = 1
+    old_udf = os.path.join(os.environ['IMPALA_HOME'],
+        'testdata/udfs/impala-hive-udfs.jar')
+    new_udf = os.path.join(os.environ['IMPALA_HOME'],
+        'tests/test-hive-udfs/target/test-hive-udfs-1.0.jar')
+    udf_dst = '/test-warehouse/impala-hive-udfs3.jar'
+    old_function_name = "udf_update_test_create1"
+    new_function_name = "udf_update_test_create2"
+
+    drop_fn_template = 'drop function if exists default.%s()'
+    self.execute_query_expect_success(
+      self.client, drop_fn_template % old_function_name, exec_options)
+    self.execute_query_expect_success(
+      self.client, drop_fn_template % new_function_name, exec_options)
+
+    create_fn_template = "create function default.%s() returns string "\
+        "LOCATION '" + udf_dst + "' SYMBOL='com.cloudera.impala.TestUpdateUdf'"
+    query_template = "select default.%s()"
+
+    # Put the old UDF binary on HDFS, make the UDF in Impala and run it.
+    call(["hadoop", "fs", "-put", "-f", old_udf, udf_dst])
+    self.execute_query_expect_success(
+      self.client, create_fn_template % old_function_name, exec_options)
+    self.__run_query_all_impalads(
+      exec_options, query_template % old_function_name, ["Old UDF"])
+
+    # Update the binary, and create a new function using the binary. The new binary
+    # should be running.
+    call(["hadoop", "fs", "-put", "-f", new_udf, udf_dst])
+    self.execute_query_expect_success(
+      self.client, create_fn_template % new_function_name, exec_options)
+    self.__run_query_all_impalads(
+      exec_options, query_template % new_function_name, ["New UDF"])
+
+    # The old function should use the new library now
+    self.__run_query_all_impalads(
+      exec_options, query_template % old_function_name, ["New UDF"])
 
   def test_drop_function_while_running(self, vector):
     self.client.execute("drop function if exists default.drop_while_running(BIGINT)")
@@ -128,9 +169,15 @@ class TestUdfs(ImpalaTestSuite):
       self.__check_exception(e)
 
   def __check_exception(self, e):
-    if ('Memory limit exceeded' not in e.inner_exception.message and
-        'Cancelled' not in e.inner_exception.message):
-      raise e
+    # The interesting exception message may be in 'e' or in its inner_exception
+    # depending on the point of query failure.
+    if 'Memory limit exceeded' in str(e) or 'Cancelled' in str(e):
+      return
+    if e.inner_exception is not None\
+       and ('Memory limit exceeded' in e.inner_exception.message
+            or 'Cancelled' not in e.inner_exception.message):
+      return
+    raise e
 
   def __run_query_all_impalads(self, exec_options, query, expected):
     impala_cluster = ImpalaCluster()

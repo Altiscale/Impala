@@ -26,7 +26,7 @@
 namespace impala {
 
 // Compare two strings using sse4.2 intrinsics if they are available. This code assumes
-// that the trivial cases are already handled (i.e. one string is empty). 
+// that the trivial cases are already handled (i.e. one string is empty).
 // Returns:
 //   < 0 if s1 < s2
 //   0 if s1 == s2
@@ -42,7 +42,9 @@ static inline int StringCompare(const char* s1, int n1, const char* s2, int n2, 
     while (len >= SSEUtil::CHARS_PER_128_BIT_REGISTER) {
       __m128i xmm0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s1));
       __m128i xmm1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(s2));
-      int chars_match = _mm_cmpistri(xmm0, xmm1, SSEUtil::STRCMP_MODE);
+      int chars_match = _mm_cmpestri(xmm0, SSEUtil::CHARS_PER_128_BIT_REGISTER,
+                                     xmm1, SSEUtil::CHARS_PER_128_BIT_REGISTER,
+                                     SSEUtil::STRCMP_MODE);
       if (chars_match != SSEUtil::CHARS_PER_128_BIT_REGISTER) {
         return s1[chars_match] - s2[chars_match];
       }
@@ -50,20 +52,6 @@ static inline int StringCompare(const char* s1, int n1, const char* s2, int n2, 
       s1 += SSEUtil::CHARS_PER_128_BIT_REGISTER;
       s2 += SSEUtil::CHARS_PER_128_BIT_REGISTER;
     }
-    if (len >= SSEUtil::CHARS_PER_64_BIT_REGISTER) {
-      // Load 64 bits at a time, the upper 64 bits of the xmm register is set to 0
-      __m128i xmm0 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s1));
-      __m128i xmm1 = _mm_loadl_epi64(reinterpret_cast<const __m128i*>(s2));
-      // The upper bits always match (always 0), hence the comparison to 
-      // CHAR_PER_128_REGISTER
-      int chars_match = _mm_cmpistri(xmm0, xmm1, SSEUtil::STRCMP_MODE);
-      if (chars_match != SSEUtil::CHARS_PER_128_BIT_REGISTER) {
-        return s1[chars_match] - s2[chars_match];
-      }
-      len -= SSEUtil::CHARS_PER_64_BIT_REGISTER;
-      s1 += SSEUtil::CHARS_PER_64_BIT_REGISTER;
-      s2 += SSEUtil::CHARS_PER_64_BIT_REGISTER;
-    } 
   }
 #endif
   // TODO: for some reason memcmp is way slower than strncmp (2.5x)  why?

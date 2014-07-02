@@ -1213,6 +1213,11 @@ public class ParserTest {
     ParsesOk("SHOW COLUMN STATS db.tbl");
     ParsesOk("SHOW COLUMN STATS `db`.`tbl`");
 
+    // Show partitions
+    ParsesOk("SHOW PARTITIONS tbl");
+    ParsesOk("SHOW PARTITIONS db.tbl");
+    ParsesOk("SHOW PARTITIONS `db`.`tbl`");
+
     // Missing arguments
     ParserError("SHOW");
     // Malformed pattern (no quotes)
@@ -1440,6 +1445,8 @@ public class ParserTest {
     ParserError("ALTER TABLE TestDb.Foo ADD PARTITION ()");
     ParserError("ALTER Foo ADD PARTITION (i=1)");
     ParserError("ALTER TABLE ADD PARTITION (i=1)");
+    ParserError("ALTER TABLE ADD");
+    ParserError("ALTER TABLE DROP");
   }
 
   @Test

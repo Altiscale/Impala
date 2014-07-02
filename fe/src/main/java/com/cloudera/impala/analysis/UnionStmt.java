@@ -60,7 +60,11 @@ public class UnionStmt extends QueryStmt {
     private Analyzer analyzer_;
 
     // map from UnionStmts result slots to our resultExprs; useful during plan generation
-    private final Expr.SubstitutionMap smap = new Expr.SubstitutionMap();
+    private final Expr.SubstitutionMap smap_ = new Expr.SubstitutionMap();
+
+    // set if this operand is guaranteed to return an empty result set;
+    // used in planning when assigning conjuncts
+    private boolean isDropped_ = false;
 
     public UnionOperand(QueryStmt queryStmt, Qualifier qualifier) {
       this.queryStmt_ = queryStmt;
@@ -78,7 +82,9 @@ public class UnionStmt extends QueryStmt {
     // Used for propagating DISTINCT.
     public void setQualifier(Qualifier qualifier) { this.qualifier_ = qualifier; }
     public Analyzer getAnalyzer() { return analyzer_; }
-    public Expr.SubstitutionMap getSmap() { return smap; }
+    public Expr.SubstitutionMap getSmap() { return smap_; }
+    public void drop() { isDropped_ = true; }
+    public boolean isDropped() { return isDropped_; }
 
     @Override
     public UnionOperand clone() {
@@ -252,8 +258,9 @@ public class UnionStmt extends QueryStmt {
   private void unnestOperands(Analyzer analyzer)
       throws AnalysisException, AuthorizationException {
     if (operands_.size() == 1) {
-      // ValuesStmt for a single row
+      // ValuesStmt for a single row.
       allOperands_.add(operands_.get(0));
+      setOperandSmap(operands_.get(0), analyzer);
       return;
     }
 
@@ -286,18 +293,9 @@ public class UnionStmt extends QueryStmt {
     operands_.addAll(distinctOperands_);
     operands_.addAll(allOperands_);
 
-    TupleDescriptor tupleDesc = analyzer.getDescTbl().getTupleDesc(tupleId_);
     // create unnested operands' smaps
     for (UnionOperand operand: operands_) {
-      // operands' smaps were already set in the operands' analyze()
-      operand.getSmap().clear();
-      for (int i = 0; i < tupleDesc.getSlots().size(); ++i) {
-        SlotDescriptor outputSlot = tupleDesc.getSlots().get(i);
-        operand.getSmap().addMapping(
-            new SlotRef(outputSlot),
-            // TODO: baseTblResultExprs?
-            operand.getQueryStmt().getResultExprs().get(i).clone(null));
-      }
+      setOperandSmap(operand, analyzer);
     }
 
     // create distinctAggInfo, if necessary
@@ -315,6 +313,23 @@ public class UnionStmt extends QueryStmt {
         // this should never happen
         throw new AnalysisException("error creating agg info in UnionStmt.analyze()");
       }
+    }
+  }
+
+  /**
+   * Sets the smap for the given operand. It maps from the output slots this union's
+   * tuple to the corresponding base table exprs of the operand.
+   */
+  private void setOperandSmap(UnionOperand operand, Analyzer analyzer) {
+    TupleDescriptor tupleDesc = analyzer.getDescTbl().getTupleDesc(tupleId_);
+    // operands' smaps were already set in the operands' analyze()
+    operand.getSmap().clear();
+    for (int i = 0; i < tupleDesc.getSlots().size(); ++i) {
+      SlotDescriptor outputSlot = tupleDesc.getSlots().get(i);
+      operand.getSmap().addMapping(
+          new SlotRef(outputSlot),
+          // TODO: baseTblResultExprs?
+          operand.getQueryStmt().getResultExprs().get(i).clone(null));
     }
   }
 

@@ -54,7 +54,9 @@ DECLARE_bool(enable_rm);
 DECLARE_int32(rm_default_cpu_vcores);
 DECLARE_string(rm_default_memory);
 
-DEFINE_bool(disable_admission_control, false, "Disables admission control.");
+// Admission control is disabled by default (CDH4 only) due to HUE-994, Hue doesn't
+// close queries (fixed in CDH5). Default is false on CDH5.
+DEFINE_bool(disable_admission_control, true, "Disables admission control.");
 DEFINE_bool(require_username, false, "Requires that a user be provided in order to "
     "schedule requests. If enabled and a user is not provided, requests will be "
     "rejected, otherwise requests without a username will be submitted with the "
@@ -759,6 +761,9 @@ Status SimpleScheduler::GetRequestPool(const string& user,
   const string& configured_pool = query_options.request_pool;
   RETURN_IF_ERROR(request_pool_service_->ResolveRequestPool(configured_pool, user,
         &resolve_pool_result));
+  if (resolve_pool_result.status.status_code != TStatusCode::OK) {
+    return Status(join(resolve_pool_result.status.error_msgs, "; "));
+  }
   if (resolve_pool_result.resolved_pool.empty()) {
     return Status(Substitute(ERROR_USER_TO_POOL_MAPPING_NOT_FOUND, user,
           configured_pool));

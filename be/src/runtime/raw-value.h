@@ -21,9 +21,9 @@
 #include <boost/functional/hash.hpp>
 
 #include "common/logging.h"
-#include "runtime/primitive-type.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
+#include "runtime/types.h"
 #include "util/hash-util.h"
 
 namespace impala {
@@ -58,10 +58,10 @@ class RawValue {
   // is combined with the seed value.
   static uint32_t GetHashValue(const void* v, const ColumnType& type, uint32_t seed = 0);
 
-  // Get the hash value using the fvn hash function.  Using different seeds with FNV
-  // results in different hash functions.  GetHashValue() does not have this property
-  // and cannot be safely used as the first step in data repartitioning.
-  // However, GetHashValue() can be significantly faster.
+  // Get a 32-bit hash value using the FNV hash function.
+  // Using different seeds with FNV results in different hash functions.
+  // GetHashValue() does not have this property and cannot be safely used as the first
+  // step in data repartitioning. However, GetHashValue() can be significantly faster.
   // TODO: fix GetHashValue
   static uint32_t GetHashValueFnv(const void* v, const ColumnType& type, uint32_t seed);
 
@@ -84,6 +84,17 @@ class RawValue {
   // This is more performant than Compare() == 0 for string equality, mostly because of
   // the length comparison check.
   static bool Eq(const void* v1, const void* v2, const ColumnType& type);
+
+ private:
+  // The magic number (used in hash_combine()) 0x9e3779b9 = 2^32 / (golden ratio).
+  static const uint32_t HASH32_COMBINE_SEED = 0x9e3779b9;
+
+  // Combine hashes 'value' and 'seed' to get a new hash value.
+  // Similar to boost::hash_combine(), but for uint32_t.
+  // Used for NULL and boolean inputs in GetHashValue().
+  static inline uint32_t HashCombine32(uint32_t value, uint32_t seed) {
+    return seed ^ (HASH32_COMBINE_SEED + value + (seed << 6) + (seed >> 2));
+  }
 };
 
 inline bool RawValue::Eq(const void* v1, const void* v2, const ColumnType& type) {
@@ -121,32 +132,39 @@ inline bool RawValue::Eq(const void* v1, const void* v2, const ColumnType& type)
     case TYPE_CHAR:
       return StringCompare(reinterpret_cast<const char*>(v1), type.len,
           reinterpret_cast<const char*>(v2), type.len, type.len) == 0;
+    case TYPE_DECIMAL:
+      switch (type.GetByteSize()) {
+        case 4:
+          return reinterpret_cast<const Decimal4Value*>(v1)->value()
+              == reinterpret_cast<const Decimal4Value*>(v2)->value();
+        case 8:
+          return reinterpret_cast<const Decimal8Value*>(v1)->value()
+              == reinterpret_cast<const Decimal8Value*>(v2)->value();
+        case 16:
+          return reinterpret_cast<const Decimal16Value*>(v1)->value()
+              == reinterpret_cast<const Decimal16Value*>(v2)->value();
+        default:
+          break;
+      }
     default:
-      DCHECK(false);
+      DCHECK(false) << type;
       return 0;
   };
 }
 
 // Use boost::hash_combine for corner cases.  boost::hash_combine is reimplemented
-// here to use int32t's (instead of size_t)
-// boost::hash_combine does:
-//  seed ^= v + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+// here to use uint32_t's (instead of size_t)
 inline uint32_t RawValue::GetHashValue(const void* v, const ColumnType& type,
     uint32_t seed) {
   // Hash_combine with v = 0
-  if (v == NULL) {
-    uint32_t value = 0x9e3779b9;
-    return seed ^ (value + (seed << 6) + (seed >> 2));
-  }
+  if (v == NULL) return HashCombine32(0, seed);
+
   switch (type.type) {
     case TYPE_STRING: {
       const StringValue* string_value = reinterpret_cast<const StringValue*>(v);
       return HashUtil::Hash(string_value->ptr, string_value->len, seed);
     }
-    case TYPE_BOOLEAN: {
-      uint32_t value = *reinterpret_cast<const bool*>(v) + 0x9e3779b9;
-      return seed ^ (value + (seed << 6) + (seed >> 2));
-    }
+    case TYPE_BOOLEAN: return HashCombine32(*reinterpret_cast<const bool*>(v), seed);
     case TYPE_TINYINT: return HashUtil::Hash(v, 1, seed);
     case TYPE_SMALLINT: return HashUtil::Hash(v, 2, seed);
     case TYPE_INT: return HashUtil::Hash(v, 4, seed);
@@ -155,6 +173,7 @@ inline uint32_t RawValue::GetHashValue(const void* v, const ColumnType& type,
     case TYPE_DOUBLE: return HashUtil::Hash(v, 8, seed);
     case TYPE_TIMESTAMP: return HashUtil::Hash(v, 12, seed);
     case TYPE_CHAR: return HashUtil::Hash(v, type.len, seed);
+    case TYPE_DECIMAL: return HashUtil::Hash(v, type.GetByteSize(), seed);
     default:
       DCHECK(false);
       return 0;
@@ -164,27 +183,23 @@ inline uint32_t RawValue::GetHashValue(const void* v, const ColumnType& type,
 inline uint32_t RawValue::GetHashValueFnv(const void* v, const ColumnType& type,
     uint32_t seed) {
   // Hash_combine with v = 0
-  if (v == NULL) {
-    uint32_t value = 0x9e3779b9;
-    return seed ^ (value + (seed << 6) + (seed >> 2));
-  }
+  if (v == NULL) return HashCombine32(0, seed);
+
   switch (type.type ) {
     case TYPE_STRING: {
       const StringValue* string_value = reinterpret_cast<const StringValue*>(v);
-      return HashUtil::FnvHash(string_value->ptr, string_value->len, seed);
+      return HashUtil::FnvHash64to32(string_value->ptr, string_value->len, seed);
     }
-    case TYPE_BOOLEAN: {
-      uint32_t value = *reinterpret_cast<const bool*>(v) + 0x9e3779b9;
-      return seed ^ (value + (seed << 6) + (seed >> 2));
-    }
-    case TYPE_TINYINT: return HashUtil::FnvHash(v, 1, seed);
-    case TYPE_SMALLINT: return HashUtil::FnvHash(v, 2, seed);
-    case TYPE_INT: return HashUtil::FnvHash(v, 4, seed);
-    case TYPE_BIGINT: return HashUtil::FnvHash(v, 8, seed);
-    case TYPE_FLOAT: return HashUtil::FnvHash(v, 4, seed);
-    case TYPE_DOUBLE: return HashUtil::FnvHash(v, 8, seed);
-    case TYPE_TIMESTAMP: return HashUtil::FnvHash(v, 12, seed);
-    case TYPE_CHAR: return HashUtil::FnvHash(v, type.len, seed);
+    case TYPE_BOOLEAN: return HashCombine32(*reinterpret_cast<const bool*>(v), seed);
+    case TYPE_TINYINT: return HashUtil::FnvHash64to32(v, 1, seed);
+    case TYPE_SMALLINT: return HashUtil::FnvHash64to32(v, 2, seed);
+    case TYPE_INT: return HashUtil::FnvHash64to32(v, 4, seed);
+    case TYPE_BIGINT: return HashUtil::FnvHash64to32(v, 8, seed);
+    case TYPE_FLOAT: return HashUtil::FnvHash64to32(v, 4, seed);
+    case TYPE_DOUBLE: return HashUtil::FnvHash64to32(v, 8, seed);
+    case TYPE_TIMESTAMP: return HashUtil::FnvHash64to32(v, 12, seed);
+    case TYPE_CHAR: return HashUtil::FnvHash64to32(v, type.len, seed);
+    case TYPE_DECIMAL: return HashUtil::FnvHash64to32(v, type.GetByteSize(), seed);
     default:
       DCHECK(false);
       return 0;
@@ -243,6 +258,21 @@ inline void RawValue::PrintValue(const void* value, const ColumnType& type, int 
     case TYPE_CHAR:
       stream->write(static_cast<const char*>(value), type.len);
       break;
+    case TYPE_DECIMAL:
+      switch (type.GetByteSize()) {
+        case 4:
+          *stream << reinterpret_cast<const Decimal4Value*>(value)->ToString(type);
+          break;
+        case 8:
+          *stream << reinterpret_cast<const Decimal8Value*>(value)->ToString(type);
+          break;
+        case 16:
+          *stream << reinterpret_cast<const Decimal16Value*>(value)->ToString(type);
+          break;
+        default:
+          DCHECK(false) << type;
+      }
+      break;
     default:
       DCHECK(false);
   }
@@ -250,7 +280,6 @@ inline void RawValue::PrintValue(const void* value, const ColumnType& type, int 
   // Undo setting stream to fixed
   stream->flags(old_flags);
 }
-
 
 }
 

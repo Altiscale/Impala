@@ -19,11 +19,6 @@ class TestQueries(ImpalaTestSuite):
                     "making result verication fail."))
     self.run_test_case('QueryTest/distinct', vector)
 
-  def test_aggregation(self, vector):
-    if vector.get_value('table_format').file_format == 'hbase':
-      pytest.xfail(reason="IMPALA-283 - select count(*) produces inconsistent results")
-    self.run_test_case('QueryTest/aggregation', vector)
-
   def test_exprs(self, vector):
     # TODO: Enable some of these tests for Avro if possible
     # Don't attempt to evaluate timestamp expressions with Avro tables (which)
@@ -102,9 +97,14 @@ class TestQueries(ImpalaTestSuite):
     table_format = vector.get_value('table_format')
     if table_format.file_format in ['hbase', 'rc', 'parquet']:
       msg = ("Failing on rc/snap/block despite resolution of IMP-624,IMP-503. "
-             "Failing on parquet because nulltable does not exist in parquet")
+             "Failing on parquet because tables do not exist")
       pytest.xfail(msg)
     self.run_test_case('QueryTest/misc', vector)
+
+  def test_null_data(self, vector):
+    if vector.get_value('table_format').file_format == 'hbase':
+      pytest.xfail("null data does not appear to work in hbase")
+    self.run_test_case('QueryTest/null_data', vector)
 
   def test_overflow(self, vector):
     table_format = vector.get_value('table_format')

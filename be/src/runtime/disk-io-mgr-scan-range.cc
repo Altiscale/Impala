@@ -76,8 +76,8 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
 
     if (ready_buffers_.empty()) {
       // The queue is empty indicating this thread could use more
-      // IO. Double the capacity to allow for more queueing.
-      ready_buffers_capacity_ *= 2;
+      // IO. Increase the capacity to allow for more queueing.
+      ++ready_buffers_capacity_ ;
       ready_buffers_capacity_ = ::min(ready_buffers_capacity_, MAX_QUEUE_CAPACITY);
     }
 
@@ -98,12 +98,8 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
     eosr_returned_ = (*buffer)->eosr();
   }
 
-  // Update tracking counters.  The buffer has now moved from the IoMgr to the
+  // Update tracking counters. The buffer has now moved from the IoMgr to the
   // caller.
-  if (eosr_returned_) {
-    reader_->total_range_queue_capacity_ += ready_buffers_capacity_;
-    ++reader_->num_finished_ranges_;
-  }
   if (cached_buffer_ == NULL) {
     ++io_mgr_->num_buffers_in_readers_;
     ++reader_->num_buffers_in_reader_;
@@ -119,6 +115,13 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
   }
 
   unique_lock<mutex> reader_lock(reader_->lock_);
+  if (eosr_returned_) {
+    reader_->total_range_queue_capacity_ += ready_buffers_capacity_;
+    ++reader_->num_finished_ranges_;
+    reader_->initial_queue_capacity_ =
+        reader_->total_range_queue_capacity_ / reader_->num_finished_ranges_;
+  }
+
   DCHECK(reader_->Validate()) << endl << reader_->DebugString();
   if (reader_->state_ == ReaderContext::Cancelled) {
     reader_->blocked_ranges_.Remove(this);
@@ -145,7 +148,9 @@ void DiskIoMgr::ScanRange::Cancel(const Status& status) {
 
   DCHECK(!status.ok());
   {
+    // Grab both locks to make sure that all working threads see is_cancelled_.
     unique_lock<mutex> scan_range_lock(lock_);
+    unique_lock<mutex> hdfs_lock(hdfs_lock_);
     DCHECK(Validate()) << DebugString();
     if (is_cancelled_) {
       DCHECK(ready_buffers_.empty());
@@ -159,7 +164,7 @@ void DiskIoMgr::ScanRange::Cancel(const Status& status) {
 
   // For cached buffers, we can't close the range until the cached buffer is returned.
   // Close is handled in DiskIoMgr::ReturnBuffer().
-  if (cached_buffer_ == NULL) CloseScanRange();
+  if (cached_buffer_ == NULL) Close();
 }
 
 void DiskIoMgr::ScanRange::CleanupQueuedBuffers() {
@@ -241,8 +246,8 @@ void DiskIoMgr::ScanRange::InitInternal(DiskIoMgr* io_mgr, ReaderContext* reader
   DCHECK(Validate()) << DebugString();
 }
 
-Status DiskIoMgr::ScanRange::OpenScanRange() {
-  unique_lock<mutex> scan_range_lock(lock_);
+Status DiskIoMgr::ScanRange::Open() {
+  unique_lock<mutex> hdfs_lock(hdfs_lock_);
   if (is_cancelled_) return Status::CANCELLED;
 
   if (reader_->hdfs_connection_ != NULL) {
@@ -285,8 +290,8 @@ Status DiskIoMgr::ScanRange::OpenScanRange() {
   return Status::OK;
 }
 
-void DiskIoMgr::ScanRange::CloseScanRange() {
-  unique_lock<mutex> scan_range_lock(lock_);
+void DiskIoMgr::ScanRange::Close() {
+  unique_lock<mutex> hdfs_lock(hdfs_lock_);
   if (reader_->hdfs_connection_ != NULL) {
     if (hdfs_file_ == NULL) return;
 
@@ -313,9 +318,8 @@ void DiskIoMgr::ScanRange::CloseScanRange() {
 // TODO: how do we best use the disk here.  e.g. is it good to break up a
 // 1MB read into 8 128K reads?
 // TODO: look at linux disk scheduling
-Status DiskIoMgr::ScanRange::ReadFromScanRange(
-    char* buffer, int64_t* bytes_read, bool* eosr) {
-  unique_lock<mutex> scan_range_lock(lock_);
+Status DiskIoMgr::ScanRange::Read(char* buffer, int64_t* bytes_read, bool* eosr) {
+  unique_lock<mutex> hdfs_lock(hdfs_lock_);
   if (is_cancelled_) return Status::CANCELLED;
 
   *eosr = false;
