@@ -24,12 +24,12 @@ using namespace std;
 namespace impala {
 
 CharLiteral::CharLiteral(const string& str)
-  : Expr(ColumnType::CreateCharType(str.size())) {
+  : Expr(ColumnType(TYPE_CHAR, str.size())) {
   result_.SetStringVal(str);
 }
 
 CharLiteral::CharLiteral(uint8_t* data, int len)
-  : Expr(ColumnType::CreateCharType(len)) {
+  : Expr(ColumnType(TYPE_CHAR, len)) {
   result_.string_val = StringValue(reinterpret_cast<char*>(data), len);
 }
 

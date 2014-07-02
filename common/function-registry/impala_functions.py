@@ -43,10 +43,7 @@ def symbol(class_name, fn_name, templated_type = None):
     sym += 'EEPvPNS_4ExprEPNS_8TupleRowE'
   return sym
 
-# The format is:
-#   [sql aliases], <return_type>, [<args>], <backend symbol>,
-# With an optional
-#   <prepare symbol>, <close symbol>
+# The format is: [sql aliases], <return_type>, [<args>], <backend symbol>
 #
 # 'sql aliases' are the function names that can be used from sql. There must be
 # at least one per function.
@@ -461,18 +458,6 @@ functions = [
       '_ZN6impala20ConditionalFunctions8CoalesceINS_11StringValueEEEPvPNS_4ExprEPNS_8TupleRowE'],
   [['coalesce'], 'TIMESTAMP', ['TIMESTAMP', '...'],
       '_ZN6impala20ConditionalFunctions8CoalesceINS_14TimestampValueEEEPvPNS_4ExprEPNS_8TupleRowE'],
-
-  # Decimal Functions
-  # TODO: oracle has decimal support for transcendental functions (e.g. sin()) to very
-  # high precisions. Do we need them? It's unclear if other databases do the same.
-  [['precision'], 'INT', ['DECIMAL'], symbol('DecimalFunctions', 'Precision')],
-  [['scale'], 'INT', ['DECIMAL'], symbol('DecimalFunctions', 'Scale')],
-  [['abs'], 'DECIMAL', ['DECIMAL'], ""],
-  [['ceil'], 'DECIMAL', ['DECIMAL'], ""],
-  [['floor'], 'DECIMAL', ['DECIMAL'], ""],
-  [['round'], 'DECIMAL', ['DECIMAL'], ""],
-  [['round'], 'DECIMAL', ['DECIMAL', 'INT'], ""],
-  [['truncate'], 'DECIMAL', ['DECIMAL', 'INT'], ""],
 ]
 
 # These functions are implemented against the UDF interface.
@@ -484,28 +469,10 @@ udf_functions = [
    '_ZN6impala11UdfBuiltins3AbsEPN10impala_udf15FunctionContextERKNS1_9DoubleValE'],
   [['udf_lower'], 'STRING', ['STRING'],
    '_ZN6impala11UdfBuiltins5LowerEPN10impala_udf15FunctionContextERKNS1_9StringValE'],
-  [['max_int'], 'INT', [],
-   '_ZN6impala11UdfBuiltins6MaxIntEPN10impala_udf15FunctionContextE'],
-  [['max_tinyint'], 'TINYINT', [],
-   '_ZN6impala11UdfBuiltins10MaxTinyIntEPN10impala_udf15FunctionContextE'],
-  [['max_smallint'], 'SMALLINT', [],
-   '_ZN6impala11UdfBuiltins11MaxSmallIntEPN10impala_udf15FunctionContextE'],
-  [['max_bigint'], 'BIGINT', [],
-   '_ZN6impala11UdfBuiltins9MaxBigIntEPN10impala_udf15FunctionContextE'],
-  [['min_int'], 'INT', [],
-   '_ZN6impala11UdfBuiltins6MinIntEPN10impala_udf15FunctionContextE'],
-  [['min_tinyint'], 'TINYINT', [],
-   '_ZN6impala11UdfBuiltins10MinTinyIntEPN10impala_udf15FunctionContextE'],
-  [['min_smallint'], 'SMALLINT', [],
-   '_ZN6impala11UdfBuiltins11MinSmallIntEPN10impala_udf15FunctionContextE'],
-  [['min_bigint'], 'BIGINT', [],
-   '_ZN6impala11UdfBuiltins9MinBigIntEPN10impala_udf15FunctionContextE'],
-  [['trunc'], 'TIMESTAMP', ['TIMESTAMP', 'STRING'],
-   '_ZN6impala11UdfBuiltins5TruncEPN10impala_udf15FunctionContextERKNS1_12TimestampValERKNS1_9StringValE',
-   '_ZN6impala11UdfBuiltins12TruncPrepareEPN10impala_udf15FunctionContextENS2_18FunctionStateScopeE',
-   '_ZN6impala11UdfBuiltins10TruncCloseEPN10impala_udf15FunctionContextENS2_18FunctionStateScopeE'],
-  [['extract'], 'INT', ['TIMESTAMP', 'STRING'],
-   '_ZN6impala11UdfBuiltins7ExtractEPN10impala_udf15FunctionContextERKNS1_12TimestampValERKNS1_9StringValE',
-   '_ZN6impala11UdfBuiltins14ExtractPrepareEPN10impala_udf15FunctionContextENS2_18FunctionStateScopeE',
-   '_ZN6impala11UdfBuiltins12ExtractCloseEPN10impala_udf15FunctionContextENS2_18FunctionStateScopeE'],
+
+  # TODO: implement these functions.
+  [['abs'], 'DECIMAL', ['DECIMAL'], ""],
+  [['precision'], 'INT', ['DECIMAL'], ""],
+  [['scale'], 'INT', ['DECIMAL'], ""],
+  [['round'], 'DECIMAL', ['DECIMAL', 'INT'], ""],
 ]

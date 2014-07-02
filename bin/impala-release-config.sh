@@ -38,6 +38,10 @@ if [ "x${HIVE_VERSION}" = "x" ] ; then
   echo "ok - applying HIVE_VERSION=$HIVE_VERSION"
 fi
 
+if [ "x${IMPALA_VERSION}" = "x" ] ; then
+  export IMPALA_VERSION=1.3.1
+fi
+
 if [ -z $IMPALA_HOME ]; then
     this=${0/-/} # login-shells often have leading '-' chars
     shell_exec=`basename $SHELL`
@@ -167,7 +171,7 @@ export THRIFT_HOME=${THRIFT_SRC_DIR}build/
 export IMPALA_BUILD_THREADS=`nproc`
 
 # Configure python path
-. $IMPALA_HOME/bin/set-pythonpath.sh
+. $IMPALA_HOME/bin/set-release-pythonpath.sh
 
 # These arguments are, despite the name, passed to every JVM created
 # by an impalad.
@@ -206,6 +210,10 @@ CLASSPATH=$IMPALA_FE_DIR/target/dependency:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/target/classes:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/src/test/resources:$CLASSPATH
 CLASSPATH=$HADOOP_LZO_JAR:$CLASSPATH:$HADOOP_CONF_DIR:$HIVE_CONF_DIR
+for jar in `find /usr/lib/impala/lib/ -type f -name "*.jar"`
+do
+  CLASSPATH=$CLASSPATH:$jar
+done
 export CLASSPATH
 
 # Setup aliases

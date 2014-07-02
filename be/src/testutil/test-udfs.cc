@@ -177,12 +177,9 @@ void CountClose(FunctionContext* context, FunctionContext::FunctionStateScope sc
 void ConstantArgPrepare(
     FunctionContext* context, FunctionContext::FunctionStateScope scope) {
   if (scope == FunctionContext::THREAD_LOCAL) {
+    IntVal* arg = reinterpret_cast<IntVal*>(context->GetConstantArg(0));
     IntVal* state = reinterpret_cast<IntVal*>(context->Allocate(sizeof(IntVal)));
-    if (context->IsArgConstant(0)) {
-      *state = *reinterpret_cast<IntVal*>(context->GetConstantArg(0));
-    } else {
-      *state = IntVal::null();
-    }
+    *state = (arg != NULL) ? *arg : IntVal::null();
     context->SetFunctionState(scope, state);
   }
 }

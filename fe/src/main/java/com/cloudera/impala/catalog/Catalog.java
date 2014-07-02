@@ -407,8 +407,7 @@ public abstract class Catalog {
             "9HllUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
         .put(ColumnType.TIMESTAMP,
             "9HllUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.DECIMAL,
-            "9HllUpdateINS_10DecimalValEEEvPN10impala_udf15FunctionContextERKT_PNS3_9StringValE")
+        .put(ColumnType.DECIMAL, "")
         .build();
 
   private static final Map<ColumnType, String> PC_UPDATE_SYMBOL =
@@ -431,8 +430,7 @@ public abstract class Catalog {
             "8PcUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
         .put(ColumnType.TIMESTAMP,
             "8PcUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-         .put(ColumnType.DECIMAL,
-            "8PcUpdateINS_10DecimalValEEEvPN10impala_udf15FunctionContextERKT_PNS3_9StringValE")
+         .put(ColumnType.DECIMAL, "")
         .build();
 
     private static final Map<ColumnType, String> PCSA_UPDATE_SYMBOL =
@@ -455,8 +453,7 @@ public abstract class Catalog {
               "10PcsaUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
           .put(ColumnType.TIMESTAMP,
               "10PcsaUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.DECIMAL,
-              "10PcsaUpdateINS_10DecimalValEEEvPN10impala_udf15FunctionContextERKT_PNS3_9StringValE")
+          .put(ColumnType.DECIMAL, "")
           .build();
 
   private static final Map<ColumnType, String> MIN_UPDATE_SYMBOL =
@@ -479,8 +476,7 @@ public abstract class Catalog {
             "3MinIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
         .put(ColumnType.TIMESTAMP,
             "3MinIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.DECIMAL,
-            "3MinINS_10DecimalValEEEvPN10impala_udf15FunctionContextERKT_PS6_")
+        .put(ColumnType.DECIMAL, "")
         .build();
 
   private static final Map<ColumnType, String> MAX_UPDATE_SYMBOL =
@@ -503,24 +499,7 @@ public abstract class Catalog {
             "3MaxIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
         .put(ColumnType.TIMESTAMP,
             "3MaxIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.DECIMAL,
-            "3MaxINS_10DecimalValEEEvPN10impala_udf15FunctionContextERKT_PS6_")
-        .build();
-
-  private static final Map<ColumnType, String> STDDEV_UPDATE_SYMBOL =
-      ImmutableMap.<ColumnType, String>builder()
-        .put(ColumnType.TINYINT,
-            "14KnuthVarUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.SMALLINT,
-            "14KnuthVarUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.INT,
-            "14KnuthVarUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.BIGINT,
-            "14KnuthVarUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.FLOAT,
-            "14KnuthVarUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.DOUBLE,
-            "14KnuthVarUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
+        .put(ColumnType.DECIMAL, "")
         .build();
 
   // Populate all the aggregate builtins in the catalog.
@@ -604,57 +583,6 @@ public abstract class Catalog {
           stringValSerializeOrFinalize,
           prefix + "12PcsaFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
           true));
-
-      if (STDDEV_UPDATE_SYMBOL.containsKey(t)) {
-        db.addBuiltin(AggregateFunction.createBuiltin(db, "stddev",
-            Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-            prefix + "12KnuthVarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-            prefix + STDDEV_UPDATE_SYMBOL.get(t),
-            prefix + "13KnuthVarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-            stringValSerializeOrFinalize,
-            prefix + "19KnuthStddevFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-            true));
-        db.addBuiltin(AggregateFunction.createBuiltin(db, "stddev_samp",
-            Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-            prefix + "12KnuthVarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-            prefix + STDDEV_UPDATE_SYMBOL.get(t),
-            prefix + "13KnuthVarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-            stringValSerializeOrFinalize,
-            prefix + "19KnuthStddevFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-            true));
-        db.addBuiltin(AggregateFunction.createBuiltin(db, "stddev_pop",
-            Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-            prefix + "12KnuthVarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-            prefix + STDDEV_UPDATE_SYMBOL.get(t),
-            prefix + "13KnuthVarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-            stringValSerializeOrFinalize,
-            prefix + "22KnuthStddevPopFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-            true));
-        db.addBuiltin(AggregateFunction.createBuiltin(db, "variance",
-            Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-            prefix + "12KnuthVarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-            prefix + STDDEV_UPDATE_SYMBOL.get(t),
-            prefix + "13KnuthVarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-            stringValSerializeOrFinalize,
-            prefix + "16KnuthVarFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-            true));
-        db.addBuiltin(AggregateFunction.createBuiltin(db, "variance_samp",
-            Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-            prefix + "12KnuthVarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-            prefix + STDDEV_UPDATE_SYMBOL.get(t),
-            prefix + "13KnuthVarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-            stringValSerializeOrFinalize,
-            prefix + "16KnuthVarFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-            true));
-        db.addBuiltin(AggregateFunction.createBuiltin(db, "variance_pop",
-            Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-            prefix + "12KnuthVarInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-            prefix + STDDEV_UPDATE_SYMBOL.get(t),
-            prefix + "13KnuthVarMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-            stringValSerializeOrFinalize,
-            prefix + "19KnuthVarPopFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-            true));
-      }
     }
 
     // Sum
@@ -673,8 +601,8 @@ public abstract class Catalog {
     db.addBuiltin(AggregateFunction.createBuiltin(db, "sum",
         Lists.newArrayList(ColumnType.DECIMAL), ColumnType.DECIMAL, ColumnType.DECIMAL,
         initNull,
-        prefix + "9SumUpdateEPN10impala_udf15FunctionContextERKNS_10DecimalValEPS4_",
-        prefix + "8SumMergeEPN10impala_udf15FunctionContextERKNS_10DecimalValEPS4_",
+        prefix + "",
+        prefix + "",
         null, null, false));
 
     for (ColumnType t: ColumnType.getNumericTypes()) {

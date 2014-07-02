@@ -27,7 +27,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-import org.apache.commons.codec.binary.Base64;
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.BlockLocation;
@@ -46,6 +45,7 @@ import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.metastore.api.StorageDescriptor;
 import org.apache.hadoop.hive.serde.serdeConstants;
 import org.apache.hadoop.hive.serde2.avro.AvroSerdeUtils;
+import org.apache.hadoop.util.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -53,6 +53,7 @@ import com.cloudera.impala.analysis.Expr;
 import com.cloudera.impala.analysis.LiteralExpr;
 import com.cloudera.impala.analysis.NullLiteral;
 import com.cloudera.impala.analysis.PartitionKeyValue;
+import com.cloudera.impala.catalog.HdfsPartition.BlockReplica;
 import com.cloudera.impala.catalog.HdfsPartition.FileBlock;
 import com.cloudera.impala.catalog.HdfsPartition.FileDescriptor;
 import com.cloudera.impala.catalog.HdfsStorageDescriptor.InvalidStorageDescriptorException;
@@ -177,15 +178,15 @@ public class HdfsTable extends Table {
     // Initialize the diskId as -1 to indicate it is unknown
     int diskId = -1;
 
-    if (hdfsVolumeId != null && hdfsVolumeId.isValid()) {
+    if (hdfsVolumeId != null) {
       // TODO: this is a hack and we'll have to address this by getting the
       // public API. Also, we need to be very mindful of this when we change
       // the version of HDFS.
       String volumeIdString = hdfsVolumeId.toString();
       // This is the hacky part. The toString is currently the underlying id
-      // encoded in base64.
-      byte[] volumeIdBytes = Base64.decodeBase64(volumeIdString);
-      if (volumeIdBytes.length == 4) {
+      // encoded as hex.
+      byte[] volumeIdBytes = StringUtils.hexStringToByte(volumeIdString);
+      if (volumeIdBytes != null && volumeIdBytes.length == 4) {
         diskId = Bytes.toInt(volumeIdBytes);
       } else if (!hasLoggedDiskIdFormatWarning_) {
         LOG.warn("wrong disk id format: " + volumeIdString);
@@ -206,6 +207,7 @@ public class HdfsTable extends Table {
 
     // Store all BlockLocations so they can be reused when loading the disk IDs.
     List<BlockLocation> blockLocations = Lists.newArrayList();
+    int numCachedBlocks = 0;
 
     // loop over all files and record their block metadata, minus volume ids
     for (String parentPath: fileDescriptors.keySet()) {
@@ -217,43 +219,52 @@ public class HdfsTable extends Table {
           // fileDescriptors should not contain directories.
           Preconditions.checkArgument(!fileStatus.isDirectory());
           locations = DFS.getFileBlockLocations(fileStatus, 0, fileStatus.getLen());
+
           Preconditions.checkNotNull(locations);
           blockLocations.addAll(Arrays.asList(locations));
 
           // Loop over all blocks in the file.
           for (BlockLocation block: locations) {
+            Preconditions.checkNotNull(block);
+            // Get the location of all block replicas in ip:port format.
             String[] blockHostPorts = block.getNames();
-            try {
-              blockHostPorts = block.getNames();
-            } catch (IOException e) {
-              // this shouldn't happen, getNames() doesn't throw anything
-              String errorMsg = "BlockLocation.getNames() failed:\n" + e.getMessage();
-              LOG.error(errorMsg);
-              throw new IllegalStateException(errorMsg);
-            }
+
+            // Get the hostnames for all block replicas. Used to resolve which hosts
+            // contain cached data. The results are returned in the same order as
+            // block.getNames() so it allows us to match a host specified as ip:port
+            // to corresponding hostname using the same array index.
+            String[] blockHostNames = block.getHosts();
+            Preconditions.checkState(blockHostNames.length == blockHostPorts.length);
+
+            // Get the hostnames that contain cached replicas of this block.
+            Set<String> cachedHosts =
+                Sets.newHashSet(Arrays.asList(block.getCachedHosts()));
+            Preconditions.checkState(cachedHosts.size() <= blockHostNames.length);
 
             // Now enumerate all replicas of the block, adding any unknown hosts
             // to hostMap_/hostList_. The host ID (index in to the hostList_) for each
             // replica is stored in replicaHostIdxs.
-            List<Integer> replicaHostIdxs = new ArrayList<Integer>(blockHostPorts.length);
+            List<BlockReplica> blockReplicas =
+                new ArrayList<BlockReplica>(blockHostPorts.length);
             for (int i = 0; i < blockHostPorts.length; ++i) {
-              String[] ip_port = blockHostPorts[i].split(":");
-              Preconditions.checkState(ip_port.length == 2);
+              TNetworkAddress networkAddress =
+                  BlockReplica.parseLocation(blockHostPorts[i]);
+              Preconditions.checkState(networkAddress != null);
 
-              TNetworkAddress network_address = new TNetworkAddress(ip_port[0],
-                  Integer.parseInt(ip_port[1]));
-
-              Integer hostIdx = hostMap_.get(network_address);
+              Integer hostIdx = hostMap_.get(networkAddress);
               if (hostIdx == null) {
                 // No match was found, add a new entry for this host to the hostMap_.
-                hostList_.add(network_address);
-                hostMap_.put(network_address, hostList_.size() - 1);
+                hostList_.add(networkAddress);
+                hostMap_.put(networkAddress, hostList_.size() - 1);
                 hostIdx = hostList_.size() - 1;
               }
-              replicaHostIdxs.add(hostIdx);
+              blockReplicas.add(new BlockReplica(hostIdx,
+                  cachedHosts.contains(blockHostNames[i])));
             }
-            fileDescriptor.addFileBlock(
-                new FileBlock(block.getOffset(), block.getLength(), replicaHostIdxs));
+            FileBlock fileBlock =
+                new FileBlock(block.getOffset(), block.getLength(), blockReplicas);
+            fileDescriptor.addFileBlock(fileBlock);
+            if (fileBlock.isCached()) ++numCachedBlocks;
           }
         } catch (IOException e) {
           throw new RuntimeException("couldn't determine block locations for path '"
@@ -261,6 +272,9 @@ public class HdfsTable extends Table {
         }
       }
     }
+
+    LOG.trace("Table: " + getFullName() + " contains " + numCachedBlocks +
+        "/" + blockLocations.size() + " cached blocks.");
 
     if (SUPPORTS_VOLUME_ID) {
       LOG.trace("loading disk ids for: " + getFullName() +

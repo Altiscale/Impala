@@ -300,9 +300,14 @@ void DiskIoMgr::ScanRange::Close() {
     if (success == 0) {
       reader_->bytes_read_local_ += read_statistics->totalLocalBytesRead;
       reader_->bytes_read_short_circuit_ += read_statistics->totalShortCircuitBytesRead;
+      reader_->bytes_read_dn_cache_ += read_statistics->totalZeroCopyBytesRead;
       hdfsFileFreeReadStatistics(read_statistics);
     }
 
+    if (cached_buffer_ != NULL) {
+      hadoopRzBufferFree(hdfs_file_, cached_buffer_);
+      cached_buffer_ = NULL;
+    }
     hdfsCloseFile(reader_->hdfs_connection_, hdfs_file_);
     hdfs_file_ = NULL;
   } else {
@@ -362,8 +367,45 @@ Status DiskIoMgr::ScanRange::Read(char* buffer, int64_t* bytes_read, bool* eosr)
 Status DiskIoMgr::ScanRange::ReadFromCache(bool* read_succeeded) {
   DCHECK(try_cache_);
   DCHECK_EQ(bytes_read_, 0);
-  // On CDH4, this always fails.
   *read_succeeded = false;
+  Status status = Open();
+  if (!status.ok()) return status;
+
+  // Cached reads not supported on local filesystem.
+  if (reader_->hdfs_connection_ == NULL) return Status::OK;
+
+  {
+    unique_lock<mutex> scan_range_lock(lock_);
+    if (is_cancelled_) return Status::CANCELLED;
+
+    DCHECK(hdfs_file_ != NULL);
+    DCHECK(cached_buffer_ == NULL);
+    cached_buffer_ = hadoopReadZero(hdfs_file_, io_mgr_->cached_read_options_, len());
+
+    // Data was not cached, caller will fall back to normal read path.
+    if (cached_buffer_ == NULL) return Status::OK;
+  }
+
+  // Cached read succeeded.
+  void* buffer = const_cast<void*>(hadoopRzBufferGet(cached_buffer_));
+  int32_t bytes_read = hadoopRzBufferLength(cached_buffer_);
+  // For now, entire the entire block is cached or none of it.
+  // TODO: if HDFS ever changes this, we'll have to handle the case where half
+  // the block is cached.
+  DCHECK_EQ(bytes_read, len());
+
+  // Create a single buffer desc for the entire scan range and enqueue that.
+  BufferDescriptor* desc = io_mgr_->GetBufferDesc(
+      reader_, this, reinterpret_cast<char*>(buffer), 0);
+  desc->len_ = bytes_read;
+  desc->scan_range_offset_ = 0;
+  desc->eosr_ = true;
+  bytes_read_ = bytes_read;
+  EnqueueBuffer(desc);
+  if (reader_->bytes_read_counter_ != NULL) {
+    COUNTER_UPDATE(reader_->bytes_read_counter_, bytes_read);
+  }
+  *read_succeeded = true;
   return Status::OK;
 }
 

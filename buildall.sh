@@ -200,7 +200,6 @@ else
   ${IMPALA_HOME}/bin/create-test-configuration.sh
 fi
 
-
 # Generate all the make files from root.
 cd ${IMPALA_HOME}
 rm -f CMakeCache.txt
@@ -214,13 +213,14 @@ then
   (cd $IMPALA_LZO; cmake .; make)
 fi
 
-# build the external data source API
-cd ${IMPALA_HOME}/ext-data-source
-mvn install -DskipTests
-
-# build frontend and copy dependencies
-cd ${IMPALA_FE_DIR}
+# Get Hadoop dependencies onto the classpath
+cd $IMPALA_FE_DIR
 mvn dependency:copy-dependencies
+
+# build frontend
+# Package first since any test failure will prevent the package phase from completing.
+# We need to do this before loading data so that hive can see the parquet input/output
+# classes.
 mvn -X package -DskipTests=true
 
 # Build the shell tarball

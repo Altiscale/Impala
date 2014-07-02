@@ -25,10 +25,6 @@
 # lib/ -- containing the Hive Beeswax libraries, and the Python thrift 0.9 libraries
 # ext-py/ -- containing all the eggs for the modules packaged with the shell.
 
-if [ "x${IMPALA_SHELL_HOME}"  = "x" ] ; then
-  IMPALA_SHELL_HOME=/usr/lib/impala-shell/
-fi
-
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SHELL_HOME=${IMPALA_SHELL_HOME:-${SCRIPT_DIR}}
 

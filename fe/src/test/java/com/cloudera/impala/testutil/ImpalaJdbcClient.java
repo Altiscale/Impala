@@ -48,10 +48,17 @@ public class ImpalaJdbcClient {
   private final static String HIVE_SERVER2_DRIVER_NAME =
       "org.apache.hive.jdbc.HiveDriver";
 
+  // Hive uses simple SASL by default. The auth configuration 'none' (both for the client
+  // and the server) correspond to using simple SASL.
+  private final static String SASL_AUTH_SPEC = ";auth=none";
+
+  // As of Hive 0.11 'noSasl' is case sensitive. See HIVE-4232 for more details.
+  private final static String NOSASL_AUTH_SPEC = ";auth=noSasl";
+
   // The default connection string connects to localhost at the default hs2_port without
   // Sasl.
   private final static String DEFAULT_CONNECTION_STRING =
-      "jdbc:hive2://localhost:21050/;auth=noSasl";
+      "jdbc:hive2://localhost:21050/default";
 
   private final String driverName_;
   private final String connString_;
@@ -127,7 +134,8 @@ public class ImpalaJdbcClient {
   }
 
   public static ImpalaJdbcClient createClientUsingHiveJdbcDriver() {
-    return new ImpalaJdbcClient(HIVE_SERVER2_DRIVER_NAME, DEFAULT_CONNECTION_STRING);
+    return new ImpalaJdbcClient(
+        HIVE_SERVER2_DRIVER_NAME, DEFAULT_CONNECTION_STRING + NOSASL_AUTH_SPEC);
   }
 
   public static ImpalaJdbcClient createClientUsingHiveJdbcDriver(String connString) {
@@ -163,11 +171,27 @@ public class ImpalaJdbcClient {
     options.addOption("i", true, "host:port of target machine impalad is listening on");
     options.addOption("c", true,
         "Full connection string to use. Overrides host/port value");
+    options.addOption("t", true, "SASL/NOSASL, whether to use SASL transport or not");
     options.addOption("q", true, "Query String");
     options.addOption("help", false, "Help");
 
     BasicParser optionParser = new BasicParser();
     CommandLine cmdArgs = optionParser.parse(options, args);
+
+    String transportOption = cmdArgs.getOptionValue("t");
+    if (transportOption == null) {
+      LOG.error("Must specify '-t' option, whether to use SASL transport or not.");
+      LOG.error("Using the wrong type of transport will cause the program to hang.");
+      LOG.error("Usage: " + options.toString());
+      System.exit(1);
+    }
+    if (!transportOption.equalsIgnoreCase("SASL") &&
+        !transportOption.equalsIgnoreCase("NOSASL")) {
+      LOG.error("Invalid argument " + transportOption + " to '-t' option.");
+      LOG.error("Usage: " + options.toString());
+      System.exit(1);
+    }
+    boolean useSasl = transportOption.equalsIgnoreCase("SASL");
 
     String connStr = cmdArgs.getOptionValue("c", null);
 
@@ -175,7 +199,13 @@ public class ImpalaJdbcClient {
     // string using HiveServer 2 JDBC driver and no security.
     if (connStr == null) {
       String hostPort = cmdArgs.getOptionValue("i", "localhost:21050");
-      connStr = "jdbc:hive2://" + hostPort + "/;auth=noSasl";
+      connStr = "jdbc:hive2://" + hostPort + "/";
+    }
+    // Append appropriate auth option to connection string.
+    if (useSasl) {
+      connStr = connStr + SASL_AUTH_SPEC;
+    } else {
+      connStr = connStr + NOSASL_AUTH_SPEC;
     }
 
     String query = cmdArgs.getOptionValue("q");

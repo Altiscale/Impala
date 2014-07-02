@@ -42,9 +42,6 @@ namespace impala {
 // abstracts over the actual dictionary type.
 // Note: it does not provide a virtual Put(). Users are expected to know the subclass
 // type when using Put().
-// TODO: once we can easily remove virtual calls with codegen, this interface can
-// rely less on templating and be easier to follow. The type should be passed in
-// as an argument rather than template argument.
 class DictEncoderBase {
  public:
   virtual ~DictEncoderBase() {
@@ -101,9 +98,7 @@ class DictEncoderBase {
 template<typename T>
 class DictEncoder : public DictEncoderBase {
  public:
-  DictEncoder(MemPool* pool, int encoded_value_size) :
-      DictEncoderBase(pool), encoded_value_size_(encoded_value_size) {
-  }
+  DictEncoder(MemPool* pool) : DictEncoderBase(pool) { }
 
   // Encode value. Returns the number of bytes added to the dictionary page length (will
   // be 0 if this value is already in the dictionary). Note that this does not actually
@@ -123,9 +118,6 @@ class DictEncoder : public DictEncoderBase {
   // The values of dict_ in order of index (essentially the reverse mapping). Used to
   // write dictionary page.
   std::vector<T> dict_;
-
-  // Size of each encoded dictionary value. -1 for variable-length types.
-  int encoded_value_size_;
 
   // Adds value to dict_ and updates dict_encoded_size_. Returns the
   // number of bytes added to dict_encoded_size_.
@@ -161,9 +153,7 @@ class DictDecoder : public DictDecoderBase {
   // of dict_buffer.
   // For string data, the decoder returns StringValues with data directly from
   // dict_buffer (i.e. no copies).
-  // fixed_len_size is the size that must be passed to decode fixed-length
-  // dictionary values (values stored using FIXED_LEN_BYTE_ARRAY).
-  DictDecoder(uint8_t* dict_buffer, int dict_len, int fixed_len_size);
+  DictDecoder(uint8_t* dict_buffer, int dict_len);
 
   virtual int num_entries() const { return dict_.size(); }
 
@@ -192,12 +182,12 @@ inline int DictEncoder<T>::Put(const T& value) {
 
 template<typename T>
 inline int DictEncoder<T>::AddToDict(const T& value, int* index) {
-  DCHECK_GT(encoded_value_size_, 0);
   *index = dict_index_.size();
   dict_index_[value] = *index;
   dict_.push_back(value);
-  dict_encoded_size_ += encoded_value_size_;
-  return encoded_value_size_;
+  int bytes_added = ParquetPlainEncoder::ByteSize(value);
+  dict_encoded_size_ += bytes_added;
+  return bytes_added;
 }
 
 template<>
@@ -227,7 +217,7 @@ inline bool DictDecoder<T>::GetValue(T* value) {
 template<typename T>
 inline void DictEncoder<T>::WriteDict(uint8_t* buffer) {
   BOOST_FOREACH(const T& value, dict_) {
-    buffer += ParquetPlainEncoder::Encode(buffer, encoded_value_size_, value);
+    buffer += ParquetPlainEncoder::Encode(buffer, value);
   }
 }
 
@@ -246,13 +236,11 @@ inline int DictEncoderBase::WriteData(uint8_t* buffer, int buffer_len) {
 }
 
 template<typename T>
-inline DictDecoder<T>::DictDecoder(uint8_t* dict_buffer, int dict_len,
-    int fixed_len_size) {
+inline DictDecoder<T>::DictDecoder(uint8_t* dict_buffer, int dict_len) {
   uint8_t* end = dict_buffer + dict_len;
   while (dict_buffer < end) {
     T value;
-    dict_buffer +=
-        ParquetPlainEncoder::Decode(dict_buffer, fixed_len_size, &value);
+    dict_buffer += ParquetPlainEncoder::Decode(dict_buffer, &value);
     dict_.push_back(value);
   }
 }

@@ -14,6 +14,7 @@
 
 package com.cloudera.impala.catalog;
 
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -33,6 +34,7 @@ import com.cloudera.impala.thrift.TExprNode;
 import com.cloudera.impala.thrift.THdfsFileBlock;
 import com.cloudera.impala.thrift.THdfsFileDesc;
 import com.cloudera.impala.thrift.THdfsPartition;
+import com.cloudera.impala.thrift.TNetworkAddress;
 import com.cloudera.impala.thrift.TTableStats;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
@@ -101,31 +103,82 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
   }
 
   /**
+   * Represents metadata of a single block replica.
+   */
+  public static class BlockReplica {
+    private final boolean isCached_;
+    private final int hostIdx_;
+
+    /**
+     * Creates a BlockReplica given a host ID/index and a flag specifying whether this
+     * replica is cahced. Host IDs are assigned when loading the block metadata in
+     * HdfsTable.
+     */
+    public BlockReplica(int hostIdx, boolean isCached) {
+      hostIdx_ = hostIdx;
+      isCached_ = isCached;
+    }
+
+    /**
+     * Parses the location (an ip address:port string) of the replica and returns a
+     * TNetworkAddress with this information, or null if parsing fails.
+     */
+    public static TNetworkAddress parseLocation(String location) {
+      Preconditions.checkNotNull(location);
+      String[] ip_port = location.split(":");
+      if (ip_port.length != 2) return null;
+      try {
+        return new TNetworkAddress(ip_port[0], Integer.parseInt(ip_port[1]));
+      } catch (NumberFormatException e) {
+        return null;
+      }
+    }
+
+    public boolean isCached() { return isCached_; }
+    public int getHostIdx() { return hostIdx_; }
+  }
+
+  /**
    * File Block metadata
    */
   public static class FileBlock {
     private final THdfsFileBlock fileBlock_;
+    private boolean isCached_; // Set to true if there is at least one cached replica.
 
     private FileBlock(THdfsFileBlock fileBlock) {
-      this.fileBlock_ = fileBlock;
+      fileBlock_ = fileBlock;
+      isCached_ = false;
+      for (boolean isCached: fileBlock.getIs_replica_cached()) {
+        isCached_ |= isCached;
+      }
     }
 
     /**
      * Construct a FileBlock given the start offset (in bytes) of the file associated
-     * with this block, the length of the block (in bytes), and the set of host IDs
-     * that contain replicas of this block. Host IDs are assigned when loading the
-     * block metadata in HdfsTable. Does not fill diskIds.
+     * with this block, the length of the block (in bytes), and a list of BlockReplicas.
+     * Does not fill diskIds.
      */
-    public FileBlock(long offset, long blockLength, List<Integer> replicaHostIdxs) {
+    public FileBlock(long offset, long blockLength,
+        List<BlockReplica> replicaHostIdxs) {
       Preconditions.checkNotNull(replicaHostIdxs);
       fileBlock_ = new THdfsFileBlock();
       fileBlock_.setOffset(offset);
       fileBlock_.setLength(blockLength);
-      fileBlock_.setReplica_host_idxs(replicaHostIdxs);
+
+      fileBlock_.setReplica_host_idxs(new ArrayList<Integer>(replicaHostIdxs.size()));
+      fileBlock_.setIs_replica_cached(new ArrayList<Boolean>(replicaHostIdxs.size()));
+      isCached_ = false;
+      for (BlockReplica replica: replicaHostIdxs) {
+        fileBlock_.addToReplica_host_idxs(replica.getHostIdx());
+        fileBlock_.addToIs_replica_cached(replica.isCached());
+        isCached_ |= replica.isCached();
+      }
     }
 
     public long getOffset() { return fileBlock_.getOffset(); }
     public long getLength() { return fileBlock_.getLength(); }
+    // Returns true if at there at least one cached replica.
+    public boolean isCached() { return isCached_; }
     public List<Integer> getReplicaHostIdxs() {
       return fileBlock_.getReplica_host_idxs();
     }
@@ -147,9 +200,11 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
      */
     public int getDiskId(int hostIndex) {
       if (fileBlock_.disk_ids == null) return -1;
-      Preconditions.checkArgument(hostIndex >= 0);
-      Preconditions.checkArgument(hostIndex < fileBlock_.getDisk_idsSize());
       return fileBlock_.getDisk_ids().get(hostIndex);
+    }
+
+    public boolean isCached(int hostIndex) {
+      return fileBlock_.getIs_replica_cached().get(hostIndex);
     }
 
     public THdfsFileBlock toThrift() { return fileBlock_; }

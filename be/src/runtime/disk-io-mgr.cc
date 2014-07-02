@@ -265,6 +265,8 @@ DiskIoMgr::~DiskIoMgr() {
   for (int i = 0; i < disk_queues_.size(); ++i) {
     delete disk_queues_[i];
   }
+
+  if (cached_read_options_ != NULL) hadoopRzOptionsFree(cached_read_options_);
 }
 
 Status DiskIoMgr::Init(MemTracker* process_mem_tracker) {
@@ -292,6 +294,15 @@ Status DiskIoMgr::Init(MemTracker* process_mem_tracker) {
     }
   }
   reader_cache_.reset(new ReaderCache(this));
+
+  cached_read_options_ = hadoopRzOptionsAlloc();
+  DCHECK(cached_read_options_ != NULL);
+  // Disable checksumming for cached reads.
+  int ret = hadoopRzOptionsSetSkipChecksum(cached_read_options_, true);
+  DCHECK_EQ(ret, 0);
+  // Disable automatic fallback for cached reads.
+  ret = hadoopRzOptionsSetByteBufferPool(cached_read_options_, NULL);
+  DCHECK_EQ(ret, 0);
 
   return Status::OK;
 }

@@ -38,11 +38,9 @@ public enum PrimitiveType {
   // 8-byte pointer and 4-byte length indicator (12 bytes total).
   // Aligning to 8 bytes so 16 total.
   STRING("STRING", 16, TPrimitiveType.STRING),
-  // Unsupported scalar type.
+  // Unsupported scalar types.
   BINARY("BINARY", -1, TPrimitiveType.BINARY),
-
-  // For decimal at the highest precision, the BE uses 16 bytes.
-  DECIMAL("DECIMAL", 16, TPrimitiveType.DECIMAL),
+  DECIMAL("DECIMAL", -1, TPrimitiveType.DECIMAL),
 
   // Fixed length char array.
   CHAR("CHAR", -1, TPrimitiveType.CHAR);
@@ -93,5 +91,5 @@ public enum PrimitiveType {
   }
 
   public int getSlotSize() { return slotSize_; }
-  public static int getMaxSlotSize() { return DECIMAL.slotSize_; }
+  public static int getMaxSlotSize() { return STRING.slotSize_; }
 }

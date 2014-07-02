@@ -135,9 +135,6 @@ class MemTracker;
 // there will be a CPU available to process the buffer and any throttling we do with
 // the number of scanner threads properly controls the amount of files we mlock.
 //
-// On CDH4, where caching is not supported, much of the caching structure is still
-// preserved to minimize how much the code in the IoMgr diverges.
-//
 // TODO: IoMgr should be able to request additional scan ranges from the coordinator
 // to help deal with stragglers.
 // TODO: look into using a lock free queue

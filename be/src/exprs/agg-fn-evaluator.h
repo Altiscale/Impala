@@ -21,7 +21,7 @@
 #include <boost/scoped_ptr.hpp>
 #include "common/status.h"
 #include "runtime/lib-cache.h"
-#include "runtime/types.h"
+#include "runtime/primitive-type.h"
 #include "udf/udf.h"
 
 #include "gen-cpp/Exprs_types.h"
