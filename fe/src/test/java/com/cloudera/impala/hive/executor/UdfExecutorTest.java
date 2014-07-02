@@ -63,7 +63,7 @@ import org.apache.hadoop.hive.ql.udf.UDFSubstr;
 import org.apache.hadoop.hive.ql.udf.UDFTan;
 import org.apache.hadoop.hive.ql.udf.UDFTrim;
 import org.apache.hadoop.hive.ql.udf.UDFUnhex;
-import org.apache.hadoop.hive.ql.udf.generic.Generic.UDFUpper;
+import org.apache.hadoop.hive.ql.udf.generic.GenericUDFUpper;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
