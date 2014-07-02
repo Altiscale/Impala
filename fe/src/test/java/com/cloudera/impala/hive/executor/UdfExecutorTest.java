@@ -43,7 +43,7 @@ import org.apache.hadoop.hive.ql.udf.UDFLn;
 import org.apache.hadoop.hive.ql.udf.UDFLog;
 import org.apache.hadoop.hive.ql.udf.UDFLog10;
 import org.apache.hadoop.hive.ql.udf.UDFLog2;
-import org.apache.hadoop.hive.ql.udf.UDFLower;
+import org.apache.hadoop.hive.ql.udf.generic.GenericUDFLower;
 import org.apache.hadoop.hive.ql.udf.UDFLpad;
 import org.apache.hadoop.hive.ql.udf.UDFPI;
 import org.apache.hadoop.hive.ql.udf.UDFPosMod;
@@ -63,7 +63,7 @@ import org.apache.hadoop.hive.ql.udf.UDFSubstr;
 import org.apache.hadoop.hive.ql.udf.UDFTan;
 import org.apache.hadoop.hive.ql.udf.UDFTrim;
 import org.apache.hadoop.hive.ql.udf.UDFUnhex;
-import org.apache.hadoop.hive.ql.udf.UDFUpper;
+import org.apache.hadoop.hive.ql.udf.generic.Generic.UDFUpper;
 import org.apache.hadoop.io.BytesWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.io.Writable;
@@ -360,7 +360,7 @@ public class UdfExecutorTest {
     TestHiveUdf(UDFAscii.class, createInt('1'), "123");
     TestHiveUdf(UDFFindInSet.class, createInt(2), "31", "12,31,23");
     TestHiveUdf(UDFLength.class, createInt(5), createText("Hello"));
-    TestHiveUdf(UDFLower.class, createText("foobar"), "FOOBAR");
+    TestHiveUdf(GenericUDFLower.class, createText("foobar"), "FOOBAR");
     TestHiveUdf(UDFLpad.class, createText("foobar"), "bar", createInt(6), "foo");
     TestHiveUdf(UDFLTrim.class, createText("foobar  "), createText("  foobar  "));
     TestHiveUdf(UDFRepeat.class, createText("abcabc"), "abc", createInt(2));
@@ -371,7 +371,7 @@ public class UdfExecutorTest {
     TestHiveUdf(UDFSubstr.class, createText("World"),
         "HelloWorld", createInt(6), createInt(5));
     TestHiveUdf(UDFTrim.class, createText("foobar"), "  foobar  ");
-    TestHiveUdf(UDFUpper.class, createText("FOOBAR"), "foobar");
+    TestHiveUdf(GenericUDFUpper.class, createText("FOOBAR"), "foobar");
     freeAllocations();
   }
 
