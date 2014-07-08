@@ -152,9 +152,9 @@ then
   $IMPALA_HOME/bin/build_thirdparty.sh $([ ${CLEAN_ACTION} -eq 0 ] && echo '-noclean')
 fi
 
-if [ -e $HADOOP_LZO/build/native/Linux-*-*/lib/libgplcompression.so ]
+if [ -e $HADOOP_HOME/lib/native/libgplcompression.so ]
 then
-  cp $HADOOP_LZO/build/native/Linux-*-*/lib/libgplcompression.* \
+  cp $HADOOP_HOME/lib/native/libgplcompression.* \
     $IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/lib/native/
 else
   echo "No hadoop-lzo found"
