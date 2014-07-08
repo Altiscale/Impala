@@ -106,6 +106,13 @@ export IMPALA_AUX_DATASET_DIR=$IMPALA_AUX_TEST_HOME/testdata/datasets
 export IMPALA_COMMON_DIR=$IMPALA_HOME/common
 export PATH=$IMPALA_HOME/bin:$PATH
 
+export IMPALA_HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-$IMPALA_HADOOP_VERSION
+if [ ! -d "$IMPALA_HADOOP_HOME" ] ; then
+  export IMPALA_HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-$IMPALA_HADOOP_VERSION
+  if [ ! -d "$IMPALA_HADOOP_HOME" ] ; then
+    echo "error - $IMPALA_HADOOP_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
 export HADOOP_HOME=/opt/hadoop
 if [ ! -d "$HADOOP_HOME" ] ; then
   export HADOOP_HOME=/opt/hadoop-$HADOOP_VERSION
@@ -214,6 +221,7 @@ alias gerrit-verify-merge="${IMPALA_AUX_TEST_HOME}/jenkins/gerrit-verify-merge.s
 
 echo "IMPALA_HOME            = $IMPALA_HOME"
 echo "HADOOP_HOME            = $HADOOP_HOME"
+echo "IMPALA_HADOOP_HOME     = $IMPALA_HADOOP_HOME"
 echo "HADOOP_CONF_DIR        = $HADOOP_CONF_DIR"
 echo "MINI_DFS_BASE_DATA_DIR = $MINI_DFS_BASE_DATA_DIR"
 echo "HIVE_HOME              = $HIVE_HOME"
