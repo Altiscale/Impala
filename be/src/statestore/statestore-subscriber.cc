@@ -21,6 +21,7 @@
 #include <boost/foreach.hpp>
 #include <boost/date_time/posix_time/posix_time.hpp>
 #include <boost/thread/shared_mutex.hpp>
+#include <gutil/strings/substitute.h>
 
 #include "common/logging.h"
 #include "common/status.h"
@@ -33,8 +34,8 @@
 using namespace std;
 using namespace boost;
 using namespace boost::posix_time;
-using namespace ::apache::thrift;
-using namespace ::apache::thrift::transport;
+using namespace apache::thrift;
+using namespace strings;
 
 DEFINE_int32(statestore_subscriber_timeout_seconds, 30, "The amount of time (in seconds)"
      " that may elapse before the connection with the statestore is considered lost.");
@@ -47,6 +48,9 @@ namespace impala {
 
 // Used to identify the statestore in the failure detector
 const string STATESTORE_ID = "STATESTORE";
+
+// Template for metrics that measure the processing time for individual topics.
+const string CALLBACK_METRIC_PATTERN = "statestore-subscriber.topic-$0.processing-time-s";
 
 // Duration, in ms, to sleep between attempts to reconnect to the
 // statestore after a failure.
@@ -112,10 +116,9 @@ Status StatestoreSubscriber::AddTopic(const Statestore::TopicId& topic_id,
   Callbacks* cb = &(update_callbacks_[topic_id]);
   cb->callbacks.push_back(callback);
   if (cb->processing_time_metric == NULL) {
-    stringstream ss;
-    ss << "statestore-subscriber.topic-" << topic_id << ".processing-time-s";
+    const string& metric_name = Substitute(CALLBACK_METRIC_PATTERN, topic_id);
     cb->processing_time_metric =
-        metrics_->RegisterMetric(new StatsMetric<double>(ss.str()));
+        metrics_->RegisterMetric(new StatsMetric<double>(metric_name));
   }
   topic_registrations_[topic_id] = is_transient;
   return Status::OK;
@@ -140,12 +143,12 @@ Status StatestoreSubscriber::Register() {
   TRegisterSubscriberResponse response;
   try {
     client->RegisterSubscriber(response, request);
-  } catch (apache::thrift::transport::TTransportException& e) {
+  } catch (const TException& e) {
     // Client may have been closed due to a failure
     RETURN_IF_ERROR(client.Reopen());
     try {
       client->RegisterSubscriber(response, request);
-    } catch (apache::thrift::transport::TTransportException& e) {
+    } catch (const TException& e) {
       return Status(e.what());
     }
   }
@@ -221,11 +224,12 @@ void StatestoreSubscriber::RecoveryModeChecker() {
                   << attempt_count++;
         Status status = Register();
         if (status.ok()) {
-          LOG(INFO) << "Reconnected to statestore. Exiting recovery mode";
           // Make sure to update failure detector so that we don't
           // immediately fail on the next loop while we're waiting for
           // heartbeats to resume.
           failure_detector_->UpdateHeartbeat(STATESTORE_ID, true);
+          LOG(INFO) << "Reconnected to statestore. Exiting recovery mode";
+
           // Break out of enclosing while (true) to top of outer-scope loop.
           break;
         } else {

@@ -17,10 +17,12 @@
 # Note: for internal (aka pre-release) versions, the version should have
 # "-INTERNAL" appended. Parts of the code will look for this to distinguish
 # between released and internal versions.
-VERSION=1.2.4
+VERSION=1.3.1-cdh4
 GIT_HASH=$(git rev-parse HEAD)
 BUILD_TIME=`date`
 HEADER="# Generated version information from save-version.sh"
 echo -e \
 "${HEADER}\nVERSION: ${VERSION}\nGIT_HASH: ${GIT_HASH}\nBUILD_TIME: ${BUILD_TIME}"\
 > $IMPALA_HOME/bin/version.info
+
+cat $IMPALA_HOME/bin/version.info

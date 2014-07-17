@@ -25,9 +25,10 @@
 
 #include <iomanip>
 #include <iostream>
+#include <boost/bind.hpp>
+#include <boost/foreach.hpp>
 #include <boost/thread/locks.hpp>
 #include <boost/thread/thread.hpp>
-#include <boost/foreach.hpp>
 
 using namespace boost;
 using namespace std;
@@ -44,14 +45,31 @@ static const string THREAD_INVOLUNTARY_CONTEXT_SWITCHES = "InvoluntaryContextSwi
 // The root counter name for all top level counters.
 static const string ROOT_COUNTER = "";
 
-RuntimeProfile::RuntimeProfile(ObjectPool* pool, const string& name) :
-  pool_(pool),
-  own_pool_(false),
-  name_(name),
-  metadata_(-1),
-  counter_total_time_(TCounterType::TIME_NS),
-  local_time_percent_(0) {
-  counter_map_["TotalTime"] = &counter_total_time_;
+const string RuntimeProfile::TOTAL_TIME_COUNTER_NAME = "TotalTime";
+const string RuntimeProfile::ASYNC_TIME_COUNTER_NAME = "AsyncTotalTime";
+
+RuntimeProfile::RuntimeProfile(ObjectPool* pool, const string& name,
+    bool is_averaged_profile)
+  : pool_(pool),
+    own_pool_(false),
+    name_(name),
+    metadata_(-1),
+    is_averaged_profile_(is_averaged_profile),
+    counter_total_time_(TCounterType::TIME_NS),
+    total_async_timer_(TCounterType::TIME_NS),
+    local_time_percent_(0),
+    local_time_ns_(0) {
+  Counter* total_time_counter;
+  if (!is_averaged_profile) {
+    total_time_counter = &counter_total_time_;
+  } else {
+    total_time_counter = pool->Add(new AveragedCounter(TCounterType::TIME_NS));
+  }
+
+  counter_map_[TOTAL_TIME_COUNTER_NAME] = total_time_counter;
+  if (!is_averaged_profile) {
+    AddCounter(ASYNC_TIME_COUNTER_NAME, TCounterType::TIME_NS);
+  }
 }
 
 RuntimeProfile::~RuntimeProfile() {
@@ -123,8 +141,9 @@ RuntimeProfile* RuntimeProfile::CreateFromThrift(ObjectPool* pool,
   return profile;
 }
 
-void RuntimeProfile::Merge(RuntimeProfile* other) {
+void RuntimeProfile::UpdateAverage(RuntimeProfile* other) {
   DCHECK(other != NULL);
+  DCHECK(is_averaged_profile_);
 
   // Merge this level
   {
@@ -134,20 +153,24 @@ void RuntimeProfile::Merge(RuntimeProfile* other) {
     lock_guard<mutex> m(other->counter_map_lock_);
     for (src_iter = other->counter_map_.begin();
          src_iter != other->counter_map_.end(); ++src_iter) {
+
+      // Ignore this counter for averages.
+      if (src_iter->first == ASYNC_TIME_COUNTER_NAME) continue;
+
       dst_iter = counter_map_.find(src_iter->first);
+      AveragedCounter* avg_counter;
+
+      // Get the counter with the same name in dst_iter (this->counter_map_)
+      // Create one if it doesn't exist.
       if (dst_iter == counter_map_.end()) {
-        counter_map_[src_iter->first] =
-          pool_->Add(new Counter(src_iter->second->type(), src_iter->second->value()));
+        avg_counter = pool_->Add(new AveragedCounter(src_iter->second->type()));
+        counter_map_[src_iter->first] = avg_counter;
       } else {
         DCHECK(dst_iter->second->type() == src_iter->second->type());
-        if (dst_iter->second->type() == TCounterType::DOUBLE_VALUE) {
-          double new_val = dst_iter->second->double_value() +
-              src_iter->second->double_value();
-          dst_iter->second->Set(new_val);
-        } else {
-          dst_iter->second->Update(src_iter->second->value());
-        }
+        avg_counter = static_cast<AveragedCounter*>(dst_iter->second);
       }
+
+      avg_counter->UpdateCounter(src_iter->second);
     }
 
     ChildCounterMap::const_iterator child_counter_src_itr;
@@ -172,16 +195,17 @@ void RuntimeProfile::Merge(RuntimeProfile* other) {
       if (j != child_map_.end()) {
         child = j->second;
       } else {
-        child = pool_->Add(new RuntimeProfile(pool_, other_child->name_));
-        child->local_time_percent_ = other_child->local_time_percent_;
+        child = pool_->Add(new RuntimeProfile(pool_, other_child->name_, true));
         child->metadata_ = other_child->metadata_;
         bool indent_other_child = other->children_[i].second;
         child_map_[child->name_] = child;
         children_.push_back(make_pair(child, indent_other_child));
       }
-      child->Merge(other_child);
+      child->UpdateAverage(other_child);
     }
   }
+
+  ComputeTimeInProfile();
 }
 
 void RuntimeProfile::Update(const TRuntimeProfileTree& thrift_profile) {
@@ -315,10 +339,15 @@ void RuntimeProfile::ComputeTimeInProfile(int64_t total) {
     total_child_time += children_[i].first->total_time_counter()->value();
   }
 
-  int64_t local_time = total_time_counter()->value() - total_child_time;
+  local_time_ns_ = total_time_counter()->value() - total_child_time;
+  if (!is_averaged_profile_) {
+    local_time_ns_ += total_async_timer()->value();
+  }
+
   // Counters have some margin, set to 0 if it was negative.
-  local_time = ::max(0L, local_time);
-  local_time_percent_ = static_cast<double>(local_time) / total;
+  local_time_ns_ = ::max(0L, local_time_ns_);
+  local_time_percent_ =
+      static_cast<double>(local_time_ns_) / total_time_counter()->value();
   local_time_percent_ = ::min(1.0, local_time_percent_) * 100;
 
   // Recurse on children
@@ -330,6 +359,11 @@ void RuntimeProfile::ComputeTimeInProfile(int64_t total) {
 void RuntimeProfile::AddChild(RuntimeProfile* child, bool indent, RuntimeProfile* loc) {
   DCHECK(child != NULL);
   lock_guard<mutex> l(children_lock_);
+  if (child_map_.count(child->name_) > 0) {
+    // This child has already been added, so do nothing.
+    // Otherwise, the map and vector will be out of sync.
+    return;
+  }
   child_map_[child->name_] = child;
   if (loc == NULL) {
     children_.push_back(make_pair(child, indent));
@@ -381,6 +415,7 @@ const string* RuntimeProfile::GetInfoString(const string& key) {
 #define ADD_COUNTER_IMPL(NAME, T) \
   RuntimeProfile::T* RuntimeProfile::NAME(\
       const string& name, TCounterType::type type, const string& parent_counter_name) {\
+    DCHECK_EQ(is_averaged_profile_, false);\
     lock_guard<mutex> l(counter_map_lock_);\
     if (counter_map_.find(name) != counter_map_.end()) {\
       return reinterpret_cast<T*>(counter_map_[name]);\
@@ -401,6 +436,7 @@ ADD_COUNTER_IMPL(AddHighWaterMarkCounter, HighWaterMarkCounter);
 RuntimeProfile::DerivedCounter* RuntimeProfile::AddDerivedCounter(
     const string& name, TCounterType::type type,
     const DerivedCounterFunction& counter_fn, const string& parent_counter_name) {
+  DCHECK_EQ(is_averaged_profile_, false);
   lock_guard<mutex> l(counter_map_lock_);
   if (counter_map_.find(name) != counter_map_.end()) return NULL;
   DerivedCounter* counter = pool_->Add(new DerivedCounter(type, counter_fn));
@@ -470,15 +506,18 @@ void RuntimeProfile::PrettyPrint(ostream* s, const string& prefix) const {
     child_counter_map = child_counter_map_;
   }
 
-  map<string, Counter*>::const_iterator total_time = counter_map.find("TotalTime");
+  map<string, Counter*>::const_iterator total_time =
+      counter_map.find(TOTAL_TIME_COUNTER_NAME);
   DCHECK(total_time != counter_map.end());
 
   stream.flags(ios::fixed);
   stream << prefix << name_ << ":";
   if (total_time->second->value() != 0) {
-    stream << "(Active: "
+    stream << "(Total: "
            << PrettyPrinter::Print(total_time->second->value(),
                total_time->second->type())
+           << ", non-child: "
+           << PrettyPrinter::Print(local_time_ns_, TCounterType::TIME_NS)
            << ", % non-child: "
            << setprecision(2) << local_time_percent_
            << "%)";
@@ -499,6 +538,7 @@ void RuntimeProfile::PrettyPrint(ostream* s, const string& prefix) const {
     //     - Event 2: 2s288ms (2s288ms)
     //     - Event 3: 2s410ms (121.138ms)
     // The times in parentheses are the time elapsed since the last event.
+    vector<EventSequence::Event> events;
     lock_guard<mutex> l(event_sequence_lock_);
     BOOST_FOREACH(
         const EventSequenceMap::value_type& event_sequence, event_sequence_map_) {
@@ -508,7 +548,8 @@ void RuntimeProfile::PrettyPrint(ostream* s, const string& prefix) const {
              << endl;
 
       int64_t last = 0L;
-      BOOST_FOREACH(const EventSequence::Event& event, event_sequence.second->events()) {
+      event_sequence.second->GetEvents(&events);
+      BOOST_FOREACH(const EventSequence::Event& event, events) {
         stream << prefix << "     - " << event.first << ": "
                << PrettyPrinter::Print(
                    event.second, TCounterType::TIME_NS) << " ("
@@ -630,6 +671,7 @@ void RuntimeProfile::ToThrift(vector<TRuntimeProfileNode>* nodes) const {
   }
 
   {
+    vector<EventSequence::Event> events;
     lock_guard<mutex> l(event_sequence_lock_);
     if (event_sequence_map_.size() != 0) {
       node.__set_event_sequences(vector<TEventSequence>());
@@ -638,7 +680,8 @@ void RuntimeProfile::ToThrift(vector<TRuntimeProfileNode>* nodes) const {
       BOOST_FOREACH(const EventSequenceMap::value_type& val, event_sequence_map_) {
         TEventSequence* seq = &node.event_sequences[idx++];
         seq->name = val.first;
-        BOOST_FOREACH(const EventSequence::Event& ev, val.second->events()) {
+        val.second->GetEvents(&events);
+        BOOST_FOREACH(const EventSequence::Event& ev, events) {
           seq->labels.push_back(ev.first);
           seq->timestamps.push_back(ev.second);
         }
@@ -766,7 +809,7 @@ void RuntimeProfile::PrintChildCounters(const string& prefix,
     const set<string>& child_counters = itr->second;
     BOOST_FOREACH(const string& child_counter, child_counters) {
       CounterMap::const_iterator iter = counter_map.find(child_counter);
-      DCHECK(iter != counter_map.end());
+      if (iter == counter_map.end()) continue;
       stream << prefix << "   - " << iter->first << ": "
              << PrettyPrinter::Print(iter->second->value(), iter->second->type())
              << endl;
@@ -776,7 +819,6 @@ void RuntimeProfile::PrintChildCounters(const string& prefix,
   }
 }
 
-// Create a time series counter to this profile. This begins sampling immediately.
 RuntimeProfile::TimeSeriesCounter* RuntimeProfile::AddTimeSeriesCounter(
     const string& name, TCounterType::type type, DerivedCounterFunction fn) {
   DCHECK(fn != NULL);
@@ -788,6 +830,13 @@ RuntimeProfile::TimeSeriesCounter* RuntimeProfile::AddTimeSeriesCounter(
   time_series_counter_map_[name] = counter;
   PeriodicCounterUpdater::RegisterTimeSeriesCounter(counter);
   return counter;
+}
+
+RuntimeProfile::TimeSeriesCounter* RuntimeProfile::AddTimeSeriesCounter(
+    const string& name, Counter* src_counter) {
+  DCHECK(src_counter != NULL);
+  return AddTimeSeriesCounter(name, src_counter->type(),
+      bind(&Counter::value, src_counter));
 }
 
 void RuntimeProfile::TimeSeriesCounter::ToThrift(TTimeSeriesCounter* counter) {

@@ -68,21 +68,24 @@ Status TopNNode::Init(const TPlanNode& tnode) {
 }
 
 Status TopNNode::Prepare(RuntimeState* state) {
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Prepare(state));
   tuple_pool_.reset(new MemPool(mem_tracker()));
   tuple_descs_ = child(0)->row_desc().tuple_descriptors();
-  Expr::Prepare(lhs_ordering_exprs_, state, child(0)->row_desc());
-  Expr::Prepare(rhs_ordering_exprs_, state, child(0)->row_desc());
+  RETURN_IF_ERROR(Expr::Prepare(lhs_ordering_exprs_, state, child(0)->row_desc()));
+  RETURN_IF_ERROR(Expr::Prepare(rhs_ordering_exprs_, state, child(0)->row_desc()));
   abort_on_default_limit_exceeded_ = abort_on_default_limit_exceeded_ &&
       state->abort_on_default_limit_exceeded();
   return Status::OK;
 }
 
 Status TopNNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
+  RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(state->CheckQueryState());
-  SCOPED_TIMER(runtime_profile_->total_time_counter());
+  RETURN_IF_ERROR(Expr::Open(lhs_ordering_exprs_, state));
+  RETURN_IF_ERROR(Expr::Open(rhs_ordering_exprs_, state));
   RETURN_IF_ERROR(child(0)->Open(state));
 
   // Limit of 0, no need to fetch anything from children.
@@ -104,15 +107,16 @@ Status TopNNode::Open(RuntimeState* state) {
   }
   DCHECK_LE(priority_queue_->size(), limit_ + offset_);
   PrepareForOutput();
+  child(0)->Close(state);
   return Status::OK;
 }
 
 Status TopNNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::GETNEXT, state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(state->CheckQueryState());
-  SCOPED_TIMER(runtime_profile_->total_time_counter());
-  while (!row_batch->IsFull() && (get_next_iter_ != sorted_top_n_.end())) {
+  while (!row_batch->AtCapacity() && (get_next_iter_ != sorted_top_n_.end())) {
     if (num_rows_skipped_ < offset_) {
       ++get_next_iter_;
       ++num_rows_skipped_;
@@ -132,7 +136,10 @@ Status TopNNode::GetNext(RuntimeState* state, RowBatch* row_batch, bool* eos) {
 }
 
 void TopNNode::Close(RuntimeState* state) {
+  if (is_closed()) return;
   if (tuple_pool_.get() != NULL) tuple_pool_->FreeAll();
+  Expr::Close(lhs_ordering_exprs_, state);
+  Expr::Close(rhs_ordering_exprs_, state);
   ExecNode::Close(state);
 }
 

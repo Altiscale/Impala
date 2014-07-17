@@ -26,7 +26,7 @@
 #include "statestore/statestore.h"
 #include "util/debug-util.h"
 #include "util/metrics.h"
-#include "util/tcmalloc-metric.h"
+#include "util/memory-metrics.h"
 #include "util/webserver.h"
 #include "util/default-path-handlers.h"
 
@@ -39,8 +39,7 @@ using namespace std;
 using namespace boost;
 using namespace impala;
 
-using namespace ::apache::thrift::server;
-using namespace ::apache::thrift::transport;
+using namespace apache::thrift;
 
 int main(int argc, char** argv) {
   // Override default for webserver port
@@ -59,7 +58,7 @@ int main(int argc, char** argv) {
 
   scoped_ptr<Metrics> metrics(new Metrics());
   metrics->Init(FLAGS_enable_webserver ? webserver.get() : NULL);
-  RegisterTcmallocMetrics(metrics.get());
+  EXIT_IF_ERROR(RegisterMemoryMetrics(metrics.get(), false));
   StartThreadInstrumentation(metrics.get(), webserver.get());
   // TODO: Add a 'common metrics' method to add standard metrics to
   // both statestored and impalad

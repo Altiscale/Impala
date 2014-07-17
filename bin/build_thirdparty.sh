@@ -39,6 +39,7 @@ BUILD_SASL=0
 BUILD_LDAP=0
 BUILD_SNAPPY=0
 BUILD_PPROF=0
+BUILD_CDH4EXTRAS=0
 
 for ARG in $*
 do
@@ -86,9 +87,13 @@ do
       BUILD_ALL=0
       BUILD_PPROF=1
       ;;
+    -cdh4extras)
+      BUILD_ALL=0
+      BUILD_CDH4EXTRAS=1
+      ;;
     -*)
       echo "Usage: build_thirdparty.sh [-noclean] \
-[-avro -glog -thrift -gflags -gtest -re2 -sasl -ldap -snappy -pprof]"
+[-avro -glog -thrift -gflags -gtest -re2 -sasl -ldap -snappy -pprof -cdh4extras]"
       exit 1
   esac
 done
@@ -109,8 +114,8 @@ function build_preamble() {
   cd $1
   if [ $CLEAN_ACTION -eq 1 ]; then
     # remove everything that is not checked in
-    # git clean -dfx
     echo "ignoring - git clean for $2 in $1"
+    # git clean -dfx
   fi
 }
 
@@ -119,13 +124,13 @@ if [ $BUILD_ALL -eq 1 ] || [ $BUILD_THRIFT -eq 1 ]; then
   cd ${THRIFT_SRC_DIR}
   build_preamble ${THRIFT_SRC_DIR} "Thrift"
   if [ -d "${PIC_LIB_PATH:-}" ]; then
-    PIC_LIB_OPTIONS=" --with-libevent=${PIC_LIB_PATH} --with-zlib=${PIC_LIB_PATH} "
+    PIC_LIB_OPTIONS="--with-zlib=${PIC_LIB_PATH} "
   fi
   JAVA_PREFIX=${THRIFT_HOME}/java PY_PREFIX=${THRIFT_HOME}/python \
     ./configure --with-pic --prefix=${THRIFT_HOME} \
     --with-php=no --with-java=no --with-perl=no --with-erlang=no \
     --with-ruby=no --with-haskell=no --with-erlang=no --with-d=no \
-    --with-qt4=no ${PIC_LIB_OPTIONS:-}
+    --with-qt4=no --with-libevent=no ${PIC_LIB_OPTIONS:-}
   make # Make with -j fails
   make install
   cd ${THRIFT_SRC_DIR}/contrib/fb303
@@ -223,4 +228,10 @@ if [ $BUILD_ALL -eq 1 ] || [ $BUILD_AVRO -eq 1 ]; then
   build_preamble $IMPALA_HOME/thirdparty/avro-c-${IMPALA_AVRO_VERSION} Avro
   cmake .
   make -j4
+fi
+
+# Build cdh4-extras
+if [ $BUILD_ALL -eq 1 ] || [ $BUILD_CDH4EXTRAS -eq 1 ]; then
+  build_preamble $IMPALA_HOME/thirdparty/cdh4-extras cdh4-extras
+  mvn package -DskipTests
 fi

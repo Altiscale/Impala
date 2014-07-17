@@ -21,6 +21,7 @@
 #include <vector>
 
 #include "common/status.h"
+#include "gen-cpp/Frontend_types.h"
 
 #define THROW_IF_ERROR_WITH_LOGGING(stmt, env, adaptor) \
   do { \
@@ -160,6 +161,18 @@ class JniLocalFrame {
   JNIEnv* env_;
 };
 
+// Describes one method to look up in a Java object
+struct JniMethodDescriptor {
+  // Name of the method, case must match
+  const std::string name;
+
+  // JNI-style method signature
+  const std::string signature;
+
+  // Handle to the method
+  jmethodID* method_id;
+};
+
 // Utility class for JNI-related functionality.
 // Init() should be called as soon as the native library is loaded.
 // Creates global class references, and promotes local references to global references.
@@ -181,6 +194,11 @@ class JniUtil {
 
   // Find JniUtil class, and get JniUtil.throwableToString method id
   static Status Init();
+
+  // Returns true if the given class could be found on the CLASSPATH in env.
+  // Returns false otherwise, or if any other error occurred (e.g. a JNI exception).
+  // This function does not log any errors or exceptions.
+  static bool ClassExists(JNIEnv* env, const char* class_str);
 
   // Returns a global JNI reference to the class specified by class_str into class_ref.
   // The reference is added to global_refs_ for cleanup in Deinit().
@@ -207,8 +225,21 @@ class JniUtil {
   static Status Cleanup();
 
   // Returns the error message for 'e'. If no exception, returns Status::OK
-  // Prefix, if non-empty will be prepended to the error message.
-  static Status GetJniExceptionMsg(JNIEnv* env, const std::string& prefx = "");
+  // log_stack determines if the stack trace is written to the log
+  // prefix, if non-empty will be prepended to the error message.
+  static Status GetJniExceptionMsg(JNIEnv* env, bool log_stack = true,
+      const std::string& prefix = "");
+
+  // Populates 'result' with a list of memory metrics from the Jvm. Returns Status::OK
+  // unless there is an exception.
+  static Status GetJvmMetrics(const TGetJvmMetricsRequest& request,
+      TGetJvmMetricsResponse* result);
+
+  // Loads a method whose signature is in the supplied descriptor. Returns Status::OK
+  // and sets descriptor->method_id to a JNI method handle if successful, otherwise an
+  // error status is returned.
+  static Status LoadJniMethod(JNIEnv* jni_env, const jclass& jni_class,
+      JniMethodDescriptor* descriptor);
 
   // Utility methods to avoid repeating lots of the JNI call boilerplate. It seems these
   // must be defined in the header to compile properly.
@@ -221,6 +252,18 @@ class JniUtil {
     RETURN_IF_ERROR(SerializeThriftMsg(jni_env, &arg, &request_bytes));
     jni_env->CallObjectMethod(obj, method, request_bytes);
     RETURN_ERROR_IF_EXC(jni_env);
+    return Status::OK;
+  }
+
+  template <typename R>
+  static Status CallJniMethod(const jobject& obj, const jmethodID& method, R* response) {
+    JNIEnv* jni_env = getJNIEnv();
+    JniLocalFrame jni_frame;
+    RETURN_IF_ERROR(jni_frame.push(jni_env));
+    jbyteArray result_bytes = static_cast<jbyteArray>(
+        jni_env->CallObjectMethod(obj, method));
+    RETURN_ERROR_IF_EXC(jni_env);
+    RETURN_IF_ERROR(DeserializeThriftMsg(jni_env, result_bytes, response));
     return Status::OK;
   }
 
@@ -264,6 +307,7 @@ class JniUtil {
   static jclass internal_exc_cl_;
   static jmethodID throwable_to_string_id_;
   static jmethodID throwable_to_stack_trace_id_;
+  static jmethodID get_jvm_metrics_id_;
   // List of global references created with GetGlobalClassRef() or LocalToGlobalRef.
   // All global references are deleted in Cleanup().
   static std::vector<jobject> global_refs_;

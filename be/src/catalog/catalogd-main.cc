@@ -24,11 +24,12 @@
 #include "rpc/thrift-util.h"
 #include "rpc/thrift-server.h"
 #include "runtime/mem-tracker.h"
+#include "service/fe-support.h"
 #include "util/debug-util.h"
 #include "util/jni-util.h"
 #include "util/metrics.h"
 #include "util/network-util.h"
-#include "util/tcmalloc-metric.h"
+#include "util/memory-metrics.h"
 #include "util/webserver.h"
 #include "util/default-path-handlers.h"
 
@@ -43,16 +44,13 @@ using namespace impala;
 using namespace std;
 using namespace boost;
 
-using namespace ::apache::thrift::server;
-using namespace ::apache::thrift::protocol;
-using namespace ::apache::thrift::transport;
+using namespace apache::thrift;
 
 int main(int argc, char** argv) {
   FLAGS_webserver_port = 25020;
   FLAGS_state_store_subscriber_port = 23020;
   InitCommonRuntime(argc, argv, true);
-
-  EXIT_IF_ERROR(JniUtil::Init());
+  InitFeSupport();
 
   MemTracker process_mem_tracker;
   scoped_ptr<Webserver> webserver(new Webserver());
@@ -65,7 +63,7 @@ int main(int argc, char** argv) {
 
   scoped_ptr<Metrics> metrics(new Metrics());
   metrics->Init(FLAGS_enable_webserver ? webserver.get() : NULL);
-  RegisterTcmallocMetrics(metrics.get());
+  EXIT_IF_ERROR(RegisterMemoryMetrics(metrics.get(), true));
   StartThreadInstrumentation(metrics.get(), webserver.get());
   metrics->CreateAndRegisterPrimitiveMetric<string>(
       "catalog.version", GetVersionString(true));

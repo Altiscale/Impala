@@ -57,6 +57,8 @@ if [ -z $IMPALA_HOME ]; then
     fi
 fi
 
+export CDH_MAJOR_VERSION=4
+
 HADOOP_LZO_JAR=`find /opt/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
 export HADOOP_LZO=${HADOOP_LZO-/opt/hadoop-$HADOOP_VERSION}
 export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
@@ -82,6 +84,7 @@ export IMPALA_THRIFT_VERSION=0.9.0
 export IMPALA_AVRO_VERSION=1.7.4
 export IMPALA_LLVM_VERSION=3.3
 export IMPALA_PARQUET_VERSION=1.2.5
+export IMPALA_LLAMA_VERSION=1.0.0-cdh5.0.0-SNAPSHOT
 
 export IMPALA_FE_DIR=$IMPALA_HOME/fe
 export IMPALA_BE_DIR=$IMPALA_HOME/be
@@ -107,8 +110,12 @@ if [ ! -d "$HADOOP_CONF_DIR" ] ; then
   fi
 fi
 
-export MINI_DFS_BASE_DATA_DIR=$IMPALA_HOME/hdfs-data
+export HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/
+export HADOOP_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
+export MINI_DFS_BASE_DATA_DIR=$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data
 export PATH=$HADOOP_HOME/bin:$PATH
+
+export LLAMA_HOME=$IMPALA_HOME/thirdparty/llama-${IMPALA_LLAMA_VERSION}/
 
 export HIVE_HOME=$IMPALA_HOME/thirdparty/hive-${IMPALA_HIVE_VERSION}/
 export PATH=$HIVE_HOME/bin:$PATH
@@ -116,7 +123,7 @@ export HIVE_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 
 ### Hive looks for jar files in a single directory from HIVE_AUX_JARS_PATH plus
 ### any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)
-export HIVE_AUX_JARS_PATH=$IMPALA_FE_DIR/target
+export HIVE_AUX_JARS_PATH=${IMPALA_FE_DIR}/target
 export AUX_CLASSPATH=$HADOOP_LZO_JAR
 
 export HBASE_HOME=$IMPALA_HOME/thirdparty/hbase-${IMPALA_HBASE_VERSION}/

@@ -29,6 +29,8 @@ using namespace impala;
 using namespace llvm;
 using namespace std;
 
+const char* BlockingJoinNode::LLVM_CLASS_NAME = "class.impala::BlockingJoinNode";
+
 BlockingJoinNode::BlockingJoinNode(const string& node_name, const TJoinOp::type join_op,
     ObjectPool* pool, const TPlanNode& tnode, const DescriptorTbl& descs)
   : ExecNode(pool, tnode, descs),
@@ -47,6 +49,7 @@ BlockingJoinNode::~BlockingJoinNode() {
 }
 
 Status BlockingJoinNode::Prepare(RuntimeState* state) {
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
   RETURN_IF_ERROR(ExecNode::Prepare(state));
 
   build_pool_.reset(new MemPool(mem_tracker()));
@@ -71,6 +74,7 @@ Status BlockingJoinNode::Prepare(RuntimeState* state) {
 }
 
 void BlockingJoinNode::Close(RuntimeState* state) {
+  if (is_closed()) return;
   if (build_pool_.get() != NULL) build_pool_->FreeAll();
   left_batch_.reset();
   ExecNode::Close(state);
@@ -80,6 +84,7 @@ void BlockingJoinNode::BuildSideThread(RuntimeState* state, Promise<Status>* sta
   Status s;
   {
     SCOPED_TIMER(state->total_cpu_timer());
+    SCOPED_TIMER(runtime_profile()->total_async_timer());
     s = ConstructBuildSide(state);
   }
   // Release the thread token as soon as possible (before the main thread joins
@@ -90,14 +95,13 @@ void BlockingJoinNode::BuildSideThread(RuntimeState* state, Promise<Status>* sta
 }
 
 Status BlockingJoinNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
+  SCOPED_TIMER(runtime_profile_->total_time_counter());
+  RETURN_IF_ERROR(ExecNode::Open(state));
   RETURN_IF_CANCELLED(state);
   RETURN_IF_ERROR(state->CheckQueryState());
-  SCOPED_TIMER(runtime_profile_->total_time_counter());
 
   eos_ = false;
 
-  // TODO: fix problems with asynchronous cancellation
   // Kick-off the construction of the build-side table in a separate
   // thread, so that the left child can do any initialisation in parallel.
   // Only do this if we can get a thread token.  Otherwise, do this in the
@@ -107,6 +111,11 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
     AddRuntimeExecOption("Join Build-Side Prepared Asynchronously");
     Thread build_thread(node_name_, "build thread",
         bind(&BlockingJoinNode::BuildSideThread, this, state, &build_side_status));
+    if (!state->cgroup().empty()) {
+      RETURN_IF_ERROR(
+          state->exec_env()->cgroups_mgr()->AssignThreadToCgroup(
+              build_thread, state->cgroup()));
+    }
   } else {
     build_side_status.Set(ConstructBuildSide(state));
   }
@@ -119,6 +128,10 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
   // Blocks until ConstructBuildSide has returned, after which the build side structures
   // are fully constructed.
   RETURN_IF_ERROR(build_side_status.Get());
+  // We can close the right child to release its resources because its input has been
+  // fully consumed.
+  child(1)->Close(state);
+
   RETURN_IF_ERROR(open_status);
   // Seed left child in preparation for GetNext().
   while (true) {
@@ -135,7 +148,6 @@ Status BlockingJoinNode::Open(RuntimeState* state) {
       continue;
     } else {
       current_left_child_row_ = left_batch_->GetRow(left_batch_pos_++);
-      VLOG_ROW << "left child row: " << GetLeftChildRowString(current_left_child_row_);
       InitGetNext(current_left_child_row_);
       break;
     }

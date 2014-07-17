@@ -68,6 +68,27 @@ void DiskIoMgr::ReaderContext::Cancel(const Status& status) {
   ready_to_start_ranges_cv_.notify_all();
 }
 
+void DiskIoMgr::ReaderContext::AddScanRange(
+    DiskIoMgr::ScanRange* range, bool schedule_immediately) {
+  // DCHECK(lock_.is_locked()); // TODO: boost should have this API
+  ReaderContext::PerDiskState& state = disk_states_[range->disk_id_];
+  if (state.done()) {
+    DCHECK_EQ(state.num_remaining_ranges(), 0);
+    state.set_done(false);
+    ++num_disks_with_ranges_;
+  }
+  if (schedule_immediately) {
+    ScheduleScanRange(range);
+  } else {
+    state.unstarted_ranges()->Enqueue(range);
+  }
+  if (state.next_range_to_start() == NULL) {
+    state.ScheduleReader(this, range->disk_id());
+  }
+  ++state.num_remaining_ranges();
+  if (!schedule_immediately) ++num_unstarted_ranges_;
+}
+
 DiskIoMgr::ReaderContext::ReaderContext(DiskIoMgr* parent, int num_disks)
   : parent_(parent),
     bytes_read_counter_(NULL),
@@ -101,6 +122,8 @@ void DiskIoMgr::ReaderContext::Reset(hdfsFS hdfs_connection, MemTracker* tracker
   num_finished_ranges_ = 0;
   bytes_read_local_ = 0;
   bytes_read_short_circuit_ = 0;
+  bytes_read_dn_cache_ = 0;
+  initial_queue_capacity_ = DiskIoMgr::DEFAULT_QUEUE_CAPACITY;
 
   DCHECK(ready_to_start_ranges_.empty());
   DCHECK(blocked_ranges_.empty());
@@ -108,13 +131,6 @@ void DiskIoMgr::ReaderContext::Reset(hdfsFS hdfs_connection, MemTracker* tracker
   for (int i = 0; i < disk_states_.size(); ++i) {
     disk_states_[i].Reset();
   }
-}
-
-int DiskIoMgr::ReaderContext::initial_scan_range_queue_capacity() {
-  if (num_finished_ranges_ > 0) {
-    return total_range_queue_capacity_ / num_finished_ranges_;
-  }
-  return DiskIoMgr::DEFAULT_QUEUE_CAPACITY;
 }
 
 // Dumps out reader information.  Lock should be taken by caller

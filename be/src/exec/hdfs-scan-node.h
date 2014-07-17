@@ -104,7 +104,7 @@ class HdfsScanNode : public ScanNode {
 
   int limit() const { return limit_; }
 
-  bool compact_data() const { return compact_data_; }
+  bool requires_compaction() const { return requires_compaction_; }
 
   const std::vector<SlotDescriptor*>& materialized_slots()
       const { return materialized_slots_; }
@@ -119,6 +119,7 @@ class HdfsScanNode : public ScanNode {
   // Returns number of materialized partition key slots
   int num_materialized_partition_keys() const { return partition_key_slots_.size(); }
 
+  // Number of columns, including partition keys
   int num_cols() const { return column_idx_to_materialized_slot_idx_.size(); }
 
   const TupleDescriptor* tuple_desc() { return tuple_desc_; }
@@ -137,6 +138,12 @@ class HdfsScanNode : public ScanNode {
   // that column is not materialized.
   int GetMaterializedSlotIdx(int col_idx) const {
     return column_idx_to_materialized_slot_idx_[col_idx];
+  }
+
+  // The result array is of length num_cols(). The i-th element is true iff column i
+  // should be materialized.
+  const bool* is_materialized_col() {
+    return reinterpret_cast<const bool*>(&is_materialized_col_[0]);
   }
 
   // Returns the per format codegen'd function.  Scanners call this to get the
@@ -168,9 +175,12 @@ class HdfsScanNode : public ScanNode {
   void AddMaterializedRowBatch(RowBatch* row_batch);
 
   // Allocate a new scan range object, stored in the runtime state's object pool.
+  // For scan ranges that correspond to the original hdfs splits, the partition id
+  // must be set to the range's partition id. For other ranges (e.g. columns in parquet,
+  // read past buffers), the partition_id is unused.
   // This is thread safe.
   DiskIoMgr::ScanRange* AllocateScanRange(const char* file, int64_t len, int64_t offset,
-      int64_t partition_id, int disk_id);
+      int64_t partition_id, int disk_id, bool try_cache);
 
   // Adds ranges to the io mgr queue and starts up new scanner threads if possible.
   Status AddDiskIoRanges(const std::vector<DiskIoMgr::ScanRange*>& ranges);
@@ -238,7 +248,7 @@ class HdfsScanNode : public ScanNode {
       const std::vector<TScanRangeParams>& scan_range_params_list,
       PerVolumnStats* per_volume_stats);
 
-  // Output the per_volume_stats to stringsteam. The output format is a list of:
+  // Output the per_volume_stats to stringstream. The output format is a list of:
   // <volume id>:<# splits>/<per volume split lengths>
   static void PrintHdfsSplitStats(const PerVolumnStats& per_volume_stats,
       std::stringstream* ss);
@@ -258,10 +268,10 @@ class HdfsScanNode : public ScanNode {
   // Tuple id resolved in Prepare() to set tuple_desc_;
   const int tuple_id_;
 
-  // Copy strings to tuple memory pool if true.
-  // We try to avoid the overhead copying strings if the data will just
-  // stream to another node that will release the memory.
-  bool compact_data_;
+  // If true, scanners need to compact the resulting tuples. This is only true if
+  // the planner marked this node as producing compact row batches and there are
+  // materialized string slots.
+  bool requires_compaction_;
 
   // ReaderContext object to use with the disk-io-mgr
   DiskIoMgr::ReaderContext* reader_context_;
@@ -285,6 +295,11 @@ class HdfsScanNode : public ScanNode {
   typedef std::map<THdfsFileFormat::type, std::vector<HdfsFileDesc*> > FileFormatsMap;
   FileFormatsMap per_type_files_;
 
+  // The estimated memory required to start up a new scanner thread. If the memory
+  // left (due to limits) is less than this value, we won't start up optional
+  // scanner threads.
+  int64_t scanner_thread_bytes_required_;
+
   // Number of files that have not been issued from the scanners.
   AtomicInt<int> num_unqueued_files_;
 
@@ -306,15 +321,20 @@ class HdfsScanNode : public ScanNode {
   typedef std::map<THdfsFileFormat::type, std::list<llvm::Function*> > CodegendFnMap;
   CodegendFnMap codegend_fn_map_;
 
+  // All conjunct copies that are created, including codegen'd and noncodegen'd
+  // conjuncts.
+  // TODO: remove when exprs are threadsafe
+  std::list<std::vector<Expr*>*> all_conjuncts_copies_;
+
   // Copies of the conjuncts for use by the scanners when they cannot use codegen'd
   // functions.
   // TODO: We will only need one copy once exprs are threadsafe.
-  boost::mutex conjuncts_copies_lock_;
-  std::list<std::vector<Expr*>*> conjuncts_copies_;
+  SpinLock interpreted_conjuncts_copies_lock_;
+  std::list<std::vector<Expr*>*> interpreted_conjuncts_copies_;
 
   // The number of non-codegen'd conjuncts copies we made in CreateConjunctsCopies(). Used
   // for debugging.
-  int num_conjuncts_copies_;
+  int num_interpreted_conjuncts_copies_;
 
   // Total number of partition slot descriptors, including non-materialized ones.
   int num_partition_keys_;
@@ -323,6 +343,13 @@ class HdfsScanNode : public ScanNode {
   // the slot_desc's col_pos.  Non-materialized slots and partition key slots will
   // have SKIP_COLUMN as its entry.
   std::vector<int> column_idx_to_materialized_slot_idx_;
+
+  // is_materialized_col_[i] = <true i-th column should be materialized, false otherwise>
+  // for 0 <= i < total # columns
+  //
+  // This should be a vector<bool>, but bool vectors are special-cased and not stored
+  // internally as arrays, so instead we store as chars and cast to bools as needed
+  std::vector<char> is_materialized_col_;
 
   // Vector containing slot descriptors for all materialized non-partition key
   // slots.  These descriptors are sorted in order of increasing col_pos
@@ -372,6 +399,9 @@ class HdfsScanNode : public ScanNode {
 
   // Total number of bytes read via short circuit read
   RuntimeProfile::Counter* bytes_read_short_circuit_;
+
+  // Total number of bytes read from data node cache
+  RuntimeProfile::Counter* bytes_read_dn_cache_;
 
   // Lock protects access between scanner thread and main query thread (the one calling
   // GetNext()) for all fields below.  If this lock and any other locks needs to be taken
@@ -432,7 +462,14 @@ class HdfsScanNode : public ScanNode {
   // processed from the IoMgr and then processes the entire range end to end.
   // This thread terminates when all scan ranges are complete or an error occurred.
   void ScannerThread();
-  void ScannerThreadHelper();
+
+  // Returns true if there is enough memory (against the mem tracker limits) to
+  // have a scanner thread.
+  // If new_thread is true, the calculation is for starting a new scanner thread.
+  // If false, it determines whether there's adequate memory for the existing
+  // set of scanner threads.
+  // lock_ must be taken before calling this.
+  bool EnoughMemoryForScannerThread(bool new_thread);
 
   // Checks for eos conditions and returns batches from materialized_row_batches_.
   Status GetNextInternal(RuntimeState* state, RowBatch* row_batch, bool* eos);

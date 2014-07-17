@@ -45,11 +45,7 @@ ExchangeNode::ExchangeNode(
 
 Status ExchangeNode::Prepare(RuntimeState* state) {
   RETURN_IF_ERROR(ExecNode::Prepare(state));
-
   convert_row_batch_timer_ = ADD_TIMER(runtime_profile(), "ConvertRowBatchTime");
-  VLOG_QUERY << "Exch id=" << id_ << "\ninput_desc=" << input_row_desc_.DebugString()
-            << "\noutput_desc=" << row_descriptor_.DebugString();
-
   // TODO: figure out appropriate buffer size
   DCHECK_GT(num_senders_, 0);
   stream_recvr_ = state->CreateRecvr(input_row_desc_, id_, num_senders_,
@@ -58,15 +54,36 @@ Status ExchangeNode::Prepare(RuntimeState* state) {
 }
 
 Status ExchangeNode::Open(RuntimeState* state) {
-  RETURN_IF_ERROR(ExecDebugAction(TExecNodePhase::OPEN, state));
   SCOPED_TIMER(runtime_profile_->total_time_counter());
+  RETURN_IF_ERROR(ExecNode::Open(state));
+  RETURN_IF_ERROR(FillInputRowBatch(state));
   return Status::OK;
 }
 
 void ExchangeNode::Close(RuntimeState* state) {
+  if (is_closed()) return;
   input_batch_.reset();
   if (stream_recvr_ != NULL) stream_recvr_->Close();
   ExecNode::Close(state);
+}
+
+Status ExchangeNode::FillInputRowBatch(RuntimeState* state) {
+  bool is_cancelled;
+  {
+    SCOPED_TIMER(state->total_network_receive_timer());
+    input_batch_.reset(stream_recvr_->GetBatch(&is_cancelled));
+  }
+  VLOG_FILE << "exch: has batch=" << (input_batch_.get() == NULL ? "false" : "true")
+            << " #rows=" << (input_batch_.get() != NULL ? input_batch_->num_rows() : 0)
+            << " is_cancelled=" << (is_cancelled ? "true" : "false")
+            << " instance_id=" << state->fragment_instance_id();
+  if (is_cancelled) return Status(TStatusCode::CANCELLED);
+  return Status::OK;
+}
+
+void ExchangeNode::TransferInputBatchOwnership(RowBatch* output_batch) {
+  if (input_batch_.get() == NULL) return;
+  input_batch_->TransferResourceOwnership(output_batch);
 }
 
 Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* eos) {
@@ -75,15 +92,18 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
   RETURN_IF_ERROR(state->CheckQueryState());
   SCOPED_TIMER(runtime_profile_->total_time_counter());
   if (ReachedLimit()) {
+    TransferInputBatchOwnership(output_batch);
     *eos = true;
     return Status::OK;
+  } else {
+    *eos = false;
   }
 
   while (true) {
     {
       SCOPED_TIMER(convert_row_batch_timer_);
       // copy rows until we hit the limit/capacity or until we exhaust input_batch_
-      while (!ReachedLimit() && !output_batch->IsFull()
+      while (!ReachedLimit() && !output_batch->AtCapacity()
           && input_batch_.get() != NULL && next_row_idx_ < input_batch_->capacity()) {
         TupleRow* src = input_batch_->GetRow(next_row_idx_);
         ++next_row_idx_;
@@ -101,24 +121,16 @@ Status ExchangeNode::GetNext(RuntimeState* state, RowBatch* output_batch, bool* 
       COUNTER_SET(rows_returned_counter_, num_rows_returned_);
 
       if (ReachedLimit()) {
+        TransferInputBatchOwnership(output_batch);
         *eos = true;
         return Status::OK;
       }
-      if (output_batch->IsFull()) return Status::OK;
+      if (output_batch->AtCapacity()) return Status::OK;
     }
 
     // we need more rows
-    if (input_batch_.get() != NULL) input_batch_->TransferResourceOwnership(output_batch);
-    bool is_cancelled;
-    {
-      SCOPED_TIMER(state->total_network_wait_timer());
-      input_batch_.reset(stream_recvr_->GetBatch(&is_cancelled));
-    }
-    VLOG_FILE << "exch: has batch=" << (input_batch_.get() == NULL ? "false" : "true")
-              << " #rows=" << (input_batch_.get() != NULL ? input_batch_->num_rows() : 0)
-              << " is_cancelled=" << (is_cancelled ? "true" : "false")
-              << " instance_id=" << state->fragment_instance_id();
-    if (is_cancelled) return Status(TStatusCode::CANCELLED);
+    TransferInputBatchOwnership(output_batch);
+    RETURN_IF_ERROR(FillInputRowBatch(state));
     *eos = (input_batch_.get() == NULL);
     if (*eos) return Status::OK;
     next_row_idx_ = 0;

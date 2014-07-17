@@ -20,6 +20,8 @@
 #include "util/runtime-profile.h"
 #include "runtime/timestamp-value.h"
 #include "service/child-query.h"
+#include "statestore/query-schedule.h"
+#include "gen-cpp/Frontend_types.h"
 #include "service/impala-server.h"
 #include "gen-cpp/Frontend_types.h"
 
@@ -52,11 +54,9 @@ class QueryExecStateCleaner;
 // will likely become obsolete. Remove all child-query related code from this class.
 class ImpalaServer::QueryExecState {
  public:
-  QueryExecState(ExecEnv* exec_env, Frontend* frontend,
+  QueryExecState(const TQueryContext& query_ctxt, ExecEnv* exec_env, Frontend* frontend,
                  ImpalaServer* server,
-                 boost::shared_ptr<ImpalaServer::SessionState> session,
-                 const TSessionState& query_session_state,
-                 const std::string& sql_stmt);
+                 boost::shared_ptr<ImpalaServer::SessionState> session);
 
   ~QueryExecState() {
   }
@@ -83,6 +83,15 @@ class ImpalaServer::QueryExecState {
   // Also updates query_state_/status_ in case of error.
   Status FetchRows(const int32_t max_rows, QueryResultSet* fetched_rows);
 
+  // Resets the state of this query such that the next fetch() returns results from the
+  // beginning of the query result set (by using the using result_cache_).
+  // It is valid to call this function for any type of statement that returns a result
+  // set, including queries, show stmts, compute stats, etc.
+  // Returns a recoverable error status if the restart is not possible, ok() otherwise.
+  // The error is recoverable to allow clients to resume fetching.
+  // The caller must hold fetch_rows_lock_ and lock_.
+  Status RestartFetch();
+
   // Update query state if the requested state isn't already obsolete.
   // Takes lock_.
   void UpdateQueryState(beeswax::QueryState::type query_state);
@@ -106,14 +115,20 @@ class ImpalaServer::QueryExecState {
   // Takes lock_: callers must not hold lock() before calling.
   void Done();
 
-  ImpalaServer::SessionState* parent_session() const { return parent_session_.get(); }
-  const std::string& user() const { return parent_session_->user; }
-  const std::string& do_as_user() const { return parent_session_->do_as_user; }
-  TSessionType::type session_type() const { return query_session_state_.session_type; }
-  const TUniqueId& session_id() const { return query_session_state_.session_id; }
-  const std::string& default_db() const { return query_session_state_.database; }
+  // Sets the API-specific (Beeswax, HS2) result cache and its size bound.
+  // The given cache is owned by this query exec state, even if an error is returned.
+  // Returns a non-ok status if max_size exceeds the per-impalad allowed maximum.
+  Status SetResultCache(QueryResultSet* cache, int64_t max_size);
+
+  ImpalaServer::SessionState* session() const { return session_.get(); }
+  const std::string& connected_user() const { return query_ctxt_.session.connected_user; }
+  const std::string& do_as_user() const { return session_->do_as_user; }
+  TSessionType::type session_type() const { return query_ctxt_.session.session_type; }
+  const TUniqueId& session_id() const { return query_ctxt_.session.session_id; }
+  const std::string& default_db() const { return query_ctxt_.session.database; }
   bool eos() const { return eos_; }
   Coordinator* coord() const { return coord_.get(); }
+  QuerySchedule* schedule() { return schedule_.get(); }
   int num_rows_fetched() const { return num_rows_fetched_; }
   bool returns_result_set() { return !result_metadata_.columns.empty(); }
   const TResultSetMetadata* result_metadata() { return &result_metadata_; }
@@ -135,7 +150,7 @@ class ImpalaServer::QueryExecState {
   const RuntimeProfile& profile() const { return profile_; }
   const TimestampValue& start_time() const { return start_time_; }
   const TimestampValue& end_time() const { return end_time_; }
-  const std::string& sql_stmt() const { return sql_stmt_; }
+  const std::string& sql_stmt() const { return query_ctxt_.request.stmt; }
 
   inline int64_t last_active() const {
     boost::lock_guard<boost::mutex> l(expiration_data_lock_);
@@ -152,7 +167,7 @@ class ImpalaServer::QueryExecState {
 
  private:
   TUniqueId query_id_;
-  const std::string sql_stmt_;
+  const TQueryContext query_ctxt_;
 
   // Ensures single-threaded execution of FetchRows(). Callers of FetchRows() are
   // responsible for acquiring this lock. To avoid deadlocks, callers must not hold lock_
@@ -175,11 +190,10 @@ class ImpalaServer::QueryExecState {
   ExecEnv* exec_env_;
 
   // Session that this query is from
-  boost::shared_ptr<SessionState> parent_session_;
+  boost::shared_ptr<SessionState> session_;
 
-  // Snapshot of state in session_ that is not constant (and can change from
-  // QueryExecState to QueryExecState).
-  const TSessionState query_session_state_;
+  // Resource assignment determined by scheduler. Owned by obj_pool_.
+  boost::scoped_ptr<QuerySchedule> schedule_;
 
   // not set for ddl queries, or queries with "limit 0"
   boost::scoped_ptr<Coordinator> coord_;
@@ -190,6 +204,16 @@ class ImpalaServer::QueryExecState {
   // Result set used for requests that return results and are not QUERY
   // statements. For example, EXPLAIN, LOAD, and SHOW use this.
   boost::scoped_ptr<std::vector<TResultRow> > request_result_set_;
+
+  // Cache of the first result_cache_max_size_ query results to allow clients to restart
+  // fetching from the beginning of the result set. This cache is appended to in
+  // FetchInternal(), and set to NULL if its bound is exceeded. If the bound is exceeded,
+  // then clients cannot restart fetching because some results have been lost since the
+  // last fetch. Only set if result_cache_max_size_ > 0.
+  boost::scoped_ptr<QueryResultSet> result_cache_;
+
+  // Max size of the result_cache_ in number of rows. A value <= 0 means no caching.
+  int64_t result_cache_max_size_;
 
   // local runtime_state_ in case we don't have a coord_
   boost::scoped_ptr<RuntimeState> local_runtime_state_;
@@ -296,6 +320,8 @@ class ImpalaServer::QueryExecState {
 
   // Copies results into request_result_set_
   void SetResultSet(const std::vector<std::string>& results);
+  void SetResultSet(const std::vector<std::string>& col1,
+      const std::vector<std::string>& col2);
 
   // Sets the result set for a CREATE TABLE AS SELECT statement. The results will not be
   // ready until all BEs complete execution. This can be called as part of Wait(),
@@ -325,6 +351,10 @@ class ImpalaServer::QueryExecState {
   // parent query is cancelled (subsequent children will not be executed). Returns OK
   // if child_queries_thread_ is not set or if all child queries finished successfully.
   Status WaitForChildQueries();
+
+  // Sets result_cache_ to NULL and updates its associated metrics and mem consumption.
+  // This function is a no-op if the cache has already been cleared.
+  void ClearResultCache();
 };
 
 }

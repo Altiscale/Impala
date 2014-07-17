@@ -136,8 +136,8 @@ class ExprTest : public testing::Test {
     Status status = executor_->Exec(stmt, &result_types);
     ASSERT_TRUE(status.ok()) << "stmt: " << stmt << "\nerror: " << status.GetErrorMsg();
     string result_row;
-    ASSERT_TRUE(executor_->FetchResult(&result_row).ok());
-    EXPECT_EQ(TypeToOdbcString(expr_type), result_types[0].type);
+    ASSERT_TRUE(executor_->FetchResult(&result_row).ok()) << expr;
+    EXPECT_EQ(TypeToOdbcString(expr_type), result_types[0].type) << expr;
     *interpreted_value = ConvertValue(expr_type, result_row);
   }
 
@@ -176,7 +176,7 @@ class ExprTest : public testing::Test {
         expr_value_.timestamp_val = TimestampValue(&value[0], value.size());
         return &expr_value_.timestamp_val;
       default:
-        DCHECK(type);
+        DCHECK(false) << type;
     }
     return NULL;
 
@@ -552,7 +552,7 @@ class ExprTest : public testing::Test {
     TestIsNull("NULL + NULL", TYPE_NULL);
     TestIsNull("NULL - NULL", TYPE_NULL);
     TestIsNull("NULL * NULL", TYPE_NULL);
-    TestIsNull("NULL / NULL", TYPE_DOUBLE);
+    TestIsNull("NULL / NULL", TYPE_NULL);
     TestIsNull("NULL & NULL", TYPE_NULL);
     TestIsNull("NULL | NULL", TYPE_NULL);
     TestIsNull("NULL ^ NULL", TYPE_NULL);
@@ -617,7 +617,7 @@ void TestSingleLiteralConstruction(const ColumnType& type, const void* value,
     const string& string_val) {
   ObjectPool pool;
   RowDescriptor desc;
-  RuntimeState state(TUniqueId(), TUniqueId(), TQueryOptions(), "", "", NULL);
+  RuntimeState state(TUniqueId(), TUniqueId(), TQueryContext(), "", NULL);
 
   Expr* expr = Expr::CreateLiteral(&pool, type, const_cast<void*>(value));
   EXPECT_TRUE(expr != NULL);
@@ -628,7 +628,7 @@ void TestSingleLiteralConstruction(const ColumnType& type, const void* value,
 TEST_F(ExprTest, NullLiteral) {
   for (int type = TYPE_BOOLEAN; type != TYPE_DATE; ++type) {
     NullLiteral expr(static_cast<PrimitiveType>(type));
-    RuntimeState state(TUniqueId(), TUniqueId(), TQueryOptions(), "", "", NULL);
+    RuntimeState state(TUniqueId(), TUniqueId(), TQueryContext(), "", NULL);
     Status status = Expr::Prepare(&expr, &state, RowDescriptor(), disable_codegen_);
     EXPECT_TRUE(status.ok());
     EXPECT_TRUE(expr.GetValue(NULL) == NULL);
@@ -777,15 +777,15 @@ TEST_F(ExprTest, ArithmeticExprs) {
 
   // Test behavior with NULLs.
   TestNullOperandFixedResultTypeOps<float, double>(min_float_values_[TYPE_FLOAT],
-      TYPE_FLOAT);
+      TYPE_DOUBLE);
   TestNullOperandFixedResultTypeOps<double, double>(min_float_values_[TYPE_DOUBLE],
-      TYPE_FLOAT);
+      TYPE_DOUBLE);
   TestNullOperandFixedResultTypeOps<int8_t, int64_t>(min_int_values_[TYPE_TINYINT],
-      TYPE_TINYINT);
-  TestNullOperandFixedResultTypeOps<int16_t, int64_t>(min_int_values_[TYPE_SMALLINT],
       TYPE_SMALLINT);
-  TestNullOperandFixedResultTypeOps<int32_t, int64_t>(min_int_values_[TYPE_INT],
+  TestNullOperandFixedResultTypeOps<int16_t, int64_t>(min_int_values_[TYPE_SMALLINT],
       TYPE_INT);
+  TestNullOperandFixedResultTypeOps<int32_t, int64_t>(min_int_values_[TYPE_INT],
+      TYPE_BIGINT);
   TestNullOperandFixedResultTypeOps<int64_t, int64_t>(min_int_values_[TYPE_BIGINT],
       TYPE_BIGINT);
 
@@ -1011,6 +1011,10 @@ TEST_F(ExprTest, LikePredicate) {
   TestValue("'abxcy1234a' RLIKE 'a.x.y.*a'", TYPE_BOOLEAN, true);
   TestValue("'axcy1234a' REGEXP 'a.x.y.*a'", TYPE_BOOLEAN, false);
   TestValue("'axcy1234a' RLIKE 'a.x.y.*a'", TYPE_BOOLEAN, false);
+  TestValue("'english' REGEXP 'en'", TYPE_BOOLEAN, true);
+  TestValue("'english' REGEXP 'lis'", TYPE_BOOLEAN, true);
+  TestValue("'english' REGEXP 'english'", TYPE_BOOLEAN, true);
+  TestValue("'english' REGEXP 'engilsh'", TYPE_BOOLEAN, false);
   // regex escape chars; insert special character in the middle to prevent
   // it from being matched as a substring
   TestValue("'.[]{}()x\\\\*+?|^$' LIKE '.[]{}()_\\\\\\\\*+?|^$'", TYPE_BOOLEAN, true);
@@ -1187,10 +1191,13 @@ TEST_F(ExprTest, StringFunctions) {
       "\nIs\rA\tLong\fMessage");
   TestIsNull("initcap(NULL)", TYPE_STRING);
 
-  TestValue("length('')", TYPE_INT, 0);
-  TestValue("length('a')", TYPE_INT, 1);
-  TestValue("length('abcdefg')", TYPE_INT, 7);
-  TestIsNull("length(NULL)", TYPE_INT);
+  string length_aliases[] = {"length", "char_length", "character_length"};
+  for (int i = 0; i < 3; i++) {
+    TestValue(length_aliases[i] + "('')", TYPE_INT, 0);
+    TestValue(length_aliases[i] + "('a')", TYPE_INT, 1);
+    TestValue(length_aliases[i] + "('abcdefg')", TYPE_INT, 7);
+    TestIsNull(length_aliases[i] + "(NULL)", TYPE_INT);
+  }
 
   TestStringValue("reverse('abcdefg')", "gfedcba");
   TestStringValue("reverse('')", "");
@@ -1493,6 +1500,21 @@ TEST_F(ExprTest, StringParseUrlFunction) {
   // Exactly what Hive returns as well.
   TestStringValue("parse_url('http://example.com_xyzabc^&*', 'HOST')",
       "example.com_xyzabc^&*");
+  // Colon after host:port/ (with port)
+  TestStringValue("parse_url('http://user:pass@example.com:80/docs/books/tutorial/"
+      "index.html?name:networking#DOWNLOADING', 'HOST')", "example.com");
+  // Colon after host/ (without port)
+  TestStringValue("parse_url('http://user:pass@example.com/docs/books/tutorial/"
+      "index.html?name:networking#DOWNLOADING', 'HOST')", "example.com");
+  // Colon in query without '/' no port
+  TestStringValue("parse_url('http://user:pass@example.com"
+      "?name:networking#DOWNLOADING', 'HOST')", "example.com");
+  // Colon in query without '/' with port
+  TestStringValue("parse_url('http://user:pass@example.com:80"
+      "?name:networking#DOWNLOADING', 'HOST')", "example.com");
+  // '/' in query
+  TestStringValue("parse_url('http://user:pass@example.com:80"
+      "?name:networking/DOWNLOADING', 'HOST')", "example.com");
   // Missing protocol.
   TestIsNull("parse_url('example.com/docs/books/tutorial/"
       "index.html?name=networking#DOWNLOADING', 'HOST')", TYPE_STRING);
@@ -1692,6 +1714,7 @@ TEST_F(ExprTest, StringParseUrlFunction) {
 }
 
 TEST_F(ExprTest, UtilityFunctions) {
+  TestStringValue("current_database()", "default");
   TestStringValue("user()", "impala_test_user");
   TestStringValue("version()", GetVersionString());
   TestValue("sleep(100)", TYPE_BOOLEAN, true);
@@ -1708,8 +1731,9 @@ TEST_F(ExprTest, UtilityFunctions) {
   unordered_map<int, int64_t>::iterator int_iter;
   for(int_iter = min_int_values_.begin(); int_iter != min_int_values_.end();
       ++int_iter) {
-    PrimitiveType t = static_cast<PrimitiveType>(int_iter->first);
-    expected = HashUtil::FnvHash64(&int_iter->second, GetByteSize(t), HashUtil::FNV_SEED);
+    ColumnType t = ColumnType(static_cast<PrimitiveType>(int_iter->first));
+    expected = HashUtil::FnvHash64(
+        &int_iter->second, t.GetByteSize(), HashUtil::FNV_SEED);
     string& val = default_type_strs_[int_iter->first];
     TestValue("fnv_hash(" + val + ")", TYPE_BIGINT, expected);
   }
@@ -1767,11 +1791,9 @@ TEST_F(ExprTest, MathTrigonometricFunctions) {
   TestIsNull("atan(NULL)", TYPE_DOUBLE);
   TestIsNull("radians(NULL)", TYPE_DOUBLE);
   TestIsNull("degrees(NULL)", TYPE_DOUBLE);
-
 }
 
 TEST_F(ExprTest, MathConversionFunctions) {
-
   TestStringValue("bin(0)", "0");
   TestStringValue("bin(1)", "1");
   TestStringValue("bin(12)", "1100");
@@ -1792,6 +1814,12 @@ TEST_F(ExprTest, MathConversionFunctions) {
   TestStringValue("hex('aAzZ')", "61417A5A");
   TestStringValue("hex('Impala')", "496D70616C61");
   TestStringValue("hex('impalA')", "696D70616C41");
+  // Test non-ASCII characters
+  TestStringValue("hex(unhex('D3'))", "D3");
+  // Test width(2) and fill('0') for multiple characters < 16
+  TestStringValue("hex(unhex('0303'))", "0303");
+  TestStringValue("hex(unhex('D303D303'))", "D303D303");
+
   TestStringValue("unhex('30')", "0");
   TestStringValue("unhex('61417A5A')", "aAzZ");
   TestStringValue("unhex('496D70616C61')", "Impala");
@@ -1801,7 +1829,8 @@ TEST_F(ExprTest, MathConversionFunctions) {
   // Uneven number of chars results in empty string.
   TestStringValue("unhex('30A')", "");
 
-  // Run the test suite twice, once with a bigint parameter, and once with string parameters.
+  // Run the test suite twice, once with a bigint parameter, and once with
+  // string parameters.
   for (int i = 0; i < 2; ++i) {
     // First iteration is with bigint, second with string parameter.
     string q = (i == 0) ? "" : "'";
@@ -2138,7 +2167,7 @@ TEST_F(ExprTest, MathFunctions) {
   TestIsNull("quotient(NULL, 1.0)", TYPE_BIGINT);
   TestIsNull("quotient(1.0, NULL)", TYPE_BIGINT);
   TestIsNull("quotient(NULL, NULL)", TYPE_BIGINT);
-  TestIsNull("least(NULL)", TYPE_STRING);
+  TestIsNull("least(NULL)", TYPE_TINYINT);
   TestIsNull("least(cast(NULL as tinyint))", TYPE_TINYINT);
   TestIsNull("least(cast(NULL as smallint))", TYPE_SMALLINT);
   TestIsNull("least(cast(NULL as int))", TYPE_INT);
@@ -2146,7 +2175,7 @@ TEST_F(ExprTest, MathFunctions) {
   TestIsNull("least(cast(NULL as float))", TYPE_FLOAT);
   TestIsNull("least(cast(NULL as double))", TYPE_DOUBLE);
   TestIsNull("least(cast(NULL as timestamp))", TYPE_TIMESTAMP);
-  TestIsNull("greatest(NULL)", TYPE_STRING);
+  TestIsNull("greatest(NULL)", TYPE_TINYINT);
   TestIsNull("greatest(cast(NULL as tinyint))", TYPE_TINYINT);
   TestIsNull("greatest(cast(NULL as smallint))", TYPE_SMALLINT);
   TestIsNull("greatest(cast(NULL as int))", TYPE_INT);
@@ -2390,7 +2419,6 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestValue("unix_timestamp('1970-01-01 00:00:00')", TYPE_INT, 0);
   TestValue("unix_timestamp('1970-01-01 00:00:00', 'yyyy-MM-dd HH:mm:ss')", TYPE_INT, 0);
   TestValue("unix_timestamp('1970-01-01', 'yyyy-MM-dd')", TYPE_INT, 0);
-  TestValue("unix_timestamp('   1970-01-01 ', 'yyyy-MM-dd')", TYPE_INT, 0);
   TestValue("unix_timestamp('1970-01-01 10:10:10', 'yyyy-MM-dd')", TYPE_INT, 0);
   TestValue("unix_timestamp('1970-01-01 00:00:00 extra text', 'yyyy-MM-dd HH:mm:ss')",
             TYPE_INT, 0);
@@ -2454,8 +2482,10 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestStringValue(
       "to_date(cast('2011-12-22 09:10:11.12345678' as timestamp))", "2011-12-22");
 
-  TestValue("datediff('2011-12-22 09:10:11.12345678', '2012-12-22')", TYPE_INT, -366);
-  TestValue("datediff('2012-12-22', '2011-12-22 09:10:11.12345678')", TYPE_INT, 366);
+  TestValue("datediff(cast('2011-12-22 09:10:11.12345678' as timestamp), \
+      cast('2012-12-22' as timestamp))", TYPE_INT, -366);
+  TestValue("datediff(cast('2012-12-22' as timestamp), \
+      cast('2011-12-22 09:10:11.12345678' as timestamp))", TYPE_INT, 366);
 
   TestIsNull("year(cast('09:10:11.000000' as timestamp))", TYPE_INT);
   TestIsNull("month(cast('09:10:11.000000' as timestamp))", TYPE_INT);
@@ -2474,8 +2504,9 @@ TEST_F(ExprTest, TimestampFunctions) {
   TestIsNull("dayofweek(NULL)", TYPE_INT);
   TestIsNull("dayofyear(NULL)", TYPE_INT);
   TestIsNull("weekofyear(NULL)", TYPE_INT);
-  TestIsNull("datediff(NULL, '2011-12-22 09:10:11.12345678')", TYPE_INT);
-  TestIsNull("datediff('2012-12-22', NULL)", TYPE_INT);
+  TestIsNull("datediff(NULL, cast('2011-12-22 09:10:11.12345678' as timestamp))",
+      TYPE_INT);
+  TestIsNull("datediff(cast('2012-12-22' as timestamp), NULL)", TYPE_INT);
   TestIsNull("datediff(NULL, NULL)", TYPE_INT);
 
   TestStringValue("dayname(cast('2011-12-18 09:10:11.000000' as timestamp))", "Sunday");
@@ -2542,20 +2573,36 @@ TEST_F(ExprTest, TimestampFunctions) {
   // Test alias
   TestValue("now() = current_timestamp()", TYPE_BOOLEAN, true);
 
+  // Test custom formats
+  TestValue("unix_timestamp('1970|01|01 00|00|00', 'yyyy|MM|dd HH|mm|ss')", TYPE_INT, 0);
+  TestValue("unix_timestamp('01,Jan,1970,00,00,00', 'dd,MMM,yyyy,HH,mm,ss')", TYPE_INT,
+      0);
+  TestValue<int64_t>("unix_timestamp('1983-08-05T05:00:00.000Z', "
+      "'yyyy-MM-ddTHH:mm:ss.SSSZ')", TYPE_INT, 428907600);
+
+  TestStringValue("from_unixtime(0, 'yyyy|MM|dd HH|mm|ss')", "1970|01|01 00|00|00");
+  TestStringValue("from_unixtime(0, 'dd,MMM,yyyy,HH,mm,ss')", "01,Jan,1970,00,00,00");
+
   // Test invalid formats returning NULL
-  TestIsNull("unix_timestamp('1970-01-01 0:00:00', 'yyyy-MM-dd HH:mm:ss')", TYPE_INT);
   TestIsNull("unix_timestamp('1970-01-01 00:00:00', 'yyyy-MM-dd hh:mm:ss')", TYPE_INT);
-  TestIsNull("unix_timestamp('1970-01-01 00:00:00', 'yy-MM-dd HH:mm:ss')", TYPE_INT);
   TestIsNull("unix_timestamp('1970-01-01', 'yyyy-MM-dd HH:mm:ss')", TYPE_INT);
   TestIsNull("unix_timestamp('1970', 'yyyy-MM-dd')", TYPE_INT);
   TestIsNull("unix_timestamp('', 'yyyy-MM-dd')", TYPE_INT);
+  TestIsNull("unix_timestamp('|1|1 00|00|00', 'yyyy|M|d HH|MM|ss')", TYPE_INT);
+  TestIsNull("unix_timestamp('1970-01-01 00:00:00', ' ')", TYPE_INT);
+  TestIsNull("unix_timestamp('1970-01-01 00:00:00', ' -===-')", TYPE_INT);
+  TestIsNull("unix_timestamp('1970-01', 'yyyy-MM-dd')", TYPE_INT);
+  TestIsNull("unix_timestamp('1970-20-01', 'yyyy-MM-dd')", TYPE_INT);
+  TestIsNull("unix_timestamp('1970-01-01', '\"foo\"')", TYPE_INT);
 
-  TestIsNull("from_unixtime(0, 'yy-MM-dd HH:mm:dd')", TYPE_STRING);
-  TestIsNull("from_unixtime(0, 'yyyy-MM-dd HH::dd')", TYPE_STRING);
-  TestIsNull("from_unixtime(0, 'HH:mm:dd')", TYPE_STRING);
-  TestIsNull("from_unixtime(cast(0 as bigint), 'yy-MM-dd HH:mm:dd')", TYPE_STRING);
-  TestIsNull("from_unixtime(cast(0 as bigint), 'yyyy-MM-dd HH::dd')", TYPE_STRING);
-  TestIsNull("from_unixtime(cast(0 as bigint), 'HH:mm:dd')", TYPE_STRING);
+  TestIsNull("from_unixtime(0, 'YY-MM-dd HH:mm:dd')", TYPE_STRING);
+  TestIsNull("from_unixtime(0, 'yyyy-MM-dd hh::dd')", TYPE_STRING);
+  TestIsNull("from_unixtime(cast(0 as bigint), 'YY-MM-dd HH:mm:dd')", TYPE_STRING);
+  TestIsNull("from_unixtime(cast(0 as bigint), 'yyyy-MM-dd hh::dd')", TYPE_STRING);
+  TestIsNull("from_unixtime(0, '')", TYPE_STRING);
+  TestIsNull("from_unixtime(0, NULL)", TYPE_STRING);
+  TestIsNull("from_unixtime(0, ' ')", TYPE_STRING);
+  TestIsNull("from_unixtime(0, ' -=++=- ')", TYPE_STRING);
 }
 
 TEST_F(ExprTest, ConditionalFunctions) {
@@ -2575,6 +2622,34 @@ TEST_F(ExprTest, ConditionalFunctions) {
       "cast('1999-06-14 19:07:25' as timestamp))", then_val);
   TestTimestampValue("if(FALSE, cast('2011-01-01 09:01:01' as timestamp), "
       "cast('1999-06-14 19:07:25' as timestamp))", else_val);
+
+  // Test nullif(). Return NULL if lhs equals rhs, lhs otherwise.
+  TestIsNull("nullif(NULL, NULL)", TYPE_BOOLEAN);
+  TestIsNull("nullif(TRUE, TRUE)", TYPE_BOOLEAN);
+  TestValue("nullif(TRUE, FALSE)", TYPE_BOOLEAN, true);
+  TestIsNull("nullif(NULL, TRUE)", TYPE_BOOLEAN);
+  TestValue("nullif(TRUE, NULL)", TYPE_BOOLEAN, true);
+  TestIsNull("nullif(NULL, 10)", TYPE_TINYINT);
+  TestValue("nullif(10, NULL)", TYPE_TINYINT, 10);
+  TestIsNull("nullif(10, 10)", TYPE_TINYINT);
+  TestValue("nullif(10, 20)", TYPE_TINYINT, 10);
+  TestIsNull("nullif(10.10, 10.10)", TYPE_DOUBLE);
+  TestValue("nullif(10.10, 20.20)", TYPE_DOUBLE, 10.10);
+  TestIsNull("nullif(NULL, 10.10)", TYPE_DOUBLE);
+  TestValue("nullif(10.10, NULL)", TYPE_DOUBLE, 10.10);
+  TestIsNull("nullif('abc', 'abc')", TYPE_STRING);
+  TestStringValue("nullif('abc', 'def')", "abc");
+  TestIsNull("nullif(NULL, 'abc')", TYPE_STRING);
+  TestStringValue("nullif('abc', NULL)", "abc");
+  TestIsNull("nullif(cast('2011-01-01 09:01:01' as timestamp), "
+      "cast('2011-01-01 09:01:01' as timestamp))", TYPE_TIMESTAMP);
+  TimestampValue testlhs(1293872461);
+  TestTimestampValue("nullif(cast('2011-01-01 09:01:01' as timestamp), "
+      "cast('1999-06-14 19:07:25' as timestamp))", testlhs);
+  TestIsNull("nullif(NULL, "
+      "cast('2011-01-01 09:01:01' as timestamp))", TYPE_TIMESTAMP);
+  TestTimestampValue("nullif(cast('2011-01-01 09:01:01' as timestamp), "
+      "NULL)", testlhs);
 
   // Test IsNull() function and its aliases on all applicable types and NULL.
   string isnull_aliases[] = {"IsNull", "IfNull", "Nvl"};
@@ -2605,8 +2680,8 @@ TEST_F(ExprTest, ConditionalFunctions) {
     TestIsNull(f + "(NULL, NULL)", TYPE_BOOLEAN);
   }
 
-  TestIsNull("coalesce(NULL)", TYPE_FLOAT);
-  TestIsNull("coalesce(NULL, NULL)", TYPE_FLOAT);
+  TestIsNull("coalesce(NULL)", TYPE_BOOLEAN);
+  TestIsNull("coalesce(NULL, NULL)", TYPE_BOOLEAN);
   TestValue("coalesce(TRUE)", TYPE_BOOLEAN, true);
   TestValue("coalesce(NULL, TRUE, NULL)", TYPE_BOOLEAN, true);
   TestValue("coalesce(FALSE, NULL, TRUE, NULL)", TYPE_BOOLEAN, false);
@@ -2694,6 +2769,45 @@ TEST_F(ExprTest, ConditionalFunctions) {
     TestValue("case when false then 1 else " + s + " end", t, int_iter->second);
     TestValue("case when true then 1 else " + s + " end", t, 1);
     TestValue("case 0 when " + s + " then true else false end", TYPE_BOOLEAN, false);
+
+    // Test for zeroifnull
+    // zeroifnull(NULL) returns 0, zeroifnull(non-null) returns the argument
+    TestValue("zeroifnull(NULL)", TYPE_TINYINT, 0);
+    TestValue("zeroifnull(cast (NULL as TINYINT))", TYPE_TINYINT, 0);
+    TestValue("zeroifnull(cast (5 as TINYINT))", TYPE_TINYINT, 5);
+    TestValue("zeroifnull(cast (NULL as SMALLINT))", TYPE_SMALLINT, 0);
+    TestValue("zeroifnull(cast (5 as SMALLINT))", TYPE_SMALLINT, 5);
+    TestValue("zeroifnull(cast (NULL as INT))", TYPE_INT, 0);
+    TestValue("zeroifnull(cast (5 as INT))", TYPE_INT, 5);
+    TestValue("zeroifnull(cast (NULL as BIGINT))", TYPE_BIGINT, 0);
+    TestValue("zeroifnull(cast (5 as BIGINT))", TYPE_BIGINT, 5);
+    TestValue<float>("zeroifnull(cast (NULL as FLOAT))", TYPE_FLOAT, 0.0f);
+    TestValue<float>("zeroifnull(cast (5 as FLOAT))", TYPE_FLOAT, 5.0f);
+    TestValue<double>("zeroifnull(cast (NULL as DOUBLE))", TYPE_DOUBLE, 0.0);
+    TestValue<double>("zeroifnull(cast (5 as DOUBLE))", TYPE_DOUBLE, 5.0);
+
+    // Test for NullIfZero
+    // Test that 0 converts to NULL and NULL remains NULL
+    TestIsNull("nullifzero(cast (0 as TINYINT))", TYPE_TINYINT);
+    TestIsNull("nullifzero(cast (NULL as TINYINT))", TYPE_TINYINT);
+    TestIsNull("nullifzero(cast (0 as SMALLINT))", TYPE_SMALLINT);
+    TestIsNull("nullifzero(cast (NULL as SMALLINT))", TYPE_SMALLINT);
+    TestIsNull("nullifzero(cast (0 as INT))", TYPE_INT);
+    TestIsNull("nullifzero(cast (NULL as INT))", TYPE_INT);
+    TestIsNull("nullifzero(cast (0 as BIGINT))", TYPE_BIGINT);
+    TestIsNull("nullifzero(cast (NULL as BIGINT))", TYPE_BIGINT);
+    TestIsNull("nullifzero(cast (0 as FLOAT))", TYPE_FLOAT);
+    TestIsNull("nullifzero(cast (NULL as FLOAT))", TYPE_FLOAT);
+    TestIsNull("nullifzero(cast (0 as DOUBLE))", TYPE_DOUBLE);
+    TestIsNull("nullifzero(cast (NULL as DOUBLE))", TYPE_DOUBLE);
+
+    // test that non-zero args are returned unchanged.
+    TestValue("nullifzero(cast (5 as TINYINT))", TYPE_TINYINT, 5);
+    TestValue("nullifzero(cast (5 as SMALLINT))", TYPE_SMALLINT, 5);
+    TestValue("nullifzero(cast (5 as INT))", TYPE_INT, 5);
+    TestValue("nullifzero(cast (5 as BIGINT))", TYPE_BIGINT, 5);
+    TestValue<float>("nullifzero(cast (5 as FLOAT))", TYPE_FLOAT, 5.0f);
+    TestValue<double>("nullifzero(cast (5 as DOUBLE))", TYPE_DOUBLE, 5.0);
   }
 
   // Test all float types in then and else exprs.
@@ -2750,7 +2864,7 @@ void ValidateLayout(const vector<Expr*>& exprs, int expected_byte_size,
 
   // Walk the computed offsets and make sure the resulting sets match expected_offsets
   for (int i = 0; i < exprs.size(); ++i) {
-    int expr_byte_size = GetByteSize(exprs[i]->type());
+    int expr_byte_size = exprs[i]->type().GetByteSize();
     map<int, set<int> >::const_iterator iter = expected_offsets.find(expr_byte_size);
     EXPECT_TRUE(iter != expected_offsets.end());
 
@@ -2777,16 +2891,16 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   // Test single Expr case
   expected_offsets.clear();
   for (int type = TYPE_BOOLEAN; type <= TYPE_STRING; ++type) {
-    PrimitiveType t = static_cast<PrimitiveType>(type);
+    ColumnType t = ColumnType(static_cast<PrimitiveType>(type));
     exprs.clear();
     expected_offsets.clear();
-    // With one expr, all offsets shoudl be 0.
-    expected_offsets[GetByteSize(t)] = list_of(0);
+    // With one expr, all offsets should be 0.
+    expected_offsets[t.GetByteSize()] = list_of(0);
     exprs.push_back(Expr::CreateLiteral(&pool, t, "0"));
-    if (t == TYPE_STRING) {
+    if (t.type == TYPE_STRING) {
       ValidateLayout(exprs, 16, 0, expected_offsets);
     } else {
-      ValidateLayout(exprs, GetByteSize(t), -1, expected_offsets);
+      ValidateLayout(exprs, t.GetByteSize(), -1, expected_offsets);
     }
   }
 
@@ -2803,7 +2917,7 @@ TEST_F(ExprTest, ResultsLayoutTest) {
   expected_offsets[1].insert(expected_byte_size);
   expected_offsets[1].insert(expected_byte_size + 1);
   expected_offsets[1].insert(expected_byte_size + 2);
-  expected_byte_size += 3 * 1 + 1;  // 1 byte of paddding
+  expected_byte_size += 3 * 1 + 1;  // 1 byte of padding
 
   exprs.push_back(Expr::CreateLiteral(&pool, TYPE_SMALLINT, "0"));
   expected_offsets[2].insert(expected_byte_size);
@@ -2879,6 +2993,7 @@ int main(int argc, char **argv) {
   EXIT_IF_ERROR(
       impala_server->StartWithClientServers(FLAGS_beeswax_port, FLAGS_beeswax_port + 1,
                                             false));
+  impala_server->SetCatalogInitialized();
   executor_ = new ImpaladQueryExecutor();
   EXIT_IF_ERROR(executor_->Setup());
 

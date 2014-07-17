@@ -23,9 +23,14 @@ set -u
 BUILD_TYPE=debug
 IMPALAD_ARGS=""
 BINARY_BASE_DIR=${IMPALA_HOME}/be/build
-IN_PROCESS=false
+GDB_PREFIX=""
+IN_PROCESS_BINARY=testutil/mini-impala-cluster
+IMPALAD_BINARY=service/impalad
+BINARY=${IMPALAD_BINARY}
+JVM_DEBUG_PORT=""
+JVM_SUSPEND="n"
+JVM_ARGS=""
 
-# Everything except for -build_type should be passed as an Impalad argument
 for ARG in $*
 do
   case "$ARG" in
@@ -40,16 +45,40 @@ do
       exit 1
       ;;
     -in-process)
-      IN_PROCESS=true
+      BINARY=${IN_PROCESS_BINARY}
       ;;
+    -gdb)
+      echo "Starting Impala under gdb..."
+      GDB_PREFIX="gdb --args"
+      ;;
+    -jvm_debug_port=*)
+      JVM_DEBUG_PORT="${ARG#*=}"
+      ;;
+    -jvm_suspend)
+      JVM_SUSPEND="y"
+      ;;
+    -jvm_args=*)
+      JVM_ARGS="${ARG#*=}"
+      ;;
+    # Pass all other options as an Impalad argument
     *)
       IMPALAD_ARGS="${IMPALAD_ARGS} ${ARG}"
   esac
 done
 
-. ${IMPALA_HOME}/bin/set-classpath.sh
-if $IN_PROCESS; then
-  exec ${BINARY_BASE_DIR}/${BUILD_TYPE}/testutil/mini-impala-cluster ${IMPALAD_ARGS}
-else
-  exec ${BINARY_BASE_DIR}/${BUILD_TYPE}/service/impalad ${IMPALAD_ARGS}
+IMPALA_CMD=${BINARY_BASE_DIR}/${BUILD_TYPE}/${BINARY}
+
+# Temporarily disable unbound variable checking in case JAVA_TOOL_OPTIONS is not set.
+set +u
+# Optionally enable Java debugging.
+if [ -n "$JVM_DEBUG_PORT" ]; then
+  export JAVA_TOOL_OPTIONS="-agentlib:jdwp=transport=dt_socket,address=localhost:${JVM_DEBUG_PORT},server=y,suspend=${JVM_SUSPEND} ${JAVA_TOOL_OPTIONS}"
 fi
+# Optionally add additional JVM args.
+if [ -n "$JVM_ARGS" ]; then
+  export JAVA_TOOL_OPTIONS="${JAVA_TOOL_OPTIONS} ${JVM_ARGS}"
+fi
+set -u
+
+. ${IMPALA_HOME}/bin/set-classpath.sh
+exec ${GDB_PREFIX} ${IMPALA_CMD} ${IMPALAD_ARGS}

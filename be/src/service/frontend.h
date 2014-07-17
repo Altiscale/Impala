@@ -21,7 +21,6 @@
 #include "gen-cpp/ImpalaHiveServer2Service.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/Frontend_types.h"
-#include "gen-cpp/CatalogService_types.h"
 #include "common/status.h"
 
 namespace impala {
@@ -43,10 +42,10 @@ class Frontend {
       TUpdateCatalogCacheResponse *resp);
 
   // Call FE to get explain plan
-  Status GetExplainPlan(const TClientRequest& query_request, std::string* explain_string);
+  Status GetExplainPlan(const TQueryContext& query_ctxt, std::string* explain_string);
 
-  // Call FE to get TClientRequestResult.
-  Status GetExecRequest(const TClientRequest& request, TExecRequest* result);
+  // Call FE to get TExecRequest.
+  Status GetExecRequest(const TQueryContext& query_ctxt, TExecRequest* result);
 
   // Returns all matching table names, per Hive's "SHOW TABLES <pattern>". Each
   // table name returned is unqualified.
@@ -127,6 +126,12 @@ class Frontend {
   // Returns true if the error returned by the FE was due to an AuthorizationException.
   static bool IsAuthorizationError(const Status& status);
 
+  // Sets the FE catalog to be initialized. This is only used for testing in
+  // conjunction with InProcessImpalaServer. This sets the FE catalog to
+  // be initialized, ready to receive queries without needing a catalog
+  // server.
+  Status SetCatalogInitialized();
+
  private:
   // Descriptor of Java Frontend class itself, used to create a new instance.
   jclass fe_class_;
@@ -146,13 +151,8 @@ class Frontend {
   jmethodID get_catalog_object_id_; // JniFrontend.getCatalogObject
   jmethodID exec_hs2_metadata_op_id_; // JniFrontend.execHiveServer2MetadataOp
   jmethodID load_table_data_id_; // JniFrontend.loadTableData
+  jmethodID set_catalog_initialized_id_; // JniFrontend.setCatalogInitialized
   jmethodID fe_ctor_;
-
-  struct MethodDescriptor;
-
-  // Utility method to load a method whose signature is in the supplied descriptor; if
-  // successful descriptor->method_id is set to a JNI method handle.
-  void LoadJniFrontendMethod(JNIEnv* jni_env, MethodDescriptor* descriptor);
 };
 
 }

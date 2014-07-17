@@ -81,11 +81,8 @@ Status HdfsTextScanner::ProcessSplit() {
 }
 
 void HdfsTextScanner::Close() {
-  AttachPool(boundary_mem_pool_.get());
+  AttachPool(boundary_mem_pool_.get(), false);
   AddFinalRowBatch();
-  // We must flush any pending batches in the row batch before telling the scan node
-  // the range is complete.
-  context_->Close();
   scan_node_->RangeComplete(THdfsFileFormat::TEXT, THdfsCompression::NONE);
 
   scan_node_->ReleaseCodegenFn(THdfsFileFormat::TEXT, codegen_fn_);
@@ -104,9 +101,10 @@ void HdfsTextScanner::InitNewRange() {
     collection_delim = '\0';
   }
 
-  delimited_text_parser_.reset(new DelimitedTextParser(scan_node_,
-      hdfs_partition->line_delim(), field_delim, collection_delim,
-      hdfs_partition->escape_char()));
+  delimited_text_parser_.reset(new DelimitedTextParser(
+      scan_node_->num_cols(), scan_node_->num_partition_keys(),
+      scan_node_->is_materialized_col(), hdfs_partition->line_delim(),
+      field_delim, collection_delim, hdfs_partition->escape_char()));
   text_converter_.reset(new TextConverter(hdfs_partition->escape_char(),
       scan_node_->hdfs_table()->null_column_value()));
 
@@ -129,8 +127,8 @@ void HdfsTextScanner::ResetScanner() {
   partial_tuple_empty_ = true;
   byte_buffer_ptr_ = byte_buffer_end_ = NULL;
 
-  partial_tuple_ = reinterpret_cast<Tuple*>(
-      boundary_mem_pool_->Allocate(scan_node_->tuple_desc()->byte_size()));
+  partial_tuple_ =
+      Tuple::Create(scan_node_->tuple_desc()->byte_size(), boundary_mem_pool_.get());
 
   // Initialize codegen fn
   InitializeWriteTuplesFn(
@@ -483,7 +481,7 @@ void HdfsTextScanner::CopyBoundaryField(FieldLocation* data, MemPool* pool) {
 
 int HdfsTextScanner::WritePartialTuple(FieldLocation* fields,
     int num_fields, bool copy_strings) {
-  copy_strings |= scan_node_->compact_data();
+  copy_strings |= scan_node_->requires_compaction();
   int next_line_offset = 0;
   for (int i = 0; i < num_fields; ++i) {
     int need_escape = false;

@@ -33,11 +33,11 @@ parser.add_option("-s", "--scale_factor", dest="scale_factor", default="",
                   help="An optional scale factor to generate the schema for")
 parser.add_option("-f", "--force_reload", dest="force_reload", action="store_true",
                   default=False, help='Skips HDFS exists check and reloads all tables')
-parser.add_option("--compute_stats", dest="compute_stats", action="store_true",
-                  default= False, help="Execute COMPUTE STATISTICS statements on the "\
-                  "tables that are loaded")
 parser.add_option("--impalad", dest="impalad", default="localhost:21000",
                   help="Impala daemon to connect to")
+parser.add_option("--hive_hs2_hostport", dest="hive_hs2_hostport",
+                  default="localhost:11050",
+                  help="HS2 host:Port to issue Hive queries against using beeline")
 parser.add_option("--table_names", dest="table_names", default=None,
                   help="Only load the specified tables - specified as a comma-seperated "\
                   "list of base table names")
@@ -64,8 +64,18 @@ AVRO_SCHEMA_DIR = "avro_schemas"
 
 GENERATE_SCHEMA_CMD = "generate-schema-statements.py --exploration_strategy=%s "\
                       "--workload=%s --scale_factor=%s --verbose"
-HIVE_CMD = os.path.join(os.environ['HIVE_HOME'], 'bin/hive')
-HIVE_ARGS = "-hiveconf hive.root.logger=WARN,console -v"
+# Load data using Hive's beeline because the Hive shell has regressed (CDH-17222).
+# The Hive shell is stateful, meaning that certain series of actions lead to problems.
+# Examples of problems due to the statefullness of the Hive shell:
+# - Creating an HBase table changes the replication factor to 1 for subsequent LOADs.
+# - INSERTs into an HBase table fail if they are the first stmt executed in a session.
+# However, beeline itself also has bugs. For example, inserting a NULL literal into
+# a string-typed column leads to an NPE. We work around these problems by using LOAD from
+# a datafile instead of doing INSERTs.
+# TODO: Adjust connection string for --use_kerberos=true appropriately.
+HIVE_CMD = os.path.join(os.environ['HIVE_HOME'], 'bin/beeline')
+HIVE_ARGS = '-u "jdbc:hive2://%s/default;auth=noSasl" --verbose=true'\
+            % (options.hive_hs2_hostport)
 HADOOP_CMD = os.path.join(os.environ['HADOOP_HOME'], 'bin/hadoop')
 
 def available_workloads(workload_dir):
@@ -79,15 +89,16 @@ def validate_workloads(all_workloads, workloads):
       print 'Available workloads: ' + ', '.join(all_workloads)
       sys.exit(1)
 
-def exec_cmd(cmd, error_msg, expect_success=True):
+def exec_cmd(cmd, error_msg, exit_on_error=True):
   ret_val = -1
   try:
     ret_val = subprocess.call(cmd, shell=True)
   except Exception as e:
     error_msg = "%s: %s" % (error_msg, str(e))
   finally:
-    if expect_success and ret_val != 0:
+    if ret_val != 0:
       print error_msg
+      if exit_on_error: sys.exit(ret_val)
   return ret_val
 
 def exec_hive_query_from_file(file_name):
@@ -167,11 +178,11 @@ def copy_avro_schemas_to_hdfs(schemas_dir):
   exec_hadoop_fs_cmd("-mkdir -p " + options.hive_warehouse_dir)
   exec_hadoop_fs_cmd("-put -f %s %s/" % (schemas_dir, options.hive_warehouse_dir))
 
-def exec_hadoop_fs_cmd(args, expect_success=True):
+def exec_hadoop_fs_cmd(args, exit_on_error=True):
   cmd = "%s fs %s" % (HADOOP_CMD, args)
   print "Executing Hadoop command: " + cmd
   exec_cmd(cmd, "Error executing Hadoop command, exiting",
-      expect_success=expect_success)
+      exit_on_error=exit_on_error)
 
 def exec_impala_query_from_file_parallel(query_files):
   # Get the name of the query file that loads the base tables, if it exists.
@@ -183,14 +194,6 @@ def exec_impala_query_from_file_parallel(query_files):
     # If loading the base tables failed, exit with a non zero error code.
     if not is_success: sys.exit(1)
   if not query_files: return
-
-  # Refresh Catalog
-  print "Invalidating metadata"
-  impala_client = ImpalaBeeswaxClient(options.impalad, use_kerberos=options.use_kerberos)
-  impala_client.connect()
-  impala_client.execute('invalidate metadata')
-  impala_client.close_connection()
-
   threads = []
   result_queue = Queue()
   for query_file in query_files:
@@ -211,6 +214,15 @@ def exec_impala_query_from_file_parallel(query_files):
   # finished putting their results in the queue.
   for thread in threads: thread.join()
 
+def invalidate_impala_metadata():
+  print "Invalidating Metadata"
+  impala_client = ImpalaBeeswaxClient(options.impalad, use_kerberos=options.use_kerberos)
+  impala_client.connect()
+  try:
+    impala_client.execute('invalidate metadata')
+  finally:
+    impala_client.close_connection()
+
 if __name__ == "__main__":
   all_workloads = available_workloads(WORKLOAD_DIR)
   workloads = []
@@ -224,7 +236,6 @@ if __name__ == "__main__":
   else:
     workloads = options.workloads.split(",")
     validate_workloads(all_workloads, workloads)
-
 
   print 'Starting data load for the following workloads: ' + ', '.join(workloads)
 
@@ -247,16 +258,18 @@ if __name__ == "__main__":
     impala_load_files = [f for f in dataset_dir_contents if load_filename in f]
 
     # Execute the data loading scripts.
-    # Creating tables in Impala have no dependencies, so we execute them first.
+    # Creating tables in Impala has no dependencies, so we execute them first.
     # HBase table inserts are done via hive, so the hbase tables need to be created before
     # running the hive script. Finally, some of the Impala inserts depend on hive tables,
     # so they're done at the end.
     exec_impala_query_from_file_parallel(impala_create_files)
     exec_hbase_query_from_file('load-%s-hbase-generated.create' % load_file_substr)
     exec_hive_query_from_file('load-%s-hive-generated.sql' % load_file_substr)
+    if impala_load_files: invalidate_impala_metadata()
     exec_impala_query_from_file_parallel(impala_load_files)
     loading_time_map[workload] = time.time() - start_time
 
+  invalidate_impala_metadata()
   total_time = 0.0
   for workload, load_time in loading_time_map.iteritems():
     total_time += load_time

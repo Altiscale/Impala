@@ -202,7 +202,7 @@ void DataStreamSender::Channel::TransmitDataHelper(const TRowBatch* batch) {
       SCOPED_TIMER(parent_->thrift_transmit_timer_);
       try {
         client->TransmitData(res, params);
-      } catch (TTransportException& e) {
+      } catch (const TException& e) {
         VLOG_RPC << "Retrying TransmitData: " << e.what();
         rpc_status_ = client.Reopen();
         if (!rpc_status_.ok()) {
@@ -228,7 +228,7 @@ void DataStreamSender::Channel::TransmitDataHelper(const TRowBatch* batch) {
 }
 
 void DataStreamSender::Channel::WaitForRpc() {
-  SCOPED_TIMER(parent_->state_->total_network_wait_timer());
+  SCOPED_TIMER(parent_->state_->total_network_send_timer());
   unique_lock<mutex> l(rpc_thread_lock_);
   while (rpc_in_flight_) {
     rpc_done_cv_.wait(l);
@@ -309,7 +309,7 @@ Status DataStreamSender::Channel::CloseInternal() {
     VLOG_RPC << "calling TransmitData to close channel";
     try {
       client->TransmitData(res, params);
-    } catch (TTransportException& e) {
+    } catch (const TException& e) {
       VLOG_RPC << "Retrying TransmitData: " << e.what();
       rpc_status_ = client.Reopen();
       if (!rpc_status_.ok()) {
@@ -380,7 +380,7 @@ DataStreamSender::~DataStreamSender() {
   }
 }
 
-Status DataStreamSender::Init(RuntimeState* state) {
+Status DataStreamSender::Prepare(RuntimeState* state) {
   DCHECK(state != NULL);
   state_ = state;
   stringstream title;
@@ -414,6 +414,10 @@ Status DataStreamSender::Init(RuntimeState* state) {
   return Status::OK;
 }
 
+Status DataStreamSender::Open(RuntimeState* state) {
+  return Expr::Open(partition_exprs_, state);
+}
+
 Status DataStreamSender::Send(RuntimeState* state, RowBatch* batch, bool eos) {
   SCOPED_TIMER(profile_->total_time_counter());
   DCHECK(!closed_);
@@ -440,17 +444,18 @@ Status DataStreamSender::Send(RuntimeState* state, RowBatch* batch, bool eos) {
     int num_channels = channels_.size();
     for (int i = 0; i < batch->num_rows(); ++i) {
       TupleRow* row = batch->GetRow(i);
-      size_t hash_val = 0;
+      uint32_t hash_val = HashUtil::FNV_SEED;
       for (vector<Expr*>::iterator expr = partition_exprs_.begin();
            expr != partition_exprs_.end(); ++expr) {
         void* partition_val = (*expr)->GetValue(row);
         // We can't use the crc hash function here because it does not result
         // in uncorrelated hashes with different seeds.  Instead we must use
-        // fvn hash.
+        // fnv hash.
         // TODO: fix crc hash/GetHashValue()
         hash_val =
             RawValue::GetHashValueFnv(partition_val, (*expr)->type(), hash_val);
       }
+
       RETURN_IF_ERROR(channels_[hash_val % num_channels]->AddRow(row));
     }
   }
@@ -459,10 +464,10 @@ Status DataStreamSender::Send(RuntimeState* state, RowBatch* batch, bool eos) {
 
 void DataStreamSender::Close(RuntimeState* state) {
   if (closed_) return;
-  // TODO: only close channels that didn't have any errors
   for (int i = 0; i < channels_.size(); ++i) {
     channels_[i]->Close(state);
   }
+  Expr::Close(partition_exprs_, state);
   closed_ = true;
 }
 

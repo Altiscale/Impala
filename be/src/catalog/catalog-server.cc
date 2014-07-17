@@ -14,10 +14,9 @@
 
 #include "catalog/catalog-server.h"
 
-#include <google/malloc_extension.h>
+#include <gutil/strings/substitute.h>
 #include <thrift/protocol/TDebugProtocol.h>
 
-#include "catalog/catalog-server.h"
 #include "catalog/catalog-util.h"
 #include "statestore/statestore-subscriber.h"
 #include "util/debug-util.h"
@@ -29,6 +28,7 @@ using namespace impala;
 using namespace std;
 using namespace boost;
 using namespace apache::thrift;
+using namespace strings;
 
 DEFINE_int32(catalog_service_port, 26000, "port where the CatalogService is running");
 DECLARE_string(state_store_host);
@@ -84,8 +84,20 @@ class CatalogServiceThriftIf : public CatalogServiceIf {
     VLOG_RPC << "UpdateCatalog(): response=" << ThriftDebugString(resp);
   }
 
-  // Executes a TUpdateCatalogRequest and returns details on the result of the
-  // operation.
+  // Gets functions in the Catalog based on the parameters of the
+  // TGetFunctionsRequest.
+  virtual void GetFunctions(TGetFunctionsResponse& resp,
+      const TGetFunctionsRequest& req) {
+    VLOG_RPC << "GetFunctions(): request=" << ThriftDebugString(req);
+    Status status = catalog_server_->catalog()->GetFunctions(req, &resp);
+    if (!status.ok()) LOG(ERROR) << status.GetErrorMsg();
+    TStatus thrift_status;
+    status.ToThrift(&thrift_status);
+    resp.__set_status(thrift_status);
+    VLOG_RPC << "GetFunctions(): response=" << ThriftDebugString(resp);
+  }
+
+  // Gets a TCatalogObject based on the parameters of the TGetCatalogObjectRequest.
   virtual void GetCatalogObject(TGetCatalogObjectResponse& resp,
       const TGetCatalogObjectRequest& req) {
     VLOG_RPC << "GetCatalogObject(): request=" << ThriftDebugString(req);
@@ -130,17 +142,15 @@ Status CatalogServer::Start() {
   TNetworkAddress server_address = MakeNetworkAddress(FLAGS_hostname,
       FLAGS_catalog_service_port);
 
-  stringstream subscriber_id;
-  subscriber_id << server_address;
-
   // This will trigger a full Catalog metadata load.
   catalog_.reset(new Catalog());
   catalog_update_gathering_thread_.reset(new Thread("catalog-server",
       "catalog-update-gathering-thread",
       &CatalogServer::GatherCatalogUpdatesThread, this));
 
-  statestore_subscriber_.reset(new StatestoreSubscriber(subscriber_id.str(),
-     subscriber_address, statestore_address, metrics_));
+  statestore_subscriber_.reset(new StatestoreSubscriber(
+     TNetworkAddressToString(server_address), subscriber_address, statestore_address,
+     metrics_));
 
   StatestoreSubscriber::UpdateCallback cb =
       bind<void>(mem_fn(&CatalogServer::UpdateCatalogTopicCallback), this, _1, _2);
@@ -254,22 +264,6 @@ void CatalogServer::GatherCatalogUpdatesThread() {
       }
     }
 
-#ifndef ADDRESS_SANITIZER
-    // Required to ensure memory gets released back to the OS, even if tcmalloc doesn't do
-    // it for us. This is because tcmalloc releases memory based on the
-    // TCMALLOC_RELEASE_RATE property, which is not actually a rate but a divisor based
-    // on the number of blocks that have been deleted. When tcmalloc does decide to
-    // release memory, it removes a single span from the PageHeap. This means there are
-    // certain allocation patterns that can lead to OOM due to not enough memory being
-    // released by tcmalloc, even when that memory is no longer being used.
-    // One example is continually resizing a vector which results in many allocations.
-    // Even after the vector goes out of scope, all the memory will not be released
-    // unless there are enough other deletions that are occurring in the system.
-    // This can eventually lead to OOM/crashes (see IMPALA-818).
-    // See: http://google-perftools.googlecode.com/svn/trunk/doc/tcmalloc.html#runtime
-    MallocExtension::instance()->ReleaseFreeMemory();
-#endif
-
     topic_processing_time_metric_->Update(sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
     topic_updates_ready_ = true;
   }
@@ -345,7 +339,9 @@ void CatalogServer::CatalogPathHandler(const Webserver::ArgumentMap& args,
     (*output) << "[ " <<  join(links, " | ") << " ] ";
 
     BOOST_FOREACH(const string& db, db_names) {
-      (*output) << "<a id='" << db << "'><h3>" << db << "</h3></a>";
+      (*output) << Substitute(
+          "<a href='catalog_objects?object_type=DATABASE&object_name=$0' id='$0'>"
+          "<h3>$0</h3></a>", db);
       TGetTablesResult get_table_results;
       Status status = catalog_->GetTableNames(db, NULL, &get_table_results);
       if (!status.ok()) {
@@ -358,7 +354,10 @@ void CatalogServer::CatalogPathHandler(const Webserver::ArgumentMap& args,
 
       (*output) << "<ul>" << endl;
       BOOST_FOREACH(const string& table, table_names) {
-        (*output) << "<li>" << table << "</li>" << endl;
+        const string& link_text = Substitute(
+            "<a href='catalog_objects?object_type=TABLE&object_name=$0.$1'>$1</a>",
+            db, table);
+        (*output) << "<li>" << link_text << "</li>" << endl;
       }
       (*output) << "</ul>" << endl;
     }

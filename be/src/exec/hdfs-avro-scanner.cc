@@ -258,7 +258,8 @@ Status HdfsAvroScanner::ResolveSchemas(const avro_schema_t& table_schema,
     SchemaElement element = ConvertSchemaNode(file_field);
     if (element.type >= COMPLEX_TYPE) {
       stringstream ss;
-      ss << "Complex Avro types unsupported: " << element.type;
+      ss << "Complex Avro data types (records, enums, arrays, maps, unions, and fixed) "
+         << "are not supported. Got type: " << element.type;
       return Status(ss.str());
     }
 
@@ -427,38 +428,38 @@ Status HdfsAvroScanner::VerifyTypesMatch(SlotDescriptor* slot_desc,
       return Status::OK;
     case AVRO_STRING:
     case AVRO_BYTES:
-      if (slot_desc->type() == TYPE_STRING) return Status::OK;
+      if (slot_desc->type().type == TYPE_STRING) return Status::OK;
       break;
     case AVRO_INT32:
-      if (slot_desc->type() == TYPE_INT) return Status::OK;
+      if (slot_desc->type().type == TYPE_INT) return Status::OK;
       // Type promotion
-      if (slot_desc->type() == TYPE_BIGINT) return Status::OK;
-      if (slot_desc->type() == TYPE_FLOAT) return Status::OK;
-      if (slot_desc->type() == TYPE_DOUBLE) return Status::OK;
+      if (slot_desc->type().type == TYPE_BIGINT) return Status::OK;
+      if (slot_desc->type().type == TYPE_FLOAT) return Status::OK;
+      if (slot_desc->type().type == TYPE_DOUBLE) return Status::OK;
       break;
     case AVRO_INT64:
-      if (slot_desc->type() == TYPE_BIGINT) return Status::OK;
+      if (slot_desc->type().type == TYPE_BIGINT) return Status::OK;
       // Type promotion
-      if (slot_desc->type() == TYPE_FLOAT) return Status::OK;
-      if (slot_desc->type() == TYPE_DOUBLE) return Status::OK;
+      if (slot_desc->type().type == TYPE_FLOAT) return Status::OK;
+      if (slot_desc->type().type == TYPE_DOUBLE) return Status::OK;
       break;
     case AVRO_FLOAT:
-      if (slot_desc->type() == TYPE_FLOAT) return Status::OK;
+      if (slot_desc->type().type == TYPE_FLOAT) return Status::OK;
       // Type promotion
-      if (slot_desc->type() == TYPE_DOUBLE) return Status::OK;
+      if (slot_desc->type().type == TYPE_DOUBLE) return Status::OK;
       break;
     case AVRO_DOUBLE:
-      if (slot_desc->type() == TYPE_DOUBLE) return Status::OK;
+      if (slot_desc->type().type == TYPE_DOUBLE) return Status::OK;
       break;
     case AVRO_BOOLEAN:
-      if (slot_desc->type() == TYPE_BOOLEAN) return Status::OK;
+      if (slot_desc->type().type == TYPE_BOOLEAN) return Status::OK;
       break;
     default:
       break;
   }
   stringstream ss;
   ss << "Unresolvable column types (column " << slot_desc->col_pos() << "): "
-     << "declared type = " << TypeToString(slot_desc->type()) << ", "
+     << "declared type = " << slot_desc->type() << ", "
      << "Avro type = " << avro_type;
   return Status(ss.str());
 }
@@ -470,7 +471,7 @@ Status HdfsAvroScanner::InitNewRange() {
   template_tuple_ = avro_header_->template_tuple;
   if (header_->is_compressed) {
     RETURN_IF_ERROR(Codec::CreateDecompressor(
-        data_buffer_pool_.get(), stream_->compact_data(),
+        data_buffer_pool_.get(), scan_node_->tuple_desc()->string_slots().empty(),
         header_->compression_type, &decompressor_));
   }
 
@@ -517,6 +518,7 @@ Status HdfsAvroScanner::ProcessRange() {
       SCOPED_TIMER(decompress_timer_);
       RETURN_IF_ERROR(decompressor_->ProcessBlock(
           false, compressed_size, compressed_data, &size, &data));
+      VLOG_FILE << "Decompressed " << compressed_size << " to " << size;
     } else {
       data = compressed_data;
     }
@@ -549,7 +551,9 @@ Status HdfsAvroScanner::ProcessRange() {
       if (scan_node_->ReachedLimit()) return Status::OK;
     }
 
-    if (!stream_->compact_data()) AttachPool(data_buffer_pool_.get());
+    if (decompressor_.get() != NULL && !decompressor_->reuse_output_buffer()) {
+      AttachPool(data_buffer_pool_.get(), true);
+    }
     RETURN_IF_ERROR(ReadSync());
   }
 
@@ -565,7 +569,7 @@ void HdfsAvroScanner::MaterializeTuple(MemPool* pool, uint8_t** data, Tuple* tup
     if (slot_desc != NULL) {
       write_slot = true;
       slot = tuple->GetSlot(slot_desc->tuple_offset());
-      slot_type = slot_desc->type();
+      slot_type = slot_desc->type().type;
     }
 
     avro_type_t type = element.type;
@@ -662,7 +666,9 @@ Function* HdfsAvroScanner::CodegenMaterializeTuple(HdfsScanNode* node,
   int error = avro_schema_from_json_length(
       table_schema_str.c_str(), table_schema_str.size(), &table_schema.schema);
   if (error != 0) {
-    LOG(WARNING) << "Failed to parse table schema: " << avro_strerror();
+    stringstream ss;
+    ss << "Failed to parse table schema: " << avro_strerror();
+    node->runtime_state()->LogError(ss.str());
     return NULL;
   }
   int num_fields = avro_schema_record_size(table_schema.schema);
@@ -770,13 +776,15 @@ Function* HdfsAvroScanner::CodegenMaterializeTuple(HdfsScanNode* node,
         read_field_fn = codegen->GetFunction(IRFunction::READ_AVRO_STRING);
         break;
       default:
-        DCHECK(false) << "Unsupported SchemaElement: " << element.type;
+        // Unsupported type, can't codegen
+        fn->eraseFromParent();
+        return NULL;
     }
 
     if (slot_idx != HdfsScanNode::SKIP_COLUMN) {
       // Field corresponds to materialized column
       SlotDescriptor* slot_desc = node->materialized_slots()[slot_idx];
-      Value* slot_type_val = codegen->GetIntConstant(TYPE_INT, slot_desc->type());
+      Value* slot_type_val = codegen->GetIntConstant(TYPE_INT, slot_desc->type().type);
       Value* slot_val =
           builder.CreateStructGEP(tuple_val, slot_desc->field_idx(), "slot");
       Value* opaque_slot_val =

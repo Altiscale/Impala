@@ -85,6 +85,17 @@ void* LikePredicate::ConstantEqualsFn(Expr* e, TupleRow* row) {
   return &p->result_.bool_val;
 }
 
+void* LikePredicate::ConstantRegexFnPartial(Expr* e, TupleRow* row) {
+  LikePredicate* p = static_cast<LikePredicate*>(e);
+  DCHECK_EQ(p->GetNumChildren(), 2);
+  StringValue* operand_val = static_cast<StringValue*>(e->GetChild(0)->GetValue(row));
+  if (operand_val == NULL) return NULL;
+
+  re2::StringPiece operand_sp(operand_val->ptr, operand_val->len);
+  p->result_.bool_val = RE2::PartialMatch(operand_sp, *p->regex_);
+  return &p->result_.bool_val;
+}
+
 void* LikePredicate::ConstantRegexFn(Expr* e, TupleRow* row) {
   LikePredicate* p = static_cast<LikePredicate*>(e);
   DCHECK_EQ(p->GetNumChildren(), 2);
@@ -110,8 +121,13 @@ void* LikePredicate::RegexMatch(Expr* e, TupleRow* row, bool is_like_pattern) {
   }
   re2::RE2 re(re_pattern);
   if (re.ok()) {
-    p->result_.bool_val = 
-        RE2::FullMatch(re2::StringPiece(operand_value->ptr, operand_value->len), re);
+    if (is_like_pattern) {
+      p->result_.bool_val =
+          RE2::FullMatch(re2::StringPiece(operand_value->ptr, operand_value->len), re);
+    } else {
+      p->result_.bool_val =
+          RE2::PartialMatch(re2::StringPiece(operand_value->ptr, operand_value->len), re);
+    }
     return &p->result_.bool_val;
   } else {
     // TODO: log error in runtime state
@@ -128,28 +144,30 @@ void* LikePredicate::RegexFn(Expr* e, TupleRow* row) {
   return RegexMatch(e, row, false);
 }
 
+// There is a difference in the semantics of LIKE and REGEXP
+// LIKE only requires explicit use of '%' to preform partial matches
+// REGEXP does partial matching by default
 Status LikePredicate::Prepare(RuntimeState* state, const RowDescriptor& row_desc) {
   RETURN_IF_ERROR(Expr::PrepareChildren(state, row_desc));
   DCHECK_EQ(children_.size(), 2);
-  switch (opcode_) {
-    case TExprOpcode::LIKE:
-      compute_fn_ = LikeFn;
-      break;
-    case TExprOpcode::REGEX:
-      compute_fn_ = RegexFn;
-      break;
-    default:
-      stringstream error;
-      error << "Invalid LIKE operator: " << opcode_;
-      return Status(error.str());
+  bool is_like = fn_.name.function_name == "like";
+  if (is_like) {
+    compute_fn_ = LikeFn;
+  } else if (fn_.name.function_name == "regexp" || fn_.name.function_name == "rlike") {
+    compute_fn_ = RegexFn;
+  } else {
+    stringstream error;
+    error << "Invalid LIKE operator: " << fn_.name.function_name;
+    return Status(error.str());
   }
+
   if (GetChild(1)->IsConstant()) {
     // determine pattern and decide on eval fn
     StringValue* pattern = static_cast<StringValue*>(GetChild(1)->GetValue(NULL));
     if (pattern == NULL) return Status::OK;
     string pattern_str(pattern->ptr, pattern->len);
-    // Generate a regex search to look for simple patterns: 
-    // - "%anything%": This maps to a fast substring search implementation. 
+    // Generate a regex search to look for simple patterns:
+    // - "%anything%": This maps to a fast substring search implementation.
     // - anything%: This maps to a strncmp implementation
     // - %anything: This maps to a strncmp implementation
     // - anything: This maps to a strncmp implementation
@@ -165,7 +183,7 @@ Status LikePredicate::Prepare(RuntimeState* state, const RowDescriptor& row_desc
     DCHECK(equals_re.ok());
     void* no_arg = NULL;
 
-    if (opcode_ == TExprOpcode::LIKE) {
+    if (is_like) {
       if (RE2::FullMatch(pattern_str, substring_re, no_arg, &search_string_, no_arg)) {
         search_string_sv_ = StringValue(search_string_);
         substring_pattern_ = StringSearch(&search_string_sv_);
@@ -184,16 +202,21 @@ Status LikePredicate::Prepare(RuntimeState* state, const RowDescriptor& row_desc
         compute_fn_ = ConstantEqualsFn;
         return Status::OK;
       }
-    } 
+    }
     string re_pattern;
-    if (opcode_ == TExprOpcode::LIKE) {
+    if (is_like) {
       ConvertLikePattern(pattern, &re_pattern);
     } else {
       re_pattern = pattern_str;
     }
     regex_.reset(new RE2(re_pattern));
     if (!regex_->ok()) return Status("Invalid regular expression: " + pattern_str);
-    compute_fn_ = ConstantRegexFn;
+    if (fn_.name.function_name == "regexp" || fn_.name.function_name == "rlike") {
+      compute_fn_ = ConstantRegexFnPartial;
+    } else {
+      compute_fn_ = ConstantRegexFn;
+    }
+
   }
   return Status::OK;
 }

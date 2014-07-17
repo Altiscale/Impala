@@ -36,6 +36,7 @@
 #include "util/runtime-profile.h"
 #include "util/simple-logger.h"
 #include "util/thread-pool.h"
+#include "util/time.h"
 #include "util/uid-util.h"
 #include "runtime/coordinator.h"
 #include "runtime/primitive-type.h"
@@ -92,7 +93,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // ImpalaService rpcs: Beeswax API (implemented in impala-beeswax-server.cc)
   virtual void query(beeswax::QueryHandle& query_handle, const beeswax::Query& query);
   virtual void executeAndWait(beeswax::QueryHandle& query_handle,
-      const beeswax::Query& query, const beeswax::LogContextId& client_ctx);
+      const beeswax::Query& query, const beeswax::LogContextId& client_ctxt);
   virtual void explain(beeswax::QueryExplanation& query_explanation,
       const beeswax::Query& query);
   virtual void fetch(beeswax::Results& query_results,
@@ -200,6 +201,11 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   virtual void TransmitData(
       TTransmitDataResult& return_val, const TTransmitDataParams& params);
 
+  // Prepares the given query context by populating fields required for evaluating
+  // certain expressions, such as now(), pid(), etc. Should be called before handing
+  // the query context to the frontend for query compilation.
+  static void PrepareQueryContext(TQueryContext* query_ctxt);
+
   // Returns the ImpalaQueryOptions enum for the given "key". Input is case in-sensitive.
   // Return -1 if the input is an invalid option.
   static int GetQueryOption(const std::string& key);
@@ -237,6 +243,12 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   void CatalogUpdateCallback(const StatestoreSubscriber::TopicDeltaMap& topic_deltas,
       std::vector<TTopicDelta>* topic_updates);
 
+  // Returns true if Impala is offline (and not accepting queries), false otherwise.
+  bool IsOffline() {
+    boost::lock_guard<boost::mutex> l(is_offline_lock_);
+    return is_offline_;
+  }
+
  private:
   class FragmentExecState;
   friend class ChildQuery;
@@ -259,6 +271,20 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
     // Add the TResultRow to this result set. When a row comes from a DDL/metadata
     // operation, the row in the form of TResultRow.
     virtual Status AddOneRow(const TResultRow& row) = 0;
+
+    // Copies rows in the range [start_idx, start_idx + num_rows) from the other result
+    // set into this result set. Returns the number of rows added to this result set.
+    // Returns 0 if the given range is out of bounds of the other result set.
+    virtual int AddRows(const QueryResultSet* other, int start_idx, int num_rows) = 0;
+
+    // Returns the approximate size of this result set in bytes.
+    int64_t BytesSize() { return BytesSize(0, size()); }
+
+    // Returns the approximate size of the given range of rows in bytes.
+    virtual int64_t BytesSize(int start_idx, int num_rows) = 0;
+
+    // Returns the size of this result set in number of rows.
+    virtual size_t size() = 0;
   };
 
   class AsciiQueryResultSet; // extends QueryResultSet
@@ -322,15 +348,13 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // session_state is a ptr to the session running this query.
   // query_session_state is a snapshot of session state that changes when the
   // query was run. (e.g. default database).
-  Status Execute(const TClientRequest& request,
+  Status Execute(TQueryContext* query_ctxt,
                  boost::shared_ptr<SessionState> session_state,
-                 const TSessionState& query_session_state,
                  boost::shared_ptr<QueryExecState>* exec_state);
 
   // Implements Execute() logic, but doesn't unregister query on error.
-  Status ExecuteInternal(const TClientRequest& request,
+  Status ExecuteInternal(const TQueryContext& query_ctxt,
                          boost::shared_ptr<SessionState> session_state,
-                         const TSessionState& query_session_state,
                          bool* registered_exec_state,
                          boost::shared_ptr<QueryExecState>* exec_state);
 
@@ -411,6 +435,9 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // "support_start_over/false" to indicate that Impala does not support start over
   // in the fetch call.
   void InitializeConfigVariables();
+
+  // Registers all the per-Impalad webserver callbacks
+  void RegisterWebserverCallbacks(Webserver* webserver);
 
   // Checks settings for profile logging, including whether the output
   // directory exists and is writeable, and initialises the first log file.
@@ -514,7 +541,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // Beeswax private methods
 
   // Helper functions to translate between Beeswax and Impala structs
-  Status QueryToTClientRequest(const beeswax::Query& query, TClientRequest* request);
+  Status QueryToTQueryContext(const beeswax::Query& query, TQueryContext* query_ctxt);
   void TUniqueIdToQueryHandle(const TUniqueId& query_id, beeswax::QueryHandle* handle);
   void QueryHandleToTUniqueId(const beeswax::QueryHandle& handle, TUniqueId* query_id);
 
@@ -543,9 +570,10 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
       apache::hive::service::cli::thrift::TOperationHandle* handle,
       apache::hive::service::cli::thrift::TStatus* status);
 
-  // Executes the fetch logic for HiveServer2 FetchResults.
+  // Executes the fetch logic for HiveServer2 FetchResults. If fetch_first is true, then
+  // the query's state should be reset to fetch from the beginning of the result set.
   // Doesn't clean up the exec state if an error occurs.
-  Status FetchInternal(const TUniqueId& query_id, int32_t fetch_size,
+  Status FetchInternal(const TUniqueId& query_id, int32_t fetch_size, bool fetch_first,
       apache::hive::service::cli::thrift::TFetchResultsResp* fetch_results);
 
   // Helper functions to translate between HiveServer2 and Impala structs
@@ -557,18 +585,18 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   static void TUniqueIdToTHandleIdentifier(
       const TUniqueId& unique_id, const TUniqueId& secret,
       apache::hive::service::cli::thrift::THandleIdentifier* handle);
-  Status TExecuteStatementReqToTClientRequest(
+  Status TExecuteStatementReqToTQueryContext(
       const apache::hive::service::cli::thrift::TExecuteStatementReq execute_request,
-      TClientRequest* client_request);
+      TQueryContext* query_ctxt);
   static void TColumnValueToHiveServer2TColumnValue(const TColumnValue& value,
-      const TPrimitiveType::type& type,
+      const TColumnType& type,
       apache::hive::service::cli::thrift::TColumnValue* hs2_col_val);
   static void TQueryOptionsToMap(const TQueryOptions& query_option,
       std::map<std::string, std::string>* configuration);
 
   // Convert an expr value to HiveServer2 TColumnValue
   static void ExprValueToHiveServer2TColumnValue(const void* value,
-      const TPrimitiveType::type& type,
+      const TColumnType& type,
       apache::hive::service::cli::thrift::TColumnValue* hs2_col_val);
 
   // Helper function to translate between Beeswax and HiveServer2 type
@@ -615,6 +643,15 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // idle (i.e. no client input and no time spent processing locally) for
   // FLAGS_idle_query_timeout seconds.
   void ExpireQueries();
+
+  // Periodically opens a socket to FLAGS_local_nodemanager_url to check if the Yarn Node
+  // Manager is running. If not, this method calls SetOffline(true), and when the NM
+  // recovers, calls SetOffline(false). Only called (in nm_failure_detection_thread_) if
+  // FLAGS_enable_rm is true.
+  void DetectNmFailures();
+
+  // Set is_offline_ to the argument's value.
+  void SetOffline(bool offline);
 
   // Guards query_log_ and query_log_index_
   boost::mutex query_log_lock_;
@@ -683,8 +720,8 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
     // Time the session was created
     TimestampValue start_time;
 
-    // User for this session
-    std::string user;
+    // Connected user for this session, i.e. the user which originated this session.
+    std::string connected_user;
 
     // The user to impersonate. Empty for no impersonation.
     std::string do_as_user;
@@ -715,7 +752,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
     boost::unordered_set<TUniqueId> inflight_queries;
 
     // Time the session was last accessed.
-    TimestampValue last_accessed;
+    int64_t last_accessed_ms;
 
     // Number of RPCs concurrently accessing this session state. Used to detect when a
     // session may be correctly expired after a timeout (when ref_count == 0). Typically
@@ -793,13 +830,13 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   Status GetSessionState(const TUniqueId& session_id,
       boost::shared_ptr<SessionState>* session_state, bool mark_active = false);
 
-  // Decrement the session's reference counter and mark the last_accessed time so that
-  // state expiration can proceed.
+  // Decrement the session's reference counter and mark last_accessed_ms so that state
+  // expiration can proceed.
   inline void MarkSessionInactive(boost::shared_ptr<SessionState> session) {
     boost::lock_guard<boost::mutex> l(session->lock);
     DCHECK_GT(session->ref_count, 0);
     --session->ref_count;
-    session->last_accessed = TimestampValue::local_time();
+    session->last_accessed_ms = ms_since_epoch();
   }
 
   // protects query_locations_. Must always be taken after
@@ -910,6 +947,15 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
 
   // Container for a thread that runs ExpireQueries() if FLAGS_idle_query_timeout is set.
   boost::scoped_ptr<Thread> query_expiration_thread_;
+
+  // Container thread for DetectNmFailures().
+  boost::scoped_ptr<Thread> nm_failure_detection_thread_;
+
+  // Protects is_offline_
+  boost::mutex is_offline_lock_;
+
+  // True if Impala server is offline, false otherwise.
+  bool is_offline_;
 };
 
 // Create an ImpalaServer and Thrift servers.

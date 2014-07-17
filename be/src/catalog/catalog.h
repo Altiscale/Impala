@@ -83,6 +83,11 @@ class Catalog {
   Status GetTableNames(const std::string& db, const std::string* pattern,
       TGetTablesResult* table_names);
 
+  // Gets all functions in the catalog matching the parameters in the given
+  // TFunctionsRequest.
+  Status GetFunctions(const TGetFunctionsRequest& request,
+      TGetFunctionsResponse *response);
+
   // Prioritizes the loading of metadata for the catalog objects specified in the
   // TPrioritizeLoadRequest.
   Status PrioritizeLoad(const TPrioritizeLoadRequest& req);
@@ -100,14 +105,9 @@ class Catalog {
   jmethodID get_catalog_version_id_;  // JniCatalog.getCatalogVersion()
   jmethodID get_db_names_id_; // JniCatalog.getDbNames()
   jmethodID get_table_names_id_; // JniCatalog.getTableNames()
+  jmethodID get_functions_id_; // JniCatalog.getFunctions()
   jmethodID prioritize_load_id_; // JniCatalog.prioritizeLoad()
   jmethodID catalog_ctor_;
-
-  struct MethodDescriptor;
-
-  // Utility method to load a method whose signature is in the supplied descriptor; if
-  // successful descriptor->method_id is set to a JNI method handle.
-  void LoadJniMethod(JNIEnv* jni_env, MethodDescriptor* descriptor);
 };
 
 }

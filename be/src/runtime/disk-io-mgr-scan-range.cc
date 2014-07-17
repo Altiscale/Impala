@@ -76,8 +76,8 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
 
     if (ready_buffers_.empty()) {
       // The queue is empty indicating this thread could use more
-      // IO. Double the capacity to allow for more queueing.
-      ready_buffers_capacity_ *= 2;
+      // IO. Increase the capacity to allow for more queueing.
+      ++ready_buffers_capacity_ ;
       ready_buffers_capacity_ = ::min(ready_buffers_capacity_, MAX_QUEUE_CAPACITY);
     }
 
@@ -98,16 +98,14 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
     eosr_returned_ = (*buffer)->eosr();
   }
 
-  // Update tracking counters.  The buffer has now moved from the IoMgr to the
+  // Update tracking counters. The buffer has now moved from the IoMgr to the
   // caller.
-  if (eosr_returned_) {
-    reader_->total_range_queue_capacity_ += ready_buffers_capacity_;
-    ++reader_->num_finished_ranges_;
+  if (cached_buffer_ == NULL) {
+    ++io_mgr_->num_buffers_in_readers_;
+    ++reader_->num_buffers_in_reader_;
+    --reader_->num_ready_buffers_;
+    --reader_->num_used_buffers_;
   }
-  ++io_mgr_->num_buffers_in_readers_;
-  ++reader_->num_buffers_in_reader_;
-  --reader_->num_ready_buffers_;
-  --reader_->num_used_buffers_;
 
   Status status = (*buffer)->status_;
   if (!status.ok()) {
@@ -117,6 +115,13 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
   }
 
   unique_lock<mutex> reader_lock(reader_->lock_);
+  if (eosr_returned_) {
+    reader_->total_range_queue_capacity_ += ready_buffers_capacity_;
+    ++reader_->num_finished_ranges_;
+    reader_->initial_queue_capacity_ =
+        reader_->total_range_queue_capacity_ / reader_->num_finished_ranges_;
+  }
+
   DCHECK(reader_->Validate()) << endl << reader_->DebugString();
   if (reader_->state_ == ReaderContext::Cancelled) {
     reader_->blocked_ranges_.Remove(this);
@@ -143,7 +148,9 @@ void DiskIoMgr::ScanRange::Cancel(const Status& status) {
 
   DCHECK(!status.ok());
   {
+    // Grab both locks to make sure that all working threads see is_cancelled_.
     unique_lock<mutex> scan_range_lock(lock_);
+    unique_lock<mutex> hdfs_lock(hdfs_lock_);
     DCHECK(Validate()) << DebugString();
     if (is_cancelled_) {
       DCHECK(ready_buffers_.empty());
@@ -154,7 +161,10 @@ void DiskIoMgr::ScanRange::Cancel(const Status& status) {
     CleanupQueuedBuffers();
   }
   buffer_ready_cv_.notify_all();
-  CloseScanRange(reader_->hdfs_connection_, reader_);
+
+  // For cached buffers, we can't close the range until the cached buffer is returned.
+  // Close is handled in DiskIoMgr::ReturnBuffer().
+  if (cached_buffer_ == NULL) Close();
 }
 
 void DiskIoMgr::ScanRange::CleanupQueuedBuffers() {
@@ -202,17 +212,19 @@ bool DiskIoMgr::ScanRange::Validate() {
 
 DiskIoMgr::ScanRange::ScanRange(int capacity)
   : ready_buffers_capacity_(capacity) {
-  Reset(NULL, -1, -1, -1);
+  Reset(NULL, -1, -1, -1, false);
 }
 
 void DiskIoMgr::ScanRange::Reset(const char* file, int64_t len, int64_t offset,
-    int disk_id, void* meta_data) {
+    int disk_id, bool try_cache, void* meta_data) {
   DCHECK(ready_buffers_.empty());
   file_ = file;
   len_ = len;
   offset_ = offset;
   disk_id_ = disk_id;
+  try_cache_ = try_cache;
   meta_data_ = meta_data;
+  cached_buffer_ = NULL;
   io_mgr_ = NULL;
   reader_ = NULL;
 }
@@ -234,21 +246,21 @@ void DiskIoMgr::ScanRange::InitInternal(DiskIoMgr* io_mgr, ReaderContext* reader
   DCHECK(Validate()) << DebugString();
 }
 
-Status DiskIoMgr::ScanRange::OpenScanRange(hdfsFS hdfs_connection) {
-  unique_lock<mutex> scan_range_lock(lock_);
+Status DiskIoMgr::ScanRange::Open() {
+  unique_lock<mutex> hdfs_lock(hdfs_lock_);
   if (is_cancelled_) return Status::CANCELLED;
 
-  if (hdfs_connection != NULL) {
+  if (reader_->hdfs_connection_ != NULL) {
     if (hdfs_file_ != NULL) return Status::OK;
 
     // TODO: is there much overhead opening hdfs files?  Should we try to preserve
     // the handle across multiple scan ranges of a file?
-    hdfs_file_ = hdfsOpenFile(hdfs_connection, file_, O_RDONLY, 0, 0, 0);
+    hdfs_file_ = hdfsOpenFile(reader_->hdfs_connection_, file_, O_RDONLY, 0, 0, 0);
     if (hdfs_file_ == NULL) {
       return Status(GetHdfsErrorMsg("Failed to open HDFS file ", file_));
     }
 
-    if (hdfsSeek(hdfs_connection, hdfs_file_, offset_) != 0) {
+    if (hdfsSeek(reader_->hdfs_connection_, hdfs_file_, offset_) != 0) {
       string error_msg = GetHdfsErrorMsg("");
       stringstream ss;
       ss << "Error seeking to " << offset_ << " in file: " << file_ << " " << error_msg;
@@ -278,20 +290,20 @@ Status DiskIoMgr::ScanRange::OpenScanRange(hdfsFS hdfs_connection) {
   return Status::OK;
 }
 
-void DiskIoMgr::ScanRange::CloseScanRange(hdfsFS hdfs_connection, ReaderContext* reader) {
-  unique_lock<mutex> scan_range_lock(lock_);
-  if (hdfs_connection != NULL) {
+void DiskIoMgr::ScanRange::Close() {
+  unique_lock<mutex> hdfs_lock(hdfs_lock_);
+  if (reader_->hdfs_connection_ != NULL) {
     if (hdfs_file_ == NULL) return;
 
     struct hdfsReadStatistics* read_statistics;
     int success = hdfsFileGetReadStatistics(hdfs_file_, &read_statistics);
     if (success == 0) {
-      reader->bytes_read_local_ += read_statistics->totalLocalBytesRead;
-      reader->bytes_read_short_circuit_ += read_statistics->totalShortCircuitBytesRead;
+      reader_->bytes_read_local_ += read_statistics->totalLocalBytesRead;
+      reader_->bytes_read_short_circuit_ += read_statistics->totalShortCircuitBytesRead;
       hdfsFileFreeReadStatistics(read_statistics);
     }
 
-    hdfsCloseFile(hdfs_connection, hdfs_file_);
+    hdfsCloseFile(reader_->hdfs_connection_, hdfs_file_);
     hdfs_file_ = NULL;
   } else {
     if (local_file_ == NULL) return;
@@ -306,9 +318,8 @@ void DiskIoMgr::ScanRange::CloseScanRange(hdfsFS hdfs_connection, ReaderContext*
 // TODO: how do we best use the disk here.  e.g. is it good to break up a
 // 1MB read into 8 128K reads?
 // TODO: look at linux disk scheduling
-Status DiskIoMgr::ScanRange::ReadFromScanRange(hdfsFS hdfs_connection,
-    char* buffer, int64_t* bytes_read, bool* eosr) {
-  unique_lock<mutex> scan_range_lock(lock_);
+Status DiskIoMgr::ScanRange::Read(char* buffer, int64_t* bytes_read, bool* eosr) {
+  unique_lock<mutex> hdfs_lock(hdfs_lock_);
   if (is_cancelled_) return Status::CANCELLED;
 
   *eosr = false;
@@ -316,11 +327,11 @@ Status DiskIoMgr::ScanRange::ReadFromScanRange(hdfsFS hdfs_connection,
   int bytes_to_read =
       min(static_cast<int64_t>(io_mgr_->max_buffer_size_), len_ - bytes_read_);
 
-  if (hdfs_connection != NULL) {
+  if (reader_->hdfs_connection_ != NULL) {
     DCHECK(hdfs_file_ != NULL);
     // TODO: why is this loop necessary? Can hdfs reads come up short?
     while (*bytes_read < bytes_to_read) {
-      int last_read = hdfsRead(hdfs_connection, hdfs_file_,
+      int last_read = hdfsRead(reader_->hdfs_connection_, hdfs_file_,
           buffer + *bytes_read, bytes_to_read - *bytes_read);
       if (last_read == -1) {
         return Status(GetHdfsErrorMsg("Error reading from HDFS file: ", file_));
@@ -348,6 +359,11 @@ Status DiskIoMgr::ScanRange::ReadFromScanRange(hdfsFS hdfs_connection,
   return Status::OK;
 }
 
-
-
+Status DiskIoMgr::ScanRange::ReadFromCache(bool* read_succeeded) {
+  DCHECK(try_cache_);
+  DCHECK_EQ(bytes_read_, 0);
+  // On CDH4, this always fails.
+  *read_succeeded = false;
+  return Status::OK;
+}
 

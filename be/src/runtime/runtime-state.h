@@ -27,8 +27,10 @@
 // stringstream is a typedef, so can't forward declare it.
 #include <sstream>
 
+#include "statestore/query-resource-mgr.h"
 #include "runtime/exec-env.h"
 #include "runtime/descriptors.h"  // for PlanNodeId
+#include "runtime/disk-io-mgr.h"  // for DiskIoMgr::ReaderContext
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/thread-resource-mgr.h"
@@ -40,7 +42,6 @@
 namespace impala {
 
 class DescriptorTbl;
-class DiskIoMgr;
 class ObjectPool;
 class Status;
 class ExecEnv;
@@ -68,45 +69,50 @@ typedef std::map<std::string, std::string> FileMoveMap;
 class RuntimeState {
  public:
   RuntimeState(const TUniqueId& query_id, const TUniqueId& fragment_instance_id,
-      const TQueryOptions& query_options, const std::string& now,
-      const std::string& user, ExecEnv* exec_env);
+      const TQueryContext& query_ctxt, const std::string& cgroup, ExecEnv* exec_env);
 
   // RuntimeState for executing expr in fe-support.
-  RuntimeState(const std::string& now, const std::string& user);
+  RuntimeState(const TQueryContext& query_ctxt);
 
   // Empty d'tor to avoid issues with scoped_ptr.
   ~RuntimeState();
 
-  // Set up four-level hierarchy of mem trackers: process, query, fragment instance.
-  // The instance tracker is tied to our profile.
-  // Specific parts of the fragment (i.e. exec nodes, sinks, data stream senders, etc)
-  // will add a fourth level when they are initialized.
-  // This function also initializes a user function mem tracker (in the fourth level).
-  Status InitMemTrackers(const TUniqueId& query_id);
+  // Set up five-level hierarchy of mem trackers: process, pool, query, fragment
+  // instance. The instance tracker is tied to our profile. Specific parts of the
+  // fragment (i.e. exec nodes, sinks, data stream senders, etc) will add a fifth level
+  // when they are initialized. This function also initializes a user function mem
+  // tracker (in the fifth level). If 'request_pool' is null, no request pool mem
+  // tracker is set up, i.e. query pools will have the process mem pool as the parent.
+  Status InitMemTrackers(const TUniqueId& query_id, const std::string* request_pool,
+      int64_t query_bytes_limit);
 
   ObjectPool* obj_pool() const { return obj_pool_.get(); }
   const DescriptorTbl& desc_tbl() const { return *desc_tbl_; }
-  const TQueryOptions& query_options() const { return query_options_; }
   void set_desc_tbl(DescriptorTbl* desc_tbl) { desc_tbl_ = desc_tbl; }
-  int batch_size() const { return query_options_.batch_size; }
-  bool abort_on_error() const { return query_options_.abort_on_error; }
-  bool abort_on_default_limit_exceeded() const {
-    return query_options_.abort_on_default_limit_exceeded;
+  const TQueryOptions& query_options() const {
+    return query_ctxt_.request.query_options;
   }
-  int max_errors() const { return query_options_.max_errors; }
+  int batch_size() const { return query_ctxt_.request.query_options.batch_size; }
+  bool abort_on_error() const {
+    return query_ctxt_.request.query_options.abort_on_error;
+  }
+  bool abort_on_default_limit_exceeded() const {
+    return query_ctxt_.request.query_options.abort_on_default_limit_exceeded;
+  }
+  int max_errors() const { return query_ctxt_.request.query_options.max_errors; }
+  const TQueryContext& query_ctxt() const { return query_ctxt_; }
+  const std::string& connected_user() const { return query_ctxt_.session.connected_user; }
   const TimestampValue* now() const { return now_.get(); }
   void set_now(const TimestampValue* now);
-  const std::string& user() const { return user_; }
   const std::vector<std::string>& error_log() const { return error_log_; }
   const std::vector<std::pair<std::string, int> >& file_errors() const {
     return file_errors_;
   }
   const TUniqueId& query_id() const { return query_id_; }
   const TUniqueId& fragment_instance_id() const { return fragment_instance_id_; }
+  const std::string& cgroup() const { return cgroup_; }
   ExecEnv* exec_env() { return exec_env_; }
   DataStreamMgr* stream_mgr() { return exec_env_->stream_mgr(); }
-  HdfsFsCache* fs_cache() { return exec_env_->fs_cache(); }
-  LibCache* lib_cache() { return exec_env_->lib_cache(); }
   HBaseTableFactory* htable_factory() { return exec_env_->htable_factory(); }
   ImpalaInternalServiceClientCache* impalad_client_cache() {
     return exec_env_->impalad_client_cache();
@@ -116,17 +122,21 @@ class RuntimeState {
   }
   DiskIoMgr* io_mgr() { return exec_env_->disk_io_mgr(); }
   MemTracker* instance_mem_tracker() { return instance_mem_tracker_.get(); }
+  MemTracker* query_mem_tracker() { return query_mem_tracker_.get(); }
   ThreadResourceMgr::ResourcePool* resource_pool() { return resource_pool_; }
 
   FileMoveMap* hdfs_files_to_move() { return &hdfs_files_to_move_; }
   PartitionRowCount* num_appended_rows() { return &num_appended_rows_; }
   PartitionInsertStats* insert_stats() { return &insert_stats_; }
+  std::vector<DiskIoMgr::ReaderContext*>* reader_contexts() { return &reader_contexts_; }
 
   // Returns runtime state profile
   RuntimeProfile* runtime_profile() { return &profile_; }
 
   // Returns true if codegen is enabled for this query.
-  bool codegen_enabled() const { return !query_options_.disable_codegen; }
+  bool codegen_enabled() const {
+    return !query_ctxt_.request.query_options.disable_codegen;
+  }
 
   // Returns CodeGen object.  Returns NULL if the codegen object has not been
   // created. If codegen is enabled for the query, the codegen object will be
@@ -163,7 +173,7 @@ class RuntimeState {
   // Returns true if the error log has not reached max_errors_.
   bool LogHasSpace() {
     boost::lock_guard<boost::mutex> l(error_log_lock_);
-    return error_log_.size() < query_options_.max_errors;
+    return error_log_.size() < query_ctxt_.request.query_options.max_errors;
   }
 
   // Report that num_errors occurred while parsing file_name.
@@ -192,8 +202,11 @@ class RuntimeState {
   RuntimeProfile::Counter* total_storage_wait_timer() {
     return total_storage_wait_timer_;
   }
-  RuntimeProfile::Counter* total_network_wait_timer() {
-    return total_network_wait_timer_;
+  RuntimeProfile::Counter* total_network_send_timer() {
+    return total_network_send_timer_;
+  }
+  RuntimeProfile::Counter* total_network_receive_timer() {
+    return total_network_receive_timer_;
   }
 
   // Sets query_status_ with err_msg if no error has been set yet.
@@ -216,19 +229,17 @@ class RuntimeState {
   // doesn't continue if the query terminates abnormally.
   Status CheckQueryState();
 
+  QueryResourceMgr* query_resource_mgr() const { return query_resource_mgr_; }
+  void SetQueryResourceMgr(QueryResourceMgr* res_mgr) { query_resource_mgr_ = res_mgr; }
+
  private:
   // Set per-fragment state.
-  Status Init(const TUniqueId& fragment_instance_id,
-      const TQueryOptions& query_options, const std::string& now,
-      const std::string& user, ExecEnv* exec_env);
+  Status Init(const TUniqueId& fragment_instance_id, ExecEnv* exec_env);
 
   static const int DEFAULT_BATCH_SIZE = 1024;
 
   DescriptorTbl* desc_tbl_;
   boost::scoped_ptr<ObjectPool> obj_pool_;
-
-  // Protects data_stream_recvrs_pool_
-  boost::mutex data_stream_recvrs_lock_;
 
   // Data stream receivers created by a plan fragment are gathered here to make sure
   // they are destroyed before obj_pool_ (class members are destroyed in reverse order).
@@ -252,16 +263,20 @@ class RuntimeState {
   // Stores the number of parse errors per file.
   std::vector<std::pair<std::string, int> > file_errors_;
 
-  // Username of user that is executing the query to which this RuntimeState belongs.
-  std::string user_;
+  // Query-global parameters used for preparing exprs as now(), user(), etc. that should
+  // return a consistent result regardless which impalad is evaluating the expr.
+  TQueryContext query_ctxt_;
 
-  // Query-global timestamp, e.g., for implementing now().
+  // Query-global timestamp, e.g., for implementing now(). Set from query_globals_.
   // Use pointer to avoid inclusion of timestampvalue.h and avoid clang issues.
   boost::scoped_ptr<TimestampValue> now_;
 
   TUniqueId query_id_;
   TUniqueId fragment_instance_id_;
-  TQueryOptions query_options_;
+
+  // The Impala-internal cgroup into which execution threads are assigned.
+  // If empty, no RM is enabled.
+  std::string cgroup_;
   ExecEnv* exec_env_;
   boost::scoped_ptr<LlvmCodeGen> codegen_;
 
@@ -287,8 +302,11 @@ class RuntimeState {
   // Total time waiting in storage (across all threads)
   RuntimeProfile::Counter* total_storage_wait_timer_;
 
-  // Total time waiting in network (across all threads)
-  RuntimeProfile::Counter* total_network_wait_timer_;
+  // Total time spent sending over the network (across all threads)
+  RuntimeProfile::Counter* total_network_send_timer_;
+
+  // Total time spent receiving over the network (across all threads)
+  RuntimeProfile::Counter* total_network_receive_timer_;
 
   // MemTracker that is shared by all fragment instances running on this host.
   // The query mem tracker must be released after the instance_mem_tracker_.
@@ -310,6 +328,13 @@ class RuntimeState {
   // TODO: this is a stopgap until we implement ExprContext
   boost::scoped_ptr<MemTracker> udf_mem_tracker_;
   boost::scoped_ptr<MemPool> udf_pool_;
+
+  // Query-wide resource manager for resource expansion etc. Not owned by us; owned by the
+  // ResourceBroker instead.
+  QueryResourceMgr* query_resource_mgr_;
+
+  // Reader contexts that need to be closed when the fragment is closed.
+  std::vector<DiskIoMgr::ReaderContext*> reader_contexts_;
 
   // prohibit copies
   RuntimeState(const RuntimeState&);

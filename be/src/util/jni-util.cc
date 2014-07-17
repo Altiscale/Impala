@@ -18,6 +18,7 @@
 #include <sstream>
 
 #include "common/status.h"
+#include "rpc/thrift-util.h"
 
 using namespace std;
 
@@ -25,6 +26,7 @@ namespace impala {
 
 jclass JniUtil::jni_util_cl_ = NULL;
 jclass JniUtil::internal_exc_cl_ = NULL;
+jmethodID JniUtil::get_jvm_metrics_id_ = NULL;
 jmethodID JniUtil::throwable_to_string_id_ = NULL;
 jmethodID JniUtil::throwable_to_stack_trace_id_ = NULL;
 vector<jobject> JniUtil::global_refs_;
@@ -38,6 +40,17 @@ Status JniLocalFrame::push(JNIEnv* env, int max_local_ref) {
   }
   env_ = env;
   return Status::OK;
+}
+
+bool JniUtil::ClassExists(JNIEnv* env, const char* class_str) {
+  jclass local_cl = env->FindClass(class_str);
+  jthrowable exc = env->ExceptionOccurred();
+  if (exc != NULL) {
+    env->ExceptionClear();
+    return false;
+  }
+  env->DeleteLocalRef(local_cl);
+  return true;
 }
 
 Status JniUtil::GetGlobalClassRef(JNIEnv* env, const char* class_str, jclass* class_ref) {
@@ -112,6 +125,15 @@ Status JniUtil::Init() {
     if (env->ExceptionOccurred()) env->ExceptionDescribe();
     return Status("Failed to find JniUtil.throwableToFullStackTrace method.");
   }
+
+  get_jvm_metrics_id_ =
+      env->GetStaticMethodID(jni_util_cl_, "getJvmMetrics", "([B)[B");
+  if (get_jvm_metrics_id_ == NULL) {
+    if (env->ExceptionOccurred()) env->ExceptionDescribe();
+    return Status("Failed to find JniUtil.getJvmMetrics method.");
+  }
+
+
   return Status::OK;
 }
 
@@ -136,7 +158,7 @@ Status JniUtil::Cleanup() {
   return Status::OK;
 }
 
-Status JniUtil::GetJniExceptionMsg(JNIEnv* env, const string& prefix) {
+Status JniUtil::GetJniExceptionMsg(JNIEnv* env, bool log_stack, const string& prefix) {
   jthrowable exc = (env)->ExceptionOccurred();
   if (exc == NULL) return Status::OK;
   env->ExceptionClear();
@@ -147,11 +169,13 @@ Status JniUtil::GetJniExceptionMsg(JNIEnv* env, const string& prefix) {
   string error_msg =
       (reinterpret_cast<const char*>(env->GetStringUTFChars(msg, &is_copy)));
 
-  jstring stack = (jstring) env->CallStaticObjectMethod(jni_util_class(),
-      throwable_to_stack_trace_id(), exc);
-  const char* c_stack =
+  if (log_stack) {
+    jstring stack = (jstring) env->CallStaticObjectMethod(jni_util_class(),
+        throwable_to_stack_trace_id(), exc);
+    const char* c_stack =
       reinterpret_cast<const char*>(env->GetStringUTFChars(stack, &is_copy));
-  VLOG(1) << string(c_stack);
+    VLOG(1) << string(c_stack);
+  }
 
   env->ExceptionClear();
   env->DeleteLocalRef(exc);
@@ -159,6 +183,19 @@ Status JniUtil::GetJniExceptionMsg(JNIEnv* env, const string& prefix) {
   stringstream ss;
   ss << prefix << error_msg;
   return Status(ss.str());
+}
+
+Status JniUtil::GetJvmMetrics(const TGetJvmMetricsRequest& request,
+    TGetJvmMetricsResponse* result) {
+  return JniUtil::CallJniMethod(jni_util_class(), get_jvm_metrics_id_, request, result);
+}
+
+Status JniUtil::LoadJniMethod(JNIEnv* env, const jclass& jni_class,
+    JniMethodDescriptor* descriptor) {
+  (*descriptor->method_id) = env->GetMethodID(jni_class,
+      descriptor->name.c_str(), descriptor->signature.c_str());
+  RETURN_ERROR_IF_EXC(env);
+  return Status::OK;
 }
 
 }

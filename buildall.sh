@@ -23,10 +23,10 @@ export IMPALA_HOME=$ROOT
 . "$ROOT"/bin/impala-config.sh
 
 CLEAN_ACTION=1
-TESTDATA_ACTION=1
+TESTDATA_ACTION=0
 TESTS_ACTION=1
-FORMAT_CLUSTER=1
-FORMAT_METASTORE=1
+FORMAT_CLUSTER=0
+FORMAT_METASTORE=0
 TARGET_BUILD_TYPE=Release
 EXPLORATION_STRATEGY=core
 SNAPSHOT_FILE=
@@ -36,6 +36,9 @@ set -u
 
 # Exit on non-zero return value
 set -e
+
+# Always run in debug mode
+set -x
 
 # parse command line options
 for ARG in $*
@@ -50,23 +53,26 @@ do
     -noclean)
       CLEAN_ACTION=0
       ;;
-    -notestdata)
-      TESTDATA_ACTION=0
-      FORMAT_CLUSTER=0
-      FORMAT_METASTORE=0
+    -testdata)
+      TESTDATA_ACTION=1
+      FORMAT_CLUSTER=1
+      FORMAT_METASTORE=1
       ;;
     -skiptests)
       TESTS_ACTION=0
       ;;
-    -noformat)
-      FORMAT_CLUSTER=0
-      FORMAT_METASTORE=0
+    -notests)
+      TESTS_ACTION=0
       ;;
-    -noformat_cluster)
-      FORMAT_CLUSTER=0
+    -format)
+      FORMAT_CLUSTER=1
+      FORMAT_METASTORE=1
       ;;
-    -noformat_metastore)
-      FORMAT_METASTORE=0
+    -format_cluster)
+      FORMAT_CLUSTER=1
+      ;;
+    -format_metastore)
+      FORMAT_METASTORE=1
       ;;
     -codecoverage_debug)
       TARGET_BUILD_TYPE=CODE_COVERAGE_DEBUG
@@ -85,24 +91,47 @@ do
       ;;
     -snapshot_file)
       SNAPSHOT_FILE="UNDEFINED"
+      TESTDATA_ACTION=1
       ;;
     -help|*)
-      echo "buildall.sh [-noclean] [-notestdata] [-noformat] [-codecoverage]"\
-           "[-skiptests] [-testexhaustive]"
-      echo "[-noclean] : omits cleaning all packages before building"
-      echo "[-notestdata] : omits recreating the metastore and loading test data"
-      echo "[-noformat] : prevents formatting the minicluster and metastore db"
-      echo "[-noformat_cluster] : prevents formatting the minicluster"
-      echo "[-noformat_metastore] : prevents formatting the metastore db"
-      echo "[-codecoverage] : build with 'gcov' code coverage instrumentation at the"\
-           "cost of performance"
-      echo "[-asan] : build with address sanitizer"
-      echo "[-skiptests] : skips execution of all tests"
-      echo "[-testpairwise] : run tests in 'pairwise' mode (increases"\
+      echo "buildall.sh - Builds Impala and runs all tests."
+      echo "[-noclean] : Omits cleaning all packages before building"
+      echo "[-format] : Format the minicluster and metastore db [Default: False]"
+      echo "[-format_cluster] : Format the minicluster [Default: False]"
+      echo "[-format_metastore] : Format the metastore db [Default: False]"
+      echo "[-codecoverage_release] : Release code coverage build"
+      echo "[-codecoverage_debug] : Debug code coverage build"
+      echo "[-asan] : Build with address sanitizer"
+      echo "[-skiptests] : Skips execution of all tests"
+      echo "[-notests] : Skips building and execution of all tests"
+      echo "[-testpairwise] : Sun tests in 'pairwise' mode (increases"\
            "test execution time)"
-      echo "[-testexhaustive] : run tests in 'exhaustive' mode (significantly increases"\
+      echo "[-testexhaustive] : Run tests in 'exhaustive' mode (significantly increases"\
            "test execution time)"
-      echo "[-snapshot_file <file name>] : load test data from a snapshot file"
+      echo "[-testdata] : Loads test data. Implied as true if -snapshot_file is "\
+           "specified. If -snapshot_file is not specified, data will be regenerated."
+      echo "[-snapshot_file <file name>] : Load test data from a snapshot file"
+      echo "-----------------------------------------------------------------------------
+Examples of common tasks:
+
+  # Build and run all tests
+  ./buildall.sh
+
+  # Build and skip tests
+  ./buildall.sh -skiptests
+
+  # Incrementally rebuild and skip tests
+  ./buildall.sh -skiptests -noclean
+
+  # Build, load a snapshot file, run tests
+  ./buildall.sh -snapshot_file <file>
+
+  # Build, generate and load test data without formatting the mini-cluster (reuses
+  # existing data in HDFS if it exists). Can be faster than loading from a snapshot.
+  ./buildall.sh -testdata
+
+  # Build, format mini-cluster and metastore, load all test data, run tests
+  ./buildall.sh -testdata -format"
       exit 1
       ;;
   esac
@@ -154,9 +183,7 @@ then
 
   # clean llvm
   rm -f $IMPALA_HOME/llvm-ir/impala*.ll
-
-  # Cleanup the version.info file so it will be regenerated for the next build.
-  rm -f $IMPALA_HOME/bin/version.info
+  rm -f $IMPALA_HOME/be/generated-sources/impala-ir/*
 fi
 
 # Kill any processes that may be accessing postgres metastore
@@ -173,19 +200,14 @@ else
   ${IMPALA_HOME}/bin/create-test-configuration.sh
 fi
 
-# build common and backend
-cd $IMPALA_HOME
+
+# Generate all the make files from root.
+cd ${IMPALA_HOME}
 rm -f CMakeCache.txt
-bin/gen_build_version.py
 cmake -DCMAKE_BUILD_TYPE=$TARGET_BUILD_TYPE .
 
-cd $IMPALA_HOME/common/function-registry
-make
-cd $IMPALA_HOME/common/thrift
-make
-cd $IMPALA_BE_DIR
-python src/codegen/gen_ir_descriptions.py
-make -j${IMPALA_BUILD_THREADS:-4}
+# build common and backend
+$IMPALA_HOME/bin/make_impala.sh $*
 
 if [ -e $IMPALA_LZO ]
 then
@@ -212,10 +234,9 @@ mkdir -p ${IMPALA_TEST_CLUSTER_LOG_DIR}/fe_tests
 mkdir -p ${IMPALA_TEST_CLUSTER_LOG_DIR}/data_loading
 
 if [ $FORMAT_CLUSTER -eq 1 ]; then
-  $IMPALA_HOME/testdata/bin/run-all.sh \
-      -format 1>${IMPALA_TEST_CLUSTER_LOG_DIR}/run-all.log 2>&1
+  $IMPALA_HOME/testdata/bin/run-all.sh -format
 elif [ $TESTDATA_ACTION -eq 1 ] || [ $TESTS_ACTION -eq 1 ]; then
-  $IMPALA_HOME/testdata/bin/run-all.sh 1>${IMPALA_TEST_CLUSTER_LOG_DIR}/run-all.log 2>&1
+  $IMPALA_HOME/testdata/bin/run-all.sh
 fi
 
 if [ $TESTDATA_ACTION -eq 1 ]

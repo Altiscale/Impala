@@ -24,6 +24,7 @@
 #include "runtime/raw-value.h"
 #include "runtime/runtime-state.h"
 #include "util/debug-util.h"
+#include "util/periodic-counter-updater.h"
 
 #include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
@@ -31,8 +32,6 @@
 using namespace std;
 using namespace boost;
 using namespace apache::thrift;
-using namespace apache::thrift::protocol;
-using namespace apache::thrift::transport;
 
 namespace impala {
 
@@ -51,6 +50,8 @@ DataStreamMgr::StreamControlBlock::StreamControlBlock(RuntimeState* state,
     received_first_batch_(false) {
   bytes_received_counter_ =
       ADD_COUNTER(profile, "BytesReceived", TCounterType::BYTES);
+  bytes_received_time_series_counter_ =
+      ADD_TIME_SERIES_COUNTER(profile, "BytesReceived", bytes_received_counter_);
   deserialize_row_batch_timer_ =
       ADD_TIMER(profile, "DeserializeRowBatchTimer");
   buffer_full_wall_timer_ = ADD_TIMER(profile, "SendersBlockedTimer");
@@ -65,6 +66,7 @@ RowBatch* DataStreamMgr::StreamControlBlock::GetBatch(bool* is_cancelled) {
   while (!is_cancelled_ && batch_queue_.empty() && num_remaining_senders_ > 0) {
     VLOG_ROW << "wait arrival fragment_instance_id=" << fragment_instance_id_
              << " node=" << dest_node_id_;
+    // Don't count time spent waiting on the sender as active time.
     SCOPED_TIMER(data_arrival_timer_);
     SCOPED_TIMER(received_first_batch_ ? NULL : first_batch_wait_timer_);
     data_arrival_.wait(l);
@@ -179,6 +181,7 @@ void DataStreamMgr::StreamControlBlock::CancelStream() {
   // notice that the stream is cancelled and handle it.
   data_arrival_.notify_all();
   data_removal_.notify_all();
+  PeriodicCounterUpdater::StopTimeSeriesCounter(bytes_received_time_series_counter_);
 
   // Delete any batches queued in batch_queue_
   for (RowBatchQueue::iterator it = batch_queue_.begin();

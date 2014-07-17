@@ -28,7 +28,9 @@
 #include "runtime/row-batch.h"
 #include "util/cpu-info.h"
 #include "util/string-parser.h"
-#include "gen-cpp/Opcodes_types.h"
+
+// For DumpStackTraceToString
+#include <glog/../utilities.h>
 
 #define PRECISION 2
 #define KILOBYTE (1024)
@@ -71,8 +73,6 @@ namespace impala {
     return ss.str();\
   }
 
-THRIFT_ENUM_OUTPUT_FN(TExprOpcode);
-THRIFT_ENUM_OUTPUT_FN(TAggregationOp);
 THRIFT_ENUM_OUTPUT_FN(TFunctionBinaryType);
 THRIFT_ENUM_OUTPUT_FN(TCatalogObjectType);
 THRIFT_ENUM_OUTPUT_FN(TDdlType);
@@ -318,7 +318,11 @@ string PrettyPrinter::Print(int64_t value, TCounterType::type type) {
     case TCounterType::BYTES: {
       string unit;
       double output = GetByteUnit(value, &unit);
-      ss << setprecision(PRECISION) << output << " " << unit;
+      if (output == 0) {
+        ss << "0";
+      } else {
+        ss << setprecision(PRECISION) << output << " " << unit;
+      }
       break;
     }
 

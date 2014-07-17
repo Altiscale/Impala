@@ -27,22 +27,19 @@ using namespace std;
 
 static const int DEFAULT_READ_PAST_SIZE = 1024; // in bytes
 
+// We always want output_buffer_bytes_left_ to be non-NULL, so we can avoid a NULL check
+// in GetBytes(). We use this variable, which is set to 0, to initialize
+// output_buffer_bytes_left_. After the first successful call to GetBytes(),
+// output_buffer_bytes_left_ will be set to something else.
+static const int OUTPUT_BUFFER_BYTES_LEFT_INIT = 0;
+
 ScannerContext::ScannerContext(RuntimeState* state, HdfsScanNode* scan_node,
     HdfsPartitionDescriptor* partition_desc, DiskIoMgr::ScanRange* scan_range)
   : state_(state),
     scan_node_(scan_node),
-    partition_desc_(partition_desc) {
-  Stream* stream = AddStream(scan_range);
-  stream->compact_data_ = scan_node_->compact_data();
-}
-
-void ScannerContext::CloseStreams() {
-  // Return all resources for the current streams
-  for (int i = 0; i < streams_.size(); ++i) {
-    streams_[i]->ReturnAllBuffers();
-    streams_[i]->boundary_pool_->FreeAll();
-  }
-  streams_.clear();
+    partition_desc_(partition_desc),
+    num_completed_io_buffers_(0) {
+  AddStream(scan_range);
 }
 
 void ScannerContext::AttachCompletedResources(RowBatch* batch, bool done) {
@@ -50,6 +47,7 @@ void ScannerContext::AttachCompletedResources(RowBatch* batch, bool done) {
   for (int i = 0; i < streams_.size(); ++i) {
     streams_[i]->AttachCompletedResources(batch, done);
   }
+  if (done) streams_.clear();
 }
 
 ScannerContext::Stream::Stream(ScannerContext* parent)
@@ -68,51 +66,44 @@ ScannerContext::Stream* ScannerContext::AddStream(DiskIoMgr::ScanRange* range) {
   stream->io_buffer_bytes_left_ = 0;
   stream->boundary_buffer_bytes_left_ = 0;
   stream->output_buffer_pos_ = NULL;
-  stream->output_buffer_bytes_left_ = &stream->io_buffer_bytes_left_;
+  stream->output_buffer_bytes_left_ = const_cast<int*>(&OUTPUT_BUFFER_BYTES_LEFT_INIT);
+  stream->contains_tuple_data_ = !scan_node_->tuple_desc()->string_slots().empty();
   streams_.push_back(stream);
   return stream;
-}
-
-void ScannerContext::Stream::ReturnAllBuffers() {
-  if (io_buffer_ != NULL) completed_io_buffers_.push_back(io_buffer_);
-  for (list<DiskIoMgr::BufferDescriptor*>::iterator it = completed_io_buffers_.begin();
-      it != completed_io_buffers_.end(); ++it) {
-    (*it)->Return();
-    --parent_->scan_node_->num_owned_io_buffers_;
-  }
-  io_buffer_ = NULL;
-  io_buffer_pos_ = NULL;
-  io_buffer_bytes_left_ = 0;
-
-  // Cancel the underlying scan range to clean up any queued buffers there
-  if (scan_range_ != NULL) scan_range_->Cancel(Status::CANCELLED);
 }
 
 void ScannerContext::Stream::AttachCompletedResources(RowBatch* batch, bool done) {
   DCHECK(batch != NULL);
   if (done) {
     // Mark any pending resources as completed
-    if (io_buffer_ != NULL) completed_io_buffers_.push_back(io_buffer_);
+    if (io_buffer_ != NULL) {
+      ++parent_->num_completed_io_buffers_;
+      completed_io_buffers_.push_back(io_buffer_);
+    }
+    // Set variables to NULL to make sure streams are not used again
     io_buffer_ = NULL;
+    io_buffer_pos_ = NULL;
+    io_buffer_bytes_left_ = 0;
     // Cancel the underlying scan range to clean up any queued buffers there
     scan_range_->Cancel(Status::CANCELLED);
   }
 
   for (list<DiskIoMgr::BufferDescriptor*>::iterator it = completed_io_buffers_.begin();
        it != completed_io_buffers_.end(); ++it) {
-    if (compact_data_) {
-      (*it)->Return();
-      --parent_->scan_node_->num_owned_io_buffers_;
-    } else {
+    if (contains_tuple_data_) {
       batch->AddIoBuffer(*it);
       // TODO: We can do row batch compaction here.  This is the only place io buffers are
       // queued.  A good heuristic is to check the number of io buffers queued and if
       // there are too many, we should compact.
+    } else {
+      (*it)->Return();
+      --parent_->scan_node_->num_owned_io_buffers_;
     }
   }
+  parent_->num_completed_io_buffers_ -= completed_io_buffers_.size();
   completed_io_buffers_.clear();
 
-  if (!compact_data_) {
+  if (contains_tuple_data_) {
     // If we're not done, keep using the last chunk allocated in boundary_pool_ so we
     // don't have to reallocate. If we are done, transfer it to the row batch.
     batch->tuple_data_pool()->AcquireData(boundary_pool_.get(), /* keep_current */ !done);
@@ -132,6 +123,7 @@ Status ScannerContext::Stream::GetNextBuffer(int read_past_size) {
   bool eosr = false;
   if (io_buffer_ != NULL) {
     eosr = io_buffer_->eosr();
+    ++parent_->num_completed_io_buffers_;
     completed_io_buffers_.push_back(io_buffer_);
     io_buffer_ = NULL;
   }
@@ -150,7 +142,7 @@ Status ScannerContext::Stream::GetNextBuffer(int read_past_size) {
     // TODO: we're reading past this scan range so this is likely a remote read.
     // Update when the IoMgr has better support for remote reads.
     DiskIoMgr::ScanRange* range = parent_->scan_node_->AllocateScanRange(
-        filename(), read_past_buffer_size, offset, -1, scan_range_->disk_id());
+        filename(), read_past_buffer_size, offset, -1, scan_range_->disk_id(), false);
     RETURN_IF_ERROR(parent_->state_->io_mgr()->Read(
         parent_->scan_node_->reader_context(), range, &io_buffer_));
   }
@@ -174,6 +166,8 @@ Status ScannerContext::Stream::GetBuffer(bool peek, uint8_t** out_buffer, int* l
   }
 
   if (boundary_buffer_bytes_left_ > 0) {
+    DCHECK_EQ(output_buffer_pos_, &boundary_buffer_pos_);
+    DCHECK_EQ(output_buffer_bytes_left_, &boundary_buffer_bytes_left_);
     *out_buffer = boundary_buffer_pos_;
     // Don't return more bytes past eosr
     *len = min(static_cast<int64_t>(boundary_buffer_bytes_left_), bytes_left());
@@ -187,8 +181,11 @@ Status ScannerContext::Stream::GetBuffer(bool peek, uint8_t** out_buffer, int* l
   }
 
   if (io_buffer_bytes_left_ == 0) {
-    output_buffer_pos_ = &io_buffer_pos_;
+    // We're at the end of the boundary buffer and the current IO buffer. Get a new IO
+    // buffer and set the current buffer to it.
     RETURN_IF_ERROR(GetNextBuffer());
+    output_buffer_pos_ = &io_buffer_pos_;
+    output_buffer_bytes_left_ = &io_buffer_bytes_left_;
   }
   DCHECK(io_buffer_ != NULL);
 
@@ -209,10 +206,10 @@ Status ScannerContext::Stream::GetBytesInternal(
   *out_buffer = NULL;
 
   if (boundary_buffer_bytes_left_ == 0) {
-    if (compact_data()) {
-      boundary_buffer_->Clear();
-    } else {
+    if (contains_tuple_data_) {
       boundary_buffer_->Reset();
+    } else {
+      boundary_buffer_->Clear();
     }
   }
 
@@ -269,18 +266,6 @@ Status ScannerContext::Stream::GetBytesInternal(
   return Status::OK;
 }
 
-void ScannerContext::Close() {
-  // Set variables to NULL to make sure this object is not being used after Close()
-  for (int i = 0; i < streams_.size(); ++i) {
-    DCHECK(streams_[i]->io_buffer_ == NULL);
-    streams_[i]->io_buffer_pos_ = NULL;
-  }
-
-  for (int i = 0; i < streams_.size(); ++i) {
-    DCHECK(streams_[i]->completed_io_buffers_.empty());
-  }
-}
-
 bool ScannerContext::cancelled() const {
   return scan_node_->done_;
 }
@@ -289,6 +274,13 @@ Status ScannerContext::Stream::ReportIncompleteRead(int length, int bytes_read) 
   stringstream ss;
   ss << "Tried to read " << length << " bytes but could only read "
      << bytes_read << " bytes. This may indicate data file corruption. "
+     << "(file: " << filename() << ", byte offset: " << file_offset() << ")";
+  return Status(ss.str());
+}
+
+Status ScannerContext::Stream::ReportInvalidRead(int length) {
+  stringstream ss;
+  ss << "Invalid read of " << length << " bytes. This may indicate data file corruption. "
      << "(file: " << filename() << ", byte offset: " << file_offset() << ")";
   return Status(ss.str());
 }

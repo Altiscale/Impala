@@ -35,7 +35,7 @@ class PrettyOutputFormatter(object):
       # Reference:  https://issues.cloudera.org/browse/IMPALA-116
       error_msg = ("Prettytable cannot resolve string columns values that have "
                    " embedded tabs. Reverting to tab delimited text output")
-      # print >>sys.stderr, error_msg
+      print >>sys.stderr, error_msg
       return '\n'.join(['\t'.join(row) for row in rows])
 
 
