@@ -129,6 +129,16 @@ public class MergeNode extends PlanNode {
   @Override
   public void init(Analyzer analyzer) throws InternalException {
     assignConjuncts(analyzer);
+    // All non-constant conjuncts should have been assigned to children.
+    // This requirement is important to guarantee that conjuncts do not trigger
+    // materialization of slots in this MergeNode's tuple.
+    // TODO: It's possible to get constant conjuncts if a union operand
+    // consists of a select stmt on a constant inline view. We should
+    // drop the operand in such cases.
+    for (Expr conjunct: conjuncts_) {
+      Preconditions.checkState(conjunct.isConstant());
+    }
+
     computeMemLayout(analyzer);
     computeStats(analyzer);
     Preconditions.checkState(resultExprLists_.size() == getChildren().size());
@@ -146,7 +156,7 @@ public class MergeNode extends PlanNode {
       }
       for (List<Expr> l: constExprLists_) {
         Preconditions.checkState(l.size() == numMaterializedSlots);
-       }
+      }
       return;
     }
 
@@ -190,16 +200,17 @@ public class MergeNode extends PlanNode {
   }
 
   @Override
-  protected String getNodeExplainString(String prefix,
+  protected String getNodeExplainString(String prefix, String detailPrefix,
       TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
+    output.append(String.format("%s%s:%s\n", prefix, id_.toString(), displayName_));
     // A MergeNode may have predicates if a union is used inside an inline view,
     // and the enclosing select stmt has predicates referring to the inline view.
     if (!conjuncts_.isEmpty()) {
-      output.append(prefix + "predicates: " + getExplainString(conjuncts_) + "\n");
+      output.append(detailPrefix + "predicates: " + getExplainString(conjuncts_) + "\n");
     }
-    if (constExprLists_.size() > 0) {
-      output.append(prefix + "merging " + constExprLists_.size() + " SELECT CONSTANT\n");
+    if (!constExprLists_.isEmpty()) {
+      output.append(detailPrefix + "constant-selects=" + constExprLists_.size() + "\n");
     }
     return output.toString();
   }

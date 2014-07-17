@@ -274,6 +274,7 @@ public class ImpaladCatalog extends Catalog {
       throws AuthorizationException {
     Preconditions.checkState(dbName != null && !dbName.isEmpty(),
         "Null or empty database name given as argument to Catalog.getDb");
+    if (checkSystemDbAccess(dbName, privilege)) return getDb(dbName);
     PrivilegeRequestBuilder pb = new PrivilegeRequestBuilder();
     if (privilege == Privilege.ANY) {
       checkAccess(user, pb.any().onAnyTable(dbName).toRequest());
@@ -318,6 +319,10 @@ public class ImpaladCatalog extends Catalog {
    */
   public boolean dbContainsTable(String dbName, String tableName, User user,
       Privilege privilege) throws AuthorizationException, DatabaseNotFoundException {
+    if (checkSystemDbAccess(dbName, privilege)) {
+      return containsTable(dbName, tableName);
+    }
+
     // Make sure the user has privileges to check if the table exists.
     checkAccess(user, new PrivilegeRequestBuilder()
         .allOf(privilege).onTable(dbName, tableName).toRequest());
@@ -337,6 +342,9 @@ public class ImpaladCatalog extends Catalog {
   public Table getTable(String dbName, String tableName, User user,
       Privilege privilege) throws AuthorizationException, DatabaseNotFoundException,
       TableLoadingException {
+    if (checkSystemDbAccess(dbName, privilege)) {
+      return getTable(dbName, tableName);
+    }
     checkAccess(user, new PrivilegeRequestBuilder()
         .allOf(privilege).onTable(dbName, tableName).toRequest());
 
@@ -433,6 +441,26 @@ public class ImpaladCatalog extends Catalog {
     } finally {
       authzCheckerLock_.readLock().unlock();
     }
+  }
+
+  /**
+   * Throws an authorization exception if the dbName is a system db
+   * and p is trying to modify it.
+   * Returns true if this is a system db and the action is allowed.
+   */
+  public boolean checkSystemDbAccess(String dbName, Privilege privilege)
+      throws AuthorizationException {
+    Db db = getDb(dbName);
+    if (db != null && db.isSystemDb()) {
+      switch (privilege) {
+        case VIEW_METADATA:
+        case ANY:
+          return true;
+        default:
+          throw new AuthorizationException("Cannot modify system database.");
+      }
+    }
+    return false;
   }
 
   /**

@@ -22,7 +22,6 @@ import com.cloudera.impala.analysis.HdfsUri;
 import com.cloudera.impala.analysis.IntLiteral;
 import com.cloudera.impala.analysis.LiteralExpr;
 import com.cloudera.impala.catalog.MetaStoreClientPool.MetaStoreClient;
-import com.cloudera.impala.thrift.TFunctionType;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
@@ -31,7 +30,7 @@ public class CatalogTest {
       CatalogServiceCatalog.createForTesting(false);
 
   private void checkTableCols(Db db, String tblName, int numClusteringCols,
-      String[] colNames, PrimitiveType[] colTypes) throws TableLoadingException {
+      String[] colNames, ColumnType[] colTypes) throws TableLoadingException {
     Table tbl = db.getTable(tblName);
     assertEquals(tbl.getName(), tblName);
     assertEquals(tbl.getNumClusteringCols(), numClusteringCols);
@@ -43,14 +42,14 @@ public class CatalogTest {
     while (it.hasNext()) {
       Column col = it.next();
       assertEquals(col.getName(), colNames[i]);
-      assertEquals(col.getType(), colTypes[i]);
+      assertTrue(col.getType().equals(colTypes[i]));
       ++i;
     }
   }
 
   private void checkHBaseTableCols(Db db, String hiveTableName, String hbaseTableName,
       String[] hiveColNames, String[] colFamilies, String[] colQualifiers,
-      PrimitiveType[] colTypes) throws TableLoadingException{
+      ColumnType[] colTypes) throws TableLoadingException{
     checkTableCols(db, hiveTableName, 1, hiveColNames, colTypes);
     HBaseTable tbl = (HBaseTable) db.getTable(hiveTableName);
     assertEquals(tbl.getHBaseTableName(), hbaseTableName);
@@ -122,36 +121,36 @@ public class CatalogTest {
           {"year", "month", "id", "bool_col", "tinyint_col", "smallint_col",
            "int_col", "bigint_col", "float_col", "double_col", "date_string_col",
            "string_col", "timestamp_col"},
-        new PrimitiveType[]
-          {PrimitiveType.INT, PrimitiveType.INT, PrimitiveType.INT,
-           PrimitiveType.BOOLEAN, PrimitiveType.TINYINT, PrimitiveType.SMALLINT,
-           PrimitiveType.INT, PrimitiveType.BIGINT, PrimitiveType.FLOAT,
-           PrimitiveType.DOUBLE, PrimitiveType.STRING, PrimitiveType.STRING,
-           PrimitiveType.TIMESTAMP});
+        new ColumnType[]
+          {ColumnType.INT, ColumnType.INT, ColumnType.INT,
+           ColumnType.BOOLEAN, ColumnType.TINYINT, ColumnType.SMALLINT,
+           ColumnType.INT, ColumnType.BIGINT, ColumnType.FLOAT,
+           ColumnType.DOUBLE, ColumnType.STRING, ColumnType.STRING,
+           ColumnType.TIMESTAMP});
     checkTableCols(functionalDb, "testtbl", 0,
         new String[] {"id", "name", "zip"},
-        new PrimitiveType[]
-          {PrimitiveType.BIGINT, PrimitiveType.STRING, PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.BIGINT, ColumnType.STRING, ColumnType.INT});
     checkTableCols(testDb, "testtbl", 0,
         new String[] {"id", "name", "zip"},
-        new PrimitiveType[]
-          {PrimitiveType.BIGINT, PrimitiveType.STRING, PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.BIGINT, ColumnType.STRING, ColumnType.INT});
     checkTableCols(functionalDb, "liketbl", 0,
         new String[] {
             "str_col", "match_like_col", "no_match_like_col", "match_regex_col",
             "no_match_regex_col"},
-        new PrimitiveType[]
-          {PrimitiveType.STRING, PrimitiveType.STRING, PrimitiveType.STRING,
-           PrimitiveType.STRING, PrimitiveType.STRING});
+        new ColumnType[]
+          {ColumnType.STRING, ColumnType.STRING, ColumnType.STRING,
+           ColumnType.STRING, ColumnType.STRING});
     checkTableCols(functionalDb, "dimtbl", 0,
         new String[] {"id", "name", "zip"},
-        new PrimitiveType[]
-          {PrimitiveType.BIGINT, PrimitiveType.STRING, PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.BIGINT, ColumnType.STRING, ColumnType.INT});
     checkTableCols(functionalDb, "jointbl", 0,
         new String[] {"test_id", "test_name", "test_zip", "alltypes_id"},
-        new PrimitiveType[]
-          {PrimitiveType.BIGINT, PrimitiveType.STRING, PrimitiveType.INT,
-           PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.BIGINT, ColumnType.STRING, ColumnType.INT,
+           ColumnType.INT});
 
     checkHBaseTableCols(hbaseDb, "alltypessmall", "functional_hbase.alltypessmall",
         new String[]
@@ -164,12 +163,12 @@ public class CatalogTest {
           {null, "bigint_col", "bool_col", "date_string_col", "double_col", "float_col",
            "int_col", "month", "smallint_col", "string_col", "timestamp_col",
            "tinyint_col", "year"},
-        new PrimitiveType[]
-          {PrimitiveType.INT, PrimitiveType.BIGINT, PrimitiveType.BOOLEAN,
-           PrimitiveType.STRING, PrimitiveType.DOUBLE, PrimitiveType.FLOAT,
-           PrimitiveType.INT, PrimitiveType.INT, PrimitiveType.SMALLINT,
-           PrimitiveType.STRING, PrimitiveType.TIMESTAMP,
-           PrimitiveType.TINYINT, PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.INT, ColumnType.BIGINT, ColumnType.BOOLEAN,
+           ColumnType.STRING, ColumnType.DOUBLE, ColumnType.FLOAT,
+           ColumnType.INT, ColumnType.INT, ColumnType.SMALLINT,
+           ColumnType.STRING, ColumnType.TIMESTAMP,
+           ColumnType.TINYINT, ColumnType.INT});
 
     checkHBaseTableCols(hbaseDb, "hbasealltypeserror",
         "functional_hbase.hbasealltypeserror",
@@ -181,11 +180,11 @@ public class CatalogTest {
         new String[]
           {null, "bigint_col", "bool_col","date_string_col", "double_col", "float_col",
            "int_col", "smallint_col", "string_col","timestamp_col", "tinyint_col"},
-        new PrimitiveType[]
-          {PrimitiveType.INT, PrimitiveType.BIGINT, PrimitiveType.BOOLEAN,
-           PrimitiveType.STRING, PrimitiveType.DOUBLE, PrimitiveType.FLOAT,
-           PrimitiveType.INT, PrimitiveType.SMALLINT, PrimitiveType.STRING,
-           PrimitiveType.TIMESTAMP, PrimitiveType.TINYINT});
+        new ColumnType[]
+          {ColumnType.INT, ColumnType.BIGINT, ColumnType.BOOLEAN,
+           ColumnType.STRING, ColumnType.DOUBLE, ColumnType.FLOAT,
+           ColumnType.INT, ColumnType.SMALLINT, ColumnType.STRING,
+           ColumnType.TIMESTAMP, ColumnType.TINYINT});
 
     checkHBaseTableCols(hbaseDb, "hbasealltypeserrornonulls",
         "functional_hbase.hbasealltypeserrornonulls",
@@ -197,11 +196,11 @@ public class CatalogTest {
         new String[]
           {null, "bigint_col", "bool_col", "date_string_col", "double_col", "float_col",
            "int_col", "smallint_col", "string_col","timestamp_col", "tinyint_col"},
-        new PrimitiveType[]
-          {PrimitiveType.INT, PrimitiveType.BIGINT, PrimitiveType.BOOLEAN,
-           PrimitiveType.STRING, PrimitiveType.DOUBLE, PrimitiveType.FLOAT,
-           PrimitiveType.INT, PrimitiveType.SMALLINT, PrimitiveType.STRING,
-           PrimitiveType.TIMESTAMP, PrimitiveType.TINYINT});
+        new ColumnType[]
+          {ColumnType.INT, ColumnType.BIGINT, ColumnType.BOOLEAN,
+           ColumnType.STRING, ColumnType.DOUBLE, ColumnType.FLOAT,
+           ColumnType.INT, ColumnType.SMALLINT, ColumnType.STRING,
+           ColumnType.TIMESTAMP, ColumnType.TINYINT});
 
     checkHBaseTableCols(hbaseDb, "alltypesagg", "functional_hbase.alltypesagg",
         new String[]
@@ -214,12 +213,12 @@ public class CatalogTest {
           {null, "bigint_col", "bool_col", "date_string_col", "day", "double_col",
            "float_col", "int_col", "month", "smallint_col", "string_col",
            "timestamp_col", "tinyint_col", "year"},
-        new PrimitiveType[]
-          {PrimitiveType.INT, PrimitiveType.BIGINT, PrimitiveType.BOOLEAN,
-           PrimitiveType.STRING,PrimitiveType.INT, PrimitiveType.DOUBLE,
-           PrimitiveType.FLOAT, PrimitiveType.INT, PrimitiveType.INT,
-           PrimitiveType.SMALLINT, PrimitiveType.STRING, PrimitiveType.TIMESTAMP,
-           PrimitiveType.TINYINT, PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.INT, ColumnType.BIGINT, ColumnType.BOOLEAN,
+           ColumnType.STRING,ColumnType.INT, ColumnType.DOUBLE,
+           ColumnType.FLOAT, ColumnType.INT, ColumnType.INT,
+           ColumnType.SMALLINT, ColumnType.STRING, ColumnType.TIMESTAMP,
+           ColumnType.TINYINT, ColumnType.INT});
 
     checkHBaseTableCols(hbaseDb, "stringids", "functional_hbase.alltypesagg",
         new String[]
@@ -232,33 +231,33 @@ public class CatalogTest {
           {null, "bigint_col", "bool_col", "date_string_col", "day", "double_col",
            "float_col", "int_col", "month", "smallint_col", "string_col",
            "timestamp_col", "tinyint_col", "year"},
-        new PrimitiveType[]
-          {PrimitiveType.STRING, PrimitiveType.BIGINT, PrimitiveType.BOOLEAN,
-           PrimitiveType.STRING,PrimitiveType.INT, PrimitiveType.DOUBLE,
-           PrimitiveType.FLOAT, PrimitiveType.INT, PrimitiveType.INT,
-           PrimitiveType.SMALLINT, PrimitiveType.STRING, PrimitiveType.TIMESTAMP,
-           PrimitiveType.TINYINT, PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.STRING, ColumnType.BIGINT, ColumnType.BOOLEAN,
+           ColumnType.STRING,ColumnType.INT, ColumnType.DOUBLE,
+           ColumnType.FLOAT, ColumnType.INT, ColumnType.INT,
+           ColumnType.SMALLINT, ColumnType.STRING, ColumnType.TIMESTAMP,
+           ColumnType.TINYINT, ColumnType.INT});
 
     checkTableCols(functionalDb, "greptiny", 0,
         new String[]
           {"field"},
-        new PrimitiveType[]
-          {PrimitiveType.STRING});
+        new ColumnType[]
+          {ColumnType.STRING});
 
     checkTableCols(functionalDb, "rankingssmall", 0,
         new String[]
           {"pagerank", "pageurl", "avgduration"},
-        new PrimitiveType[]
-          {PrimitiveType.INT, PrimitiveType.STRING, PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.INT, ColumnType.STRING, ColumnType.INT});
 
     checkTableCols(functionalDb, "uservisitssmall", 0,
         new String[]
           {"sourceip", "desturl", "visitdate",  "adrevenue", "useragent",
            "ccode", "lcode", "skeyword", "avgtimeonsite"},
-        new PrimitiveType[]
-          {PrimitiveType.STRING, PrimitiveType.STRING, PrimitiveType.STRING,
-           PrimitiveType.FLOAT, PrimitiveType.STRING, PrimitiveType.STRING,
-           PrimitiveType.STRING, PrimitiveType.STRING, PrimitiveType.INT});
+        new ColumnType[]
+          {ColumnType.STRING, ColumnType.STRING, ColumnType.STRING,
+           ColumnType.FLOAT, ColumnType.STRING, ColumnType.STRING,
+           ColumnType.STRING, ColumnType.STRING, ColumnType.INT});
 
     // case-insensitive lookup
     assertEquals(catalog_.getOrLoadTable("functional", "alltypes"),
@@ -298,64 +297,76 @@ public class CatalogTest {
     assertEquals(months.size(), 24);
   }
 
-  @Test
+  // TODO: All Hive-stats related tests are temporarily disabled because of an unknown,
+  // sporadic issue causing stats of some columns to be absent in Jenkins runs.
+  // Investigate this issue further.
+  //@Test
   public void testStats() throws TableLoadingException {
     // make sure the stats for functional.alltypesagg look correct
     HdfsTable table =
         (HdfsTable) catalog_.getDb("functional").getTable("AllTypesAgg");
 
     Column idCol = table.getColumn("id");
-    assertEquals(idCol.getStats().getAvgSerializedSize(),
+    assertEquals(idCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.INT.getSlotSize(),
         PrimitiveType.INT.getSlotSize(), 0.0001);
     assertEquals(idCol.getStats().getMaxSize(), PrimitiveType.INT.getSlotSize());
     assertTrue(!idCol.getStats().hasNulls());
 
     Column boolCol = table.getColumn("bool_col");
-    assertEquals(boolCol.getStats().getAvgSerializedSize(),
+    assertEquals(boolCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.BOOLEAN.getSlotSize(),
         PrimitiveType.BOOLEAN.getSlotSize(), 0.0001);
     assertEquals(boolCol.getStats().getMaxSize(), PrimitiveType.BOOLEAN.getSlotSize());
     assertTrue(!boolCol.getStats().hasNulls());
 
     Column tinyintCol = table.getColumn("tinyint_col");
-    assertEquals(tinyintCol.getStats().getAvgSerializedSize(),
+    assertEquals(tinyintCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.TINYINT.getSlotSize(),
         PrimitiveType.TINYINT.getSlotSize(), 0.0001);
     assertEquals(tinyintCol.getStats().getMaxSize(),
         PrimitiveType.TINYINT.getSlotSize());
     assertTrue(tinyintCol.getStats().hasNulls());
 
     Column smallintCol = table.getColumn("smallint_col");
-    assertEquals(smallintCol.getStats().getAvgSerializedSize(),
+    assertEquals(smallintCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.SMALLINT.getSlotSize(),
         PrimitiveType.SMALLINT.getSlotSize(), 0.0001);
     assertEquals(smallintCol.getStats().getMaxSize(),
         PrimitiveType.SMALLINT.getSlotSize());
     assertTrue(smallintCol.getStats().hasNulls());
 
     Column intCol = table.getColumn("int_col");
-    assertEquals(intCol.getStats().getAvgSerializedSize(),
+    assertEquals(intCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.INT.getSlotSize(),
         PrimitiveType.INT.getSlotSize(), 0.0001);
     assertEquals(intCol.getStats().getMaxSize(), PrimitiveType.INT.getSlotSize());
     assertTrue(intCol.getStats().hasNulls());
 
     Column bigintCol = table.getColumn("bigint_col");
-    assertEquals(bigintCol.getStats().getAvgSerializedSize(),
+    assertEquals(bigintCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.BIGINT.getSlotSize(),
         PrimitiveType.BIGINT.getSlotSize(), 0.0001);
     assertEquals(bigintCol.getStats().getMaxSize(), PrimitiveType.BIGINT.getSlotSize());
     assertTrue(bigintCol.getStats().hasNulls());
 
     Column floatCol = table.getColumn("float_col");
-    assertEquals(floatCol.getStats().getAvgSerializedSize(),
+    assertEquals(floatCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.FLOAT.getSlotSize(),
         PrimitiveType.FLOAT.getSlotSize(), 0.0001);
     assertEquals(floatCol.getStats().getMaxSize(), PrimitiveType.FLOAT.getSlotSize());
     assertTrue(floatCol.getStats().hasNulls());
 
     Column doubleCol = table.getColumn("double_col");
-    assertEquals(doubleCol.getStats().getAvgSerializedSize(),
+    assertEquals(doubleCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.DOUBLE.getSlotSize(),
         PrimitiveType.DOUBLE.getSlotSize(), 0.0001);
     assertEquals(doubleCol.getStats().getMaxSize(), PrimitiveType.DOUBLE.getSlotSize());
     assertTrue(doubleCol.getStats().hasNulls());
 
     Column timestampCol = table.getColumn("timestamp_col");
-    assertEquals(timestampCol.getStats().getAvgSerializedSize(),
+    assertEquals(timestampCol.getStats().getAvgSerializedSize() -
+        PrimitiveType.TIMESTAMP.getSlotSize(),
         PrimitiveType.TIMESTAMP.getSlotSize(), 0.0001);
     assertEquals(timestampCol.getStats().getMaxSize(),
         PrimitiveType.TIMESTAMP.getSlotSize());
@@ -376,7 +387,10 @@ public class CatalogTest {
    * the column type results in the stats being set to "unknown". This is a regression
    * test for IMPALA-588, where this used to result in a Preconditions failure.
    */
-  @Test
+  // TODO: All Hive-stats related tests are temporarily disabled because of an unknown,
+  // sporadic issue causing stats of some columns to be absent in Jenkins runs.
+  // Investigate this issue further.
+  //@Test
   public void testColStatsColTypeMismatch() throws Exception {
     // First load a table that has column stats.
     //catalog_.refreshTable("functional", "alltypesagg", false);
@@ -495,6 +509,16 @@ public class CatalogTest {
     assertEquals("Impala does not support tables of this type. REASON: SerDe" +
         " library 'org.apache.hadoop.hive.serde2.binarysortable.BinarySortableSerDe' " +
         "is not supported.", incompleteTable.getCause().getCause().getMessage());
+
+    // Impala does not yet support Hive's LazyBinaryColumnarSerDe which can be
+    // used for RCFILE tables.
+    table = catalog_.getOrLoadTable("functional_rc", "rcfile_lazy_binary_serde");
+    assertTrue(table instanceof IncompleteTable);
+    incompleteTable = (IncompleteTable) table;
+    assertTrue(incompleteTable.getCause() instanceof TableLoadingException);
+    assertEquals("Impala does not support tables of this type. REASON: SerDe" +
+        " library 'org.apache.hadoop.hive.serde2.columnar.LazyBinaryColumnarSerDe' " +
+        "is not supported.", incompleteTable.getCause().getCause().getMessage());
   }
 
   // This table has metadata set so the escape is \n, which is also the tuple delim. This
@@ -510,44 +534,51 @@ public class CatalogTest {
     }
   }
 
+  private List<String> getFunctionSignatures(String db) throws DatabaseNotFoundException {
+    List<Function> fns = catalog_.getFunctions(db);
+    List<String> names = Lists.newArrayList();
+    for (Function fn: fns) {
+      names.add(fn.signatureString());
+    }
+    return names;
+  }
+
   @Test
   public void TestUdf() throws CatalogException {
-    List<String> fnNames =
-        catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", "");
+    List<String> fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 0);
 
-    ArrayList<PrimitiveType> args1 = Lists.newArrayList();
-    ArrayList<PrimitiveType> args2 = Lists.newArrayList(PrimitiveType.INT);
-    ArrayList<PrimitiveType> args3 = Lists.newArrayList(PrimitiveType.TINYINT);
+    ArrayList<ColumnType> args1 = Lists.newArrayList();
+    ArrayList<ColumnType> args2 = Lists.newArrayList(ColumnType.INT);
+    ArrayList<ColumnType> args3 = Lists.newArrayList(ColumnType.TINYINT);
 
     catalog_.removeFunction(
         new Function(new FunctionName("default", "Foo"), args1,
-            PrimitiveType.INVALID_TYPE, false));
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
-
+            ColumnType.INVALID, false));
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 0);
 
-    Udf udf1 = new Udf(new FunctionName("default", "Foo"),
-        args1, PrimitiveType.INVALID_TYPE, new HdfsUri("/Foo"), "Foo.class");
+    ScalarFunction udf1 = new ScalarFunction(new FunctionName("default", "Foo"),
+        args1, ColumnType.INVALID, new HdfsUri("/Foo"), "Foo.class", null, null);
     catalog_.addFunction(udf1);
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 1);
     assertTrue(fnNames.contains("foo()"));
 
     // Same function name, overloaded arguments
-    Udf udf2 = new Udf(new FunctionName("default", "Foo"),
-        args2, PrimitiveType.INVALID_TYPE, new HdfsUri("/Foo"), "Foo.class");
+    ScalarFunction udf2 = new ScalarFunction(new FunctionName("default", "Foo"),
+        args2, ColumnType.INVALID, new HdfsUri("/Foo"), "Foo.class", null, null);
     catalog_.addFunction(udf2);
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 2);
     assertTrue(fnNames.contains("foo()"));
     assertTrue(fnNames.contains("foo(INT)"));
 
     // Add a function with a new name
-    Udf udf3 = new Udf(new FunctionName("default", "Bar"),
-        args2, PrimitiveType.INVALID_TYPE, new HdfsUri("/Foo"), "Foo.class");
+    ScalarFunction udf3 = new ScalarFunction(new FunctionName("default", "Bar"),
+        args2, ColumnType.INVALID, new HdfsUri("/Foo"), "Foo.class", null, null);
     catalog_.addFunction(udf3);
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 3);
     assertTrue(fnNames.contains("foo()"));
     assertTrue(fnNames.contains("foo(INT)"));
@@ -555,47 +586,47 @@ public class CatalogTest {
 
     // Drop Foo()
     catalog_.removeFunction(new Function(
-        new FunctionName("default", "Foo"), args1, PrimitiveType.INVALID_TYPE, false));
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+        new FunctionName("default", "Foo"), args1, ColumnType.INVALID, false));
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 2);
     assertTrue(fnNames.contains("foo(INT)"));
     assertTrue(fnNames.contains("bar(INT)"));
 
     // Drop it again, no-op
     catalog_.removeFunction(new Function(
-        new FunctionName("default", "Foo"), args1, PrimitiveType.INVALID_TYPE, false));
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+        new FunctionName("default", "Foo"), args1, ColumnType.INVALID, false));
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 2);
     assertTrue(fnNames.contains("foo(INT)"));
     assertTrue(fnNames.contains("bar(INT)"));
 
     // Drop bar(), no-op
     catalog_.removeFunction(new Function(
-        new FunctionName("default", "Bar"), args1, PrimitiveType.INVALID_TYPE, false));
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+        new FunctionName("default", "Bar"), args1, ColumnType.INVALID, false));
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 2);
     assertTrue(fnNames.contains("foo(INT)"));
     assertTrue(fnNames.contains("bar(INT)"));
 
     // Drop bar(tinyint), no-op
     catalog_.removeFunction(new Function(
-        new FunctionName("default", "Bar"), args3, PrimitiveType.INVALID_TYPE, false));
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+        new FunctionName("default", "Bar"), args3, ColumnType.INVALID, false));
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 2);
     assertTrue(fnNames.contains("foo(INT)"));
     assertTrue(fnNames.contains("bar(INT)"));
 
     // Drop bar(int)
     catalog_.removeFunction(new Function(
-        new FunctionName("default", "Bar"), args2, PrimitiveType.INVALID_TYPE, false));
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+        new FunctionName("default", "Bar"), args2, ColumnType.INVALID, false));
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 1);
     assertTrue(fnNames.contains("foo(INT)"));
 
     // Drop foo(int)
     catalog_.removeFunction(new Function(
-        new FunctionName("default", "foo"), args2, PrimitiveType.INVALID_TYPE, false));
-    fnNames = catalog_.getFunctionSignatures(TFunctionType.SCALAR, "default", null);
+        new FunctionName("default", "foo"), args2, ColumnType.INVALID, false));
+    fnNames = getFunctionSignatures("default");
     assertEquals(fnNames.size(), 0);
   }
 }

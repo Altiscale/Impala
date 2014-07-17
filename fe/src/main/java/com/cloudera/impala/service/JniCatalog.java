@@ -32,9 +32,12 @@ import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.JniUtil;
 import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TDdlExecRequest;
+import com.cloudera.impala.thrift.TFunction;
 import com.cloudera.impala.thrift.TGetAllCatalogObjectsResponse;
 import com.cloudera.impala.thrift.TGetDbsParams;
 import com.cloudera.impala.thrift.TGetDbsResult;
+import com.cloudera.impala.thrift.TGetFunctionsRequest;
+import com.cloudera.impala.thrift.TGetFunctionsResponse;
 import com.cloudera.impala.thrift.TGetTablesParams;
 import com.cloudera.impala.thrift.TGetTablesResult;
 import com.cloudera.impala.thrift.TLogLevel;
@@ -166,6 +169,30 @@ public class JniCatalog {
     JniUtil.deserializeThrift(protocolFactory_, objectDescription, thriftParams);
     TSerializer serializer = new TSerializer(protocolFactory_);
     return serializer.serialize(catalog_.getTCatalogObject(objectDescription));
+  }
+
+  /**
+   * See comment in CatalogServiceCatalog.
+   */
+  public byte[] getFunctions(byte[] thriftParams) throws ImpalaException,
+      TException {
+    TGetFunctionsRequest request = new TGetFunctionsRequest();
+    JniUtil.deserializeThrift(protocolFactory_, request, thriftParams);
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    if (!request.isSetDb_name()) {
+      throw new InternalException("Database name must be set in call to " +
+          "getFunctions()");
+    }
+
+    // Get all the functions and convert them to their Thrift representation.
+    List<Function> fns = catalog_.getFunctions(request.getDb_name());
+    TGetFunctionsResponse response = new TGetFunctionsResponse();
+    response.setFunctions(new ArrayList<TFunction>(fns.size()));
+    for (Function fn: fns) {
+      response.addToFunctions(fn.toThrift());
+    }
+
+    return serializer.serialize(response);
   }
 
   public void prioritizeLoad(byte[] thriftLoadReq) throws ImpalaException,

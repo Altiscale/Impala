@@ -16,13 +16,15 @@ package com.cloudera.impala.catalog;
 
 import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.apache.log4j.Logger;
 
-import com.cloudera.impala.analysis.FunctionName;
+import com.cloudera.impala.catalog.Function.CompareMode;
 import com.cloudera.impala.thrift.TCatalogObjectType;
 import com.cloudera.impala.thrift.TDatabase;
 import com.cloudera.impala.thrift.TFunctionType;
+import com.cloudera.impala.util.PatternMatcher;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -54,12 +56,18 @@ public class Db implements CatalogObject {
   // on this map.
   private final HashMap<String, List<Function>> functions_;
 
+  // If true, this database is an Impala system database.
+  // (e.g. can't drop it, can't add tables to it, etc).
+  private boolean isSystemDb_ = false;
+
   public Db(String name, Catalog catalog) {
     thriftDb_ = new TDatabase(name.toLowerCase());
     parentCatalog_ = catalog;
     tableCache_ = new CatalogObjectCache<Table>();
     functions_ = new HashMap<String, List<Function>>();
   }
+
+  public void setIsSystemDb(boolean b) { isSystemDb_ = b; }
 
   /**
    * Creates a Db object with no tables based on the given TDatabase thrift struct.
@@ -68,6 +76,7 @@ public class Db implements CatalogObject {
     return new Db(db.getDb_name(), parentCatalog);
   }
 
+  public boolean isSystemDb() { return isSystemDb_; }
   public TDatabase toThrift() { return thriftDb_; }
   public String getName() { return thriftDb_.getDb_name(); }
   public TCatalogObjectType getCatalogObjectType() {
@@ -108,25 +117,6 @@ public class Db implements CatalogObject {
   }
 
   /**
-   * Returns all the function signatures in this DB that match the specified
-   * fuction type. If the function type is null, all function signatures are returned.
-   */
-  public List<String> getAllFunctionSignatures(TFunctionType type) {
-    List<String> names = Lists.newArrayList();
-    synchronized (functions_) {
-      for (List<Function> fns: functions_.values()) {
-        for (Function f: fns) {
-          if (type == null || (type == TFunctionType.SCALAR && f instanceof Udf) ||
-               type == TFunctionType.AGGREGATE && f instanceof Uda) {
-            names.add(f.signatureString());
-          }
-        }
-      }
-    }
-    return names;
-  }
-
-  /**
    * Returns the number of functions in this database.
    */
   public int numFunctions() {
@@ -138,9 +128,9 @@ public class Db implements CatalogObject {
   /**
    * See comment in Catalog.
    */
-  public boolean functionExists(FunctionName name) {
+  public boolean containsFunction(String name) {
     synchronized (functions_) {
-      return functions_.get(name.getFunction()) != null;
+      return functions_.get(name) != null;
     }
   }
 
@@ -166,7 +156,7 @@ public class Db implements CatalogObject {
 
       // Finally check for is_subtype
       for (Function f: fns) {
-        if (f.compare(desc, Function.CompareMode.IS_SUBTYPE)) return f;
+        if (f.compare(desc, Function.CompareMode.IS_SUPERTYPE_OF)) return f;
       }
     }
     return null;
@@ -231,10 +221,55 @@ public class Db implements CatalogObject {
   }
 
   /**
-   * Returns a map of functionNames to list of (overloaded) functions with that name.
+   * Add a builtin with the specified name and signatures to this db.
    */
-  public HashMap<String, List<Function>> getAllFunctions() {
+  public void addScalarBuiltin(boolean udfInterface, String fnName, String symbol,
+      boolean varArgs, ColumnType retType, ColumnType ... args) {
+    Preconditions.checkState(isSystemDb());
+    addBuiltin(ScalarFunction.createBuiltin(
+        fnName, Lists.newArrayList(args), varArgs, retType,
+        symbol, udfInterface));
+  }
+
+  /**
+   * Adds a builtin to this database. The function must not already exist.
+   */
+  public void addBuiltin(Function fn) {
+    Preconditions.checkState(isSystemDb());
+    Preconditions.checkState(fn != null);
+    Preconditions.checkState(getFunction(fn, CompareMode.IS_INDISTINGUISHABLE) == null);
+    addFunction(fn);
+  }
+
+  /**
+   * Returns a map of functionNames to list of (overloaded) functions with that name.
+   * This is not thread safe so a higher level lock must be taken while iterating
+   * over the returned functions.
+   */
+  protected HashMap<String, List<Function>> getAllFunctions() {
     return functions_;
+  }
+
+  /**
+   * Returns all functions that match 'fnPattern'.
+   */
+  public List<Function> getFunctions(TFunctionType type, PatternMatcher fnPattern) {
+    List<Function> functions = Lists.newArrayList();
+    synchronized (functions_) {
+      for (Map.Entry<String, List<Function>> fns: functions_.entrySet()) {
+        if (fnPattern.matches(fns.getKey())) {
+          for (Function fn: fns.getValue()) {
+            if (fn.userVisible()) {
+              if (type == null ||
+                  (type == TFunctionType.SCALAR && fn instanceof ScalarFunction) ||
+                  (type == TFunctionType.AGGREGATE && fn instanceof AggregateFunction))
+              functions.add(fn);
+            }
+          }
+        }
+      }
+    }
+    return functions;
   }
 
   @Override

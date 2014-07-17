@@ -56,7 +56,6 @@ import com.cloudera.impala.analysis.PartitionKeyValue;
 import com.cloudera.impala.catalog.HdfsPartition.FileBlock;
 import com.cloudera.impala.catalog.HdfsPartition.FileDescriptor;
 import com.cloudera.impala.catalog.HdfsStorageDescriptor.InvalidStorageDescriptorException;
-import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.FileSystemUtil;
 import com.cloudera.impala.thrift.ImpalaInternalServiceConstants;
 import com.cloudera.impala.thrift.TAccessLevel;
@@ -67,7 +66,6 @@ import com.cloudera.impala.thrift.THdfsPartition;
 import com.cloudera.impala.thrift.THdfsTable;
 import com.cloudera.impala.thrift.TNetworkAddress;
 import com.cloudera.impala.thrift.TPartitionKeyValue;
-import com.cloudera.impala.thrift.TPrimitiveType;
 import com.cloudera.impala.thrift.TResultSet;
 import com.cloudera.impala.thrift.TResultSetMetadata;
 import com.cloudera.impala.thrift.TTable;
@@ -461,7 +459,7 @@ public class HdfsTable extends Table {
       throws TableLoadingException {
     int pos = 0;
     for (FieldSchema s: fieldSchemas) {
-      PrimitiveType type = getPrimitiveType(s);
+      ColumnType type = parseColumnType(s);
       // Check if we support partitioning on columns of such a type.
       if (pos < numClusteringCols_ && !type.supportsTablePartitioning()) {
         throw new TableLoadingException(
@@ -539,13 +537,13 @@ public class HdfsTable extends Table {
             keyValues.add(new NullLiteral());
             ++numNullKeys[i];
           } else {
-            PrimitiveType type = colsByPos_.get(keyValues.size()).getType();
+            ColumnType type = colsByPos_.get(keyValues.size()).getType();
             try {
               Expr expr = LiteralExpr.create(partitionKey, type);
               // Force the literal to be of type declared in the metadata.
               expr = expr.castTo(type);
               keyValues.add((LiteralExpr) expr);
-            } catch (AnalysisException ex) {
+            } catch (Exception ex) {
               LOG.warn("Failed to create literal expression of type: " + type, ex);
               throw new InvalidStorageDescriptorException(ex);
             }
@@ -596,11 +594,11 @@ public class HdfsTable extends Table {
     if (permisisonChecker.hasAccess(DFS, location, FsAction.READ_WRITE)) {
       return TAccessLevel.READ_WRITE;
     } else if (permisisonChecker.hasAccess(DFS, location, FsAction.READ)) {
-      LOG.debug(String.format("Impala does not have READ access to '%s' in table: %s",
+      LOG.debug(String.format("Impala does not have WRITE access to '%s' in table: %s",
           location, getFullName()));
       return TAccessLevel.READ_ONLY;
     } else if (permisisonChecker.hasAccess(DFS, location, FsAction.WRITE)) {
-      LOG.debug(String.format("Impala does not have WRITE access to '%s' in table: %s",
+      LOG.debug(String.format("Impala does not have READ access to '%s' in table: %s",
           location, getFullName()));
       return TAccessLevel.WRITE_ONLY;
     }
@@ -992,6 +990,7 @@ public class HdfsTable extends Table {
   public long getNumHdfsFiles() { return numHdfsFiles_; }
   public long getTotalHdfsBytes() { return totalHdfsBytes_; }
   public String getHdfsBaseDir() { return hdfsBaseDir_; }
+  public boolean isAvroTable() { return avroSchema_ != null; }
 
   @Override
   public int getNumNodes() { return hostMap_.size(); }
@@ -1047,10 +1046,10 @@ public class HdfsTable extends Table {
       TColumn colDesc = new TColumn(partCol.getName(), partCol.getType().toThrift());
       resultSchema.addToColumns(colDesc);
     }
-    resultSchema.addToColumns(new TColumn("#Rows", TPrimitiveType.BIGINT));
-    resultSchema.addToColumns(new TColumn("#Files", TPrimitiveType.BIGINT));
-    resultSchema.addToColumns(new TColumn("Size", TPrimitiveType.STRING));
-    resultSchema.addToColumns(new TColumn("Format", TPrimitiveType.STRING));
+    resultSchema.addToColumns(new TColumn("#Rows", ColumnType.BIGINT.toThrift()));
+    resultSchema.addToColumns(new TColumn("#Files", ColumnType.BIGINT.toThrift()));
+    resultSchema.addToColumns(new TColumn("Size", ColumnType.STRING.toThrift()));
+    resultSchema.addToColumns(new TColumn("Format", ColumnType.STRING.toThrift()));
 
     // Pretty print partitions and their stats.
     ArrayList<HdfsPartition> orderedPartitions = Lists.newArrayList(partitions_);

@@ -31,4 +31,9 @@ public class PlanNodeId extends Id<PlanNodeId> {
       public PlanNodeId getMaxId() { return new PlanNodeId(nextId_ - 1); }
     };
   }
+
+  @Override
+  public String toString() {
+    return String.format("%02d", id_);
+  }
 }

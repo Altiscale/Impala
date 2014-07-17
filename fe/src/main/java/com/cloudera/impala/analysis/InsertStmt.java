@@ -26,9 +26,9 @@ import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.authorization.PrivilegeRequestBuilder;
 import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Column;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.HdfsTable;
-import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.catalog.Table;
 import com.cloudera.impala.catalog.View;
 import com.cloudera.impala.common.AnalysisException;
@@ -91,6 +91,12 @@ public class InsertStmt extends StatementBase {
   // should decide whether to re-partition or not).
   private Boolean isRepartition_ = null;
 
+  // Output expressions that produce the final results to write to the target table. May
+  // include casts, and NullLiterals where an output column isn't explicitly mentioned.
+  // Set in prepareExpressions(). The i'th expr produces the i'th column of the target
+  // table.
+  private final ArrayList<Expr> resultExprs_ = new ArrayList<Expr>();
+
   // The column permutation is specified by writing INSERT INTO tbl(col3, col1, col2...)
   //
   // It is a mapping from select-list expr index to (non-partition) output column. If
@@ -144,7 +150,7 @@ public class InsertStmt extends StatementBase {
     if (!needsGeneratedQueryStatement_) {
       try {
         queryStmt_.analyze(analyzer);
-        selectListExprs = queryStmt_.getBaseTblResultExprs();
+        selectListExprs = Expr.cloneList(queryStmt_.getBaseTblResultExprs());
       } catch (AnalysisException e) {
         if (analyzer.getMissingTbls().isEmpty()) throw e;
       }
@@ -256,7 +262,6 @@ public class InsertStmt extends StatementBase {
 
     // Populate partitionKeyExprs from partitionKeyValues and selectExprTargetColumns
     prepareExpressions(selectExprTargetColumns, selectListExprs, table_, analyzer);
-
     // Analyze plan hints at the end to prefer reporting other error messages first
     // (e.g., the PARTITION clause is not applicable to unpartitioned and HBase tables).
     analyzePlanHints();
@@ -297,14 +302,6 @@ public class InsertStmt extends StatementBase {
           table_.getFullName()));
     }
 
-    if (table_ instanceof HdfsTable) {
-      HdfsTable hdfsTable = (HdfsTable) table_;
-      if (!hdfsTable.hasWriteAccess()) {
-        throw new AnalysisException(String.format("Unable to INSERT into target table " +
-            "(%s) because Impala does not have WRITE access to at least one HDFS path" +
-            ": %s", targetTableName_, hdfsTable.getFirstLocationWithoutWriteAccess()));
-      }
-    }
 
     boolean isHBaseTable = (table_ instanceof HBaseTable);
     int numClusteringCols = isHBaseTable ? 0 : table_.getNumClusteringCols();
@@ -318,6 +315,28 @@ public class InsertStmt extends StatementBase {
         // Unpartitioned table, but INSERT has PARTITION clause
         throw new AnalysisException("PARTITION clause is only valid for INSERT into " +
             "partitioned table. '" + targetTableName_ + "' is not partitioned");
+      }
+    }
+
+    if (table_ instanceof HdfsTable) {
+      HdfsTable hdfsTable = (HdfsTable) table_;
+      if (!hdfsTable.hasWriteAccess()) {
+        throw new AnalysisException(String.format("Unable to INSERT into target table " +
+            "(%s) because Impala does not have WRITE access to at least one HDFS path" +
+            ": %s", targetTableName_, hdfsTable.getFirstLocationWithoutWriteAccess()));
+      }
+
+      for (int colIdx = 0; colIdx < numClusteringCols; ++colIdx) {
+        Column col = hdfsTable.getColumns().get(colIdx);
+        // Hive has a number of issues handling BOOLEAN partition columns (see HIVE-6590).
+        // Instead of working around the Hive bugs, INSERT is disabled for BOOLEAN
+        // partitions in Impala. Once the Hive JIRA is resolved, we can remove this
+        // analysis check.
+        if (col.getType() == ColumnType.BOOLEAN) {
+          throw new AnalysisException(String.format("INSERT into table with BOOLEAN " +
+              "partition column (%s) is not supported: %s", col.getName(),
+              targetTableName_));
+        }
       }
     }
 
@@ -404,7 +423,7 @@ public class InsertStmt extends StatementBase {
    * 2. Populates partitionKeyExprs with type-compatible expressions, in Hive
    * partition-column order, for all partition columns
    *
-   * 3. Replaces selectListExprs with type-compatible expressions, in Hive column order,
+   * 3. Populates resultExprs_ with type-compatible expressions, in Hive column order,
    * for all expressions in the select-list. Unmentioned columns are assigned NULL literal
    * expressions.
    *
@@ -469,12 +488,11 @@ public class InsertStmt extends StatementBase {
 
     // Finally, 'undo' the permutation so that the selectListExprs are in Hive column
     // order, and add NULL expressions to all missing columns.
-    List<Expr> permutedSelectListExprs = Lists.newArrayList();
     for (Column tblColumn: table_.getColumnsInHiveOrder()) {
       boolean matchFound = false;
       for (int i = 0; i < selectListExprs.size(); ++i) {
         if (selectExprTargetColumns.get(i).getName().equals(tblColumn.getName())) {
-          permutedSelectListExprs.add(selectListExprs.get(i));
+          resultExprs_.add(selectListExprs.get(i));
           matchFound = true;
           break;
         }
@@ -486,7 +504,7 @@ public class InsertStmt extends StatementBase {
         if (tblColumn.getPosition() >= numClusteringCols) {
           // Unmentioned non-clustering columns get NULL literals with the appropriate
           // target type because Parquet cannot handle NULL_TYPE (IMPALA-617).
-          permutedSelectListExprs.add(new NullLiteral().castTo(tblColumn.getType()));
+          resultExprs_.add(new NullLiteral().castTo(tblColumn.getType()));
         }
       }
     }
@@ -494,14 +512,13 @@ public class InsertStmt extends StatementBase {
     if (needsGeneratedQueryStatement_) {
       // Build a query statement that returns NULL for every column
       List<SelectListItem> selectListItems = Lists.newArrayList();
-      for(Expr e: permutedSelectListExprs) {
+      for(Expr e: resultExprs_) {
         selectListItems.add(new SelectListItem(e, null));
       }
       SelectList selectList = new SelectList(selectListItems);
       queryStmt_ = new SelectStmt(selectList, null, null, null, null, null, null);
       queryStmt_.analyze(analyzer);
     }
-    queryStmt_.setResultExprs(permutedSelectListExprs);
   }
 
   /**
@@ -512,14 +529,13 @@ public class InsertStmt extends StatementBase {
       throws AnalysisException {
     // Check for compatible type, and add casts to the selectListExprs if necessary.
     // We don't allow casting to a lower precision type.
-    PrimitiveType colType = column.getType();
-    PrimitiveType exprType = expr.getType();
+    ColumnType colType = column.getType();
+    ColumnType exprType = expr.getType();
     // Trivially compatible.
-    if (colType == exprType) {
-      return expr;
-    }
-    PrimitiveType compatibleType =
-        PrimitiveType.getAssignmentCompatibleType(colType, exprType);
+    if (colType.equals(exprType)) return expr;
+
+    ColumnType compatibleType =
+        ColumnType.getAssignmentCompatibleType(colType, exprType);
     // Incompatible types.
     if (!compatibleType.isValid()) {
       throw new AnalysisException(
@@ -529,7 +545,7 @@ public class InsertStmt extends StatementBase {
             targetTableName_, expr.toSql(), exprType, column.getName(), colType));
     }
     // Loss of precision when inserting into the table.
-    if (compatibleType != colType && !compatibleType.isNull()) {
+    if (!compatibleType.equals(colType) && !compatibleType.isNull()) {
       throw new AnalysisException(
           String.format("Possible loss of precision for target table '%s'.\n" +
                         "Expression '%s' (type: %s) would need to be cast to %s" +
@@ -538,8 +554,7 @@ public class InsertStmt extends StatementBase {
                         column.getName()));
     }
     // Add a cast to the selectListExpr to the higher type.
-    Expr castExpr = expr.castTo(compatibleType);
-    return castExpr;
+    return expr.castTo(compatibleType);
   }
 
   private void analyzePlanHints() throws AnalysisException {
@@ -581,6 +596,7 @@ public class InsertStmt extends StatementBase {
   public QueryStmt getQueryStmt() { return queryStmt_; }
   public List<Expr> getPartitionKeyExprs() { return partitionKeyExprs_; }
   public Boolean isRepartition() { return isRepartition_; }
+  public ArrayList<Expr> getResultExprs() { return resultExprs_; }
 
   public DataSink createDataSink() {
     // analyze() must have been called before.

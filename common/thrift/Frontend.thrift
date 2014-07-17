@@ -30,30 +30,6 @@ include "CatalogService.thrift"
 // These are supporting structs for JniFrontend.java, which serves as the glue
 // between our C++ execution environment and the Java frontend.
 
-// Impala currently has two types of sessions: Beeswax and HiveServer2
-enum TSessionType {
-  BEESWAX,
-  HIVESERVER2
-}
-
-// Per-client session state
-struct TSessionState {
-  // A unique identifier for this session
-  3: required Types.TUniqueId session_id
-
-  // Session Type (Beeswax or HiveServer2)
-  5: required TSessionType session_type
-
-  // The default database for the session
-  1: required string database
-
-  // The user to whom this session belongs
-  2: required string user
-
-  // Client network address
-  4: required Types.TNetworkAddress network_address
-}
-
 // Struct for HiveUdf expr to create the proper execution object in the FE
 // java side. See exprs/hive-udf-call.h for how hive Udfs are executed in general.
 // TODO: this could be the UdfID, collapsing the first 3 arguments but synchronizing
@@ -68,21 +44,21 @@ struct THiveUdfExecutorCtorParams {
   // call the Java executor with a buffer for all the inputs.
   // input_byte_offsets[0] is the byte offset in the buffer for the first
   // argument; input_byte_offsets[1] is the second, etc.
-  3: required list<i32> input_byte_offsets;
+  3: required list<i32> input_byte_offsets
 
   // Native input buffer ptr (cast as i64) for the inputs. The input arguments
   // are written to this buffer directly and read from java with no copies
   // input_null_ptr[i] is true if the i-th input is null.
   // input_buffer_ptr[input_byte_offsets[i]] is the value of the i-th input.
-  4: required i64 input_nulls_ptr;
-  5: required i64 input_buffer_ptr;
+  4: required i64 input_nulls_ptr
+  5: required i64 input_buffer_ptr
 
   // Native output buffer ptr. For non-variable length types, the output is
   // written here and read from the native side with no copies.
   // The UDF should set *output_null_ptr to true, if the result of the UDF is
   // NULL.
-  6: required i64 output_null_ptr;
-  7: required i64 output_buffer_ptr;
+  6: required i64 output_null_ptr
+  7: required i64 output_buffer_ptr
 }
 
 // Arguments to getTableNames, which returns a list of tables that match an
@@ -97,7 +73,7 @@ struct TGetTablesParams {
   // Session state for the user who initiated this request. If authorization is
   // enabled, only the tables this user has access to will be returned. If not
   // set, access checks will be skipped (used for internal Impala requests)
-  3: optional TSessionState session
+  3: optional ImpalaInternalService.TSessionState session
 }
 
 // getTableNames returns a list of unqualified table names
@@ -114,7 +90,7 @@ struct TGetDbsParams {
   // Session state for the user who initiated this request. If authorization is
   // enabled, only the databases this user has access to will be returned. If not
   // set, access checks will be skipped (used for internal Impala requests)
-  2: optional TSessionState session
+  2: optional ImpalaInternalService.TSessionState session
 }
 
 // getDbNames returns a list of database names
@@ -149,17 +125,6 @@ struct TDescribeTableParams {
 struct TDescribeTableResult {
   // Output from a DESCRIBE TABLE command.
   1: required list<Data.TResultRow> results
-}
-
-struct TClientRequest {
-  // select stmt to be executed
-  1: required string stmt
-
-  // query options
-  2: required ImpalaInternalService.TQueryOptions queryOptions
-
-  // session state
-  3: required TSessionState sessionState
 }
 
 // Parameters for SHOW DATABASES commands
@@ -210,12 +175,13 @@ struct TGetFunctionsParams {
   // Session state for the user who initiated this request. If authorization is
   // enabled, only the functions this user has access to will be returned. If not
   // set, access checks will be skipped (used for internal Impala requests)
-  4: optional TSessionState session
+  4: optional ImpalaInternalService.TSessionState session
 }
 
 // getFunctions() returns a list of function signatures
 struct TGetFunctionsResult {
   1: list<string> fn_signatures
+  2: list<string> fn_ret_types
 }
 
 // Parameters for the USE db command
@@ -302,7 +268,7 @@ struct TQueryExecRequest {
   // Set if the query needs finalization after it executes
   6: optional TFinalizeParams finalize_params
 
-  7: required ImpalaInternalService.TQueryGlobals query_globals
+  7: required ImpalaInternalService.TQueryContext query_ctxt
 
   // The same as the output of 'explain <query>'
   8: optional string query_plan
@@ -397,7 +363,7 @@ struct TMetadataOpRequest {
   // Session state for the user who initiated this request. If authorization is
   // enabled, only the server objects this user has access to will be returned.
   // If not set, access checks will be skipped (used for internal Impala requests)
-  10: optional TSessionState session
+  10: optional ImpalaInternalService.TSessionState session
 }
 
 // Tracks accesses to Catalog objects for use during auditing. This information, paired
@@ -443,6 +409,14 @@ struct TExecRequest {
   8: optional list<TAccessEvent> access_events
 }
 
+// A UDF may include optional prepare and close functions in addition the main evaluation
+// function. This enum distinguishes between these when doing a symbol lookup.
+enum TSymbolType {
+  UDF_EVALUATE,
+  UDF_PREPARE,
+  UDF_CLOSE,
+}
+
 // Parameters to pass to validate that the binary contains the symbol. If the
 // symbols is fully specified (i.e. full mangled name), we validate that the
 // mangled name is correct. If only the function name is specified, we try
@@ -467,6 +441,9 @@ struct TSymbolLookupParams {
 
   // If set this function needs to have an return out argument of this type.
   6: optional Types.TColumnType ret_arg_type
+
+  // Determines the signature of the mangled symbol
+  7: required TSymbolType symbol_type;
 }
 
 enum TSymbolLookupResultCode {
@@ -506,5 +483,53 @@ struct TUpdateCatalogCacheRequest {
 // Response from a TUpdateCatalogCacheRequest.
 struct TUpdateCatalogCacheResponse {
   // The catalog service id this version is from.
-  1: required Types.TUniqueId catalog_service_id;
+  1: required Types.TUniqueId catalog_service_id
+}
+
+// Contains all interesting statistics from a single 'memory pool' in the JVM.
+// All numeric values are measured in bytes.
+struct TJvmMemoryPool {
+  // Memory committed by the operating system to this pool (i.e. not just virtual address
+  // space)
+  1: required i64 committed
+
+  // The initial amount of memory committed to this pool
+  2: required i64 init
+
+  // The maximum amount of memory this pool will use.
+  3: required i64 max
+
+  // The amount of memory currently in use by this pool (will be <= committed).
+  4: required i64 used
+
+  // Maximum committed memory over time
+  5: required i64 peak_committed
+
+  // Should be always == init
+  6: required i64 peak_init
+
+  // Peak maximum memory over time (usually will not change)
+  7: required i64 peak_max
+
+  // Peak consumed memory over time
+  8: required i64 peak_used
+
+  // Name of this pool, defined by the JVM
+  9: required string name
+}
+
+// Request to get one or all sets of memory pool metrics.
+struct TGetJvmMetricsRequest {
+  // If set, return all pools
+  1: required bool get_all
+
+  // If get_all is false, this must be set to the name of the memory pool to return.
+  2: optional string memory_pool
+}
+
+// Response from JniUtil::GetJvmMetrics()
+struct TGetJvmMetricsResponse {
+  // One entry for every pool tracked by the Jvm, plus a synthetic aggregate pool called
+  // 'total'
+  1: required list<TJvmMemoryPool> memory_pools
 }

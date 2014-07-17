@@ -16,7 +16,6 @@ package com.cloudera.impala.planner;
 
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Set;
 
 import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
@@ -34,7 +33,6 @@ import com.cloudera.impala.catalog.HdfsPartition.FileBlock;
 import com.cloudera.impala.catalog.HdfsTable;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.NotImplementedException;
-import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.common.PrintUtils;
 import com.cloudera.impala.common.RuntimeEnv;
 import com.cloudera.impala.thrift.TExplainLevel;
@@ -52,7 +50,6 @@ import com.google.common.base.Objects;
 import com.google.common.base.Objects.ToStringHelper;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
 
 /**
  * Scan of a single single table. Currently limited to full-table scans.
@@ -109,17 +106,13 @@ public class HdfsScanNode extends ScanNode {
   @Override
   public void init(Analyzer analyzer)
       throws InternalException, AuthorizationException {
-    // loop over all materialized slots and add predicates to conjuncts_
-    for (SlotDescriptor slotDesc: analyzer.getTupleDesc(tupleIds_.get(0)).getSlots()) {
-      ArrayList<Pair<Expr, Boolean>> bindingPredicates =
-          analyzer.getBoundPredicates(slotDesc.getId(), this);
-      for (Pair<Expr, Boolean> p: bindingPredicates) {
-        if (p.second) analyzer.markConjunctAssigned(p.first);
-        conjuncts_.add(p.first);
-      }
-    }
+    ArrayList<Expr> bindingPredicates = analyzer.getBoundPredicates(tupleIds_.get(0));
+    conjuncts_.addAll(bindingPredicates);
+
     // also add remaining unassigned conjuncts
     assignConjuncts(analyzer);
+
+    analyzer.enforceSlotEquivalences(tupleIds_.get(0), conjuncts_);
 
     // do partition pruning before deciding which slots to materialize,
     // we might end up removing some predicates
@@ -153,7 +146,7 @@ public class HdfsScanNode extends ScanNode {
       }
     }
     List<HdfsPartitionFilter> partitionFilters = Lists.newArrayList();
-    Set<Expr> filterConjuncts = Sets.newHashSet();
+    List<Expr> filterConjuncts = Lists.newArrayList();
     for (Expr conjunct: conjuncts_) {
       if (conjunct.isBoundBySlotIds(partitionSlots)) {
         partitionFilters.add(new HdfsPartitionFilter(conjunct, tbl_, analyzer));
@@ -193,6 +186,7 @@ public class HdfsScanNode extends ScanNode {
       cardinality_ = tbl_.getNumRows();
     } else {
       cardinality_ = 0;
+      totalBytes_ = 0;
       boolean hasValidPartitionCardinality = false;
       for (HdfsPartition p: partitions_) {
         // ignore partitions with missing stats in the hope they don't matter
@@ -214,6 +208,7 @@ public class HdfsScanNode extends ScanNode {
                 " sel=" + Double.toString(computeSelectivity()));
       cardinality_ = Math.round((double) cardinality_ * computeSelectivity());
     }
+    cardinality_ = capAtLimit(cardinality_);
     LOG.debug("computeStats HdfsScan: cardinality_=" + Long.toString(cardinality_));
 
     // TODO: take actual partitions into account
@@ -295,25 +290,40 @@ public class HdfsScanNode extends ScanNode {
   }
 
   @Override
-  protected String getNodeExplainString(String prefix, TExplainLevel detailLevel) {
+  protected String getNodeExplainString(String prefix, String detailPrefix,
+      TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
     HdfsTable table = (HdfsTable) desc_.getTable();
-    output.append(prefix + "table=" + table.getFullName());
-    // Exclude the dummy default partition from the total partition count.
-    output.append(String.format(" #partitions=%s/%s", partitions_.size(),
-        table.getPartitions().size() - 1));
-    output.append(" size=" + PrintUtils.printBytes(totalBytes_));
-    if (compactData_) {
-      output.append(" compact\n");
-    } else {
-      output.append("\n");
+    String aliasStr = "";
+    if (!table.getFullName().equalsIgnoreCase(desc_.getAlias()) &&
+        !table.getName().equalsIgnoreCase(desc_.getAlias())) {
+      aliasStr = " " + desc_.getAlias();
     }
-    if (!conjuncts_.isEmpty()) {
-      output.append(prefix + "predicates: " + getExplainString(conjuncts_) + "\n");
+    output.append(String.format("%s%s:%s [%s%s", prefix, id_.toString(),
+        displayName_, table.getFullName(), aliasStr));
+    if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal() &&
+        fragment_.isPartitioned()) {
+      output.append(", " + fragment_.getDataPartition().getExplainString());
     }
-    // Add table and column stats in verbose mode.
-    if (detailLevel == TExplainLevel.VERBOSE) {
-      output.append(getStatsExplainString(prefix, detailLevel));
+    output.append("]\n");
+    if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
+      int numPartitions = partitions_.size();
+      if (tbl_.getNumClusteringCols() == 0) numPartitions = 1;
+      output.append(String.format("%spartitions=%s/%s size=%s", detailPrefix,
+          numPartitions, table.getPartitions().size() - 1,
+          PrintUtils.printBytes(totalBytes_)));
+      if (compactData_) {
+        output.append(" compact\n");
+      } else {
+        output.append("\n");
+      }
+      if (!conjuncts_.isEmpty()) {
+        output.append(
+            detailPrefix + "predicates: " + getExplainString(conjuncts_) + "\n");
+      }
+    }
+    if (detailLevel.ordinal() >= TExplainLevel.EXTENDED.ordinal()) {
+      output.append(getStatsExplainString(detailPrefix, detailLevel));
       output.append("\n");
     }
     return output.toString();

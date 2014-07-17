@@ -94,7 +94,7 @@ public class HdfsPartitionFilter {
     Preconditions.checkState(literalPredicate.isConstant());
     // analyze to insert casts, etc.
     try {
-      literalPredicate.analyze(analyzer);
+      literalPredicate.reanalyze(analyzer);
     } catch (AnalysisException e) {
       // this should never happen
       throw new InternalException(
@@ -102,7 +102,7 @@ public class HdfsPartitionFilter {
     }
 
     // call backend
-    if (!FeSupport.EvalPredicate(literalPredicate, analyzer.getQueryGlobals())) {
+    if (!FeSupport.EvalPredicate(literalPredicate, analyzer.getQueryContext())) {
       return false;
     }
 

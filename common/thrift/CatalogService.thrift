@@ -74,7 +74,7 @@ struct TDdlExecRequest {
   // Parameters for CREATE FUNCTION
   9: optional JniCatalog.TCreateFunctionParams create_fn_params
 
-  // Paramaters for DROP DATABASE
+  // Parameters for DROP DATABASE
   10: optional JniCatalog.TDropDbParams drop_db_params
 
   // Parameters for DROP TABLE/VIEW
@@ -144,6 +144,24 @@ struct TResetMetadataResponse {
   1: required TCatalogUpdateResult result
 }
 
+// Request to GetFunctions()
+struct TGetFunctionsRequest {
+  1: required CatalogServiceVersion protocol_version = CatalogServiceVersion.V1
+
+  // The parent database name.
+  2: optional string db_name;
+}
+
+// Response a call to GetFunctions()
+struct TGetFunctionsResponse {
+  // The status of the operation, OK if the operation was successful.
+  1: optional Status.TStatus status
+
+  // List of functions returned to the caller. Functions are not returned in a
+  // defined order.
+  2: optional list<Types.TFunction> functions;
+}
+
 // Request the complete metadata for a given catalog object. May trigger a metadata load
 // if the object is not already in the catalog cache.
 struct TGetCatalogObjectRequest {
@@ -191,6 +209,10 @@ service CatalogService {
   // Updates the metastore with new partition information and returns a response
   // with details on the result of the operation.
   TUpdateCatalogResponse UpdateCatalog(1: TUpdateCatalogRequest req);
+
+  // Gets all user defined functions (aggregate and scalar) in the catalog matching
+  // the parameters of TGetFunctionsRequest.
+  TGetFunctionsResponse GetFunctions(1: TGetFunctionsRequest req);
 
   // Prioritize the loading of metadata for the CatalogObjects specified in the
   // TPrioritizeLoadRequest.

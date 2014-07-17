@@ -27,15 +27,15 @@ import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.analysis.Expr;
 import com.cloudera.impala.analysis.TableName;
-import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TCatalogObjectType;
 import com.cloudera.impala.thrift.TColumnValue;
 import com.cloudera.impala.thrift.TExpr;
-import com.cloudera.impala.thrift.TQueryGlobals;
 import com.cloudera.impala.thrift.TPrioritizeLoadRequest;
 import com.cloudera.impala.thrift.TPrioritizeLoadResponse;
+import com.cloudera.impala.thrift.TFunction;
+import com.cloudera.impala.thrift.TQueryContext;
 import com.cloudera.impala.thrift.TStatus;
 import com.cloudera.impala.thrift.TSymbolLookupParams;
 import com.cloudera.impala.thrift.TSymbolLookupResult;
@@ -63,7 +63,7 @@ public class FeSupport {
   public native static byte[] NativeEvalConstExpr(byte[] thriftExpr,
       byte[] thriftQueryGlobals);
 
-  // Returns a serialize TSymbolLookupResult
+  // Returns a serialized TSymbolLookupResult
   public native static byte[] NativeLookupSymbol(byte[] thriftSymbolLookup);
 
   // Does an RPCs to the Catalog Server to prioritize the metadata loading of a
@@ -72,7 +72,7 @@ public class FeSupport {
   // using Java Thrift bindings.
   public native static byte[] NativePrioritizeLoad(byte[] thriftReq);
 
-  public static TColumnValue EvalConstExpr(Expr expr, TQueryGlobals queryGlobals)
+  public static TColumnValue EvalConstExpr(Expr expr, TQueryContext queryCtxt)
       throws InternalException {
     Preconditions.checkState(expr.isConstant());
     TExpr thriftExpr = expr.treeToThrift();
@@ -80,7 +80,7 @@ public class FeSupport {
     byte[] result;
     try {
       result = EvalConstExpr(serializer.serialize(thriftExpr),
-          serializer.serialize(queryGlobals));
+          serializer.serialize(queryCtxt));
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
       TColumnValue val = new TColumnValue();
@@ -117,20 +117,20 @@ public class FeSupport {
     }
   }
 
-  private static byte[] EvalConstExpr(byte[] thriftExpr, byte[] thriftQueryGlobals) {
+  private static byte[] EvalConstExpr(byte[] thriftExpr, byte[] thriftQueryContext) {
     try {
-      return NativeEvalConstExpr(thriftExpr, thriftQueryGlobals);
+      return NativeEvalConstExpr(thriftExpr, thriftQueryContext);
     } catch (UnsatisfiedLinkError e) {
       // We should only get here in FE tests that dont run the BE.
       loadLibrary();
     }
-    return NativeEvalConstExpr(thriftExpr, thriftQueryGlobals);
+    return NativeEvalConstExpr(thriftExpr, thriftQueryContext);
   }
 
-  public static boolean EvalPredicate(Expr pred, TQueryGlobals queryGlobals)
+  public static boolean EvalPredicate(Expr pred, TQueryContext queryCtxt)
       throws InternalException {
-    Preconditions.checkState(pred.getType() == PrimitiveType.BOOLEAN);
-    TColumnValue val = EvalConstExpr(pred, queryGlobals);
+    Preconditions.checkState(pred.getType().isBoolean());
+    TColumnValue val = EvalConstExpr(pred, queryCtxt);
     // Return false if pred evaluated to false or NULL. True otherwise.
     return val.isSetBoolVal() && val.boolVal;
   }

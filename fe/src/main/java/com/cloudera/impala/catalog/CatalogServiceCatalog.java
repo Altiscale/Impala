@@ -32,10 +32,12 @@ import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.thrift.TCatalog;
 import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TCatalogObjectType;
+import com.cloudera.impala.thrift.TFunctionBinaryType;
 import com.cloudera.impala.thrift.TGetAllCatalogObjectsResponse;
 import com.cloudera.impala.thrift.TTable;
 import com.cloudera.impala.thrift.TTableName;
 import com.cloudera.impala.thrift.TUniqueId;
+import com.cloudera.impala.util.PatternMatcher;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
@@ -184,9 +186,7 @@ public class CatalogServiceCatalog extends Catalog {
           resp.addToObjects(catalogTbl);
         }
 
-        for (String signature: db.getAllFunctionSignatures(null)) {
-          Function fn = db.getFunction(signature);
-          if (fn == null) continue;
+        for (Function fn: db.getFunctions(null, new PatternMatcher())) {
           TCatalogObject function = new TCatalogObject(TCatalogObjectType.FUNCTION,
               fn.getCatalogVersion());
           function.setType(TCatalogObjectType.FUNCTION);
@@ -213,6 +213,27 @@ public class CatalogServiceCatalog extends Catalog {
     } finally {
       catalogLock_.readLock().unlock();
     }
+  }
+
+  /**
+   * Returns all user defined functions (aggregate and scalar) in the specified database.
+   * Functions are not returned in a defined order.
+   */
+  public List<Function> getFunctions(String dbName) throws DatabaseNotFoundException {
+    Db db = getDb(dbName);
+    if (db == null) {
+      throw new DatabaseNotFoundException("Database does not exist: " + dbName);
+    }
+
+    // Contains map of overloaded function names to all functions matching that name.
+    HashMap<String, List<Function>> dbFns = db.getAllFunctions();
+    List<Function> fns = new ArrayList<Function>(dbFns.size());
+    for (List<Function> fnOverloads: dbFns.values()) {
+      for (Function fn: fnOverloads) {
+        fns.add(fn);
+      }
+    }
+    return fns;
   }
 
   /**
@@ -276,6 +297,7 @@ public class CatalogServiceCatalog extends Catalog {
 
         for (List<Function> fns: dbFns.second.values()) {
           for (Function fn: fns) {
+            if (fn.getBinaryType() == TFunctionBinaryType.BUILTIN) continue;
             fn.setCatalogVersion(incrementAndGetCatalogVersion());
             db.addFunction(fn);
           }

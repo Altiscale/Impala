@@ -7,6 +7,7 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 import java.util.List;
+import java.util.Set;
 
 import org.apache.hive.service.cli.thrift.TGetCatalogsReq;
 import org.apache.hive.service.cli.thrift.TGetColumnsReq;
@@ -20,16 +21,15 @@ import com.cloudera.impala.authorization.AuthorizationConfig;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.ImpalaException;
-import com.cloudera.impala.thrift.TClientRequest;
 import com.cloudera.impala.testutil.ImpaladTestCatalog;
 import com.cloudera.impala.testutil.TestUtils;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpcode;
-import com.cloudera.impala.thrift.TQueryOptions;
+import com.cloudera.impala.thrift.TQueryContext;
 import com.cloudera.impala.thrift.TResultRow;
 import com.cloudera.impala.thrift.TResultSet;
-import com.cloudera.impala.thrift.TSessionState;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 
 /**
  * Unit test for Frontend.execHiveServer2MetadataOp, which executes a HiveServer2
@@ -47,20 +47,16 @@ public class FrontendTest {
   @Test
   public void TestCatalogNotReady() throws ImpalaException {
     Frontend fe = new Frontend(AuthorizationConfig.createAuthDisabledConfig());
-    TClientRequest request = new TClientRequest();
-    request.setSessionState(new TSessionState());
-    request.getSessionState().setUser("fake_user");
-    request.getSessionState().setDatabase("default");
-    request.setQueryOptions(new TQueryOptions());
+    TQueryContext queryCtxt = TestUtils.createQueryContext("default", "fake_user");
 
     // Queries that do not touch catalog objects should succeed.
-    request.setStmt("select 1");
-    fe.createExecRequest(request, new StringBuilder());
+    queryCtxt.request.setStmt("select 1");
+    fe.createExecRequest(queryCtxt, new StringBuilder());
 
     // A query that touches a catalog object should fail.
-    request.setStmt("show tables");
+    queryCtxt.request.setStmt("show tables");
     try {
-      fe.createExecRequest(request, new StringBuilder());
+      fe.createExecRequest(queryCtxt, new StringBuilder());
       fail("Expected failure to due uninitialized catalog.");
     } catch (AnalysisException e) {
       assertEquals("This Impala daemon is not ready to accept user requests. " +
@@ -78,9 +74,10 @@ public class FrontendTest {
     // DatabaseMetaData.getTypeInfo has 18 columns.
     assertEquals(18, resp.schema.columns.size());
     assertEquals(18, resp.rows.get(0).colVals.size());
-    // All primitives types, except INVALID_TYPE, DATE, DATETIME and CHAR, should be
-    // returned. Therefore #supported types =  PrimitiveType.values().length - 4.
-    assertEquals(PrimitiveType.values().length - 4, resp.rows.size());
+    // All primitives types, except INVALID_TYPE, DATE, DATETIME DECIMAL and CHAR,
+    // should be returned.
+    // Therefore #supported types =  PrimitiveType.values().length - 5.
+    assertEquals(PrimitiveType.values().length - 5, resp.rows.size());
   }
 
   @Test
@@ -176,14 +173,18 @@ public class FrontendTest {
     assertEquals(6, resp.schema.columns.size());
     assertEquals(6, resp.rows.get(0).colVals.size());
 
-    assertEquals(3, resp.rows.size());
+    Set<String> fns = Sets.newHashSet();
+    for (TResultRow row: resp.rows) {
+      String fn = row.colVals.get(2).stringVal.toLowerCase();
+      fns.add(fn);
+    }
+    assertEquals(3, fns.size());
 
     List<String> expectedResult = Lists.newArrayList();
     expectedResult.add("subdate");
     expectedResult.add("substr");
     expectedResult.add("substring");
-    for (TResultRow row: resp.rows) {
-      String fn = row.colVals.get(2).stringVal.toLowerCase();
+    for (String fn: fns) {
       assertTrue(fn + " not found", expectedResult.remove(fn));
     }
   }

@@ -63,18 +63,15 @@ public class SortNode extends PlanNode {
   }
 
   /**
-   * Clone 'inputSortNode' for distributed Top-N
+   * Copy c'tor used in clone().
    */
-  public SortNode(PlanNodeId id, SortNode inputSortNode, PlanNode child) {
-    super(id, inputSortNode, "TOP-N");
-    info_ = inputSortNode.info_;
-    // set this directly (and don't reassign in init()): inputSortNode's smap
-    // may not be able to remap info_.orderingExprs
-    baseTblOrderingExprs_ = inputSortNode.baseTblOrderingExprs_;
-    useTopN_ = inputSortNode.useTopN_;
-    isDefaultLimit_ = inputSortNode.isDefaultLimit_;
-    children_.add(child);
-    offset_ = inputSortNode.offset_;
+  private SortNode(PlanNodeId id, SortNode src) {
+    super(id, src, "TOP-N");
+    info_ = src.info_;
+    baseTblOrderingExprs_ = src.baseTblOrderingExprs_;
+    useTopN_ = src.useTopN_;
+    isDefaultLimit_ = src.isDefaultLimit_;
+    offset_ = src.offset_;
   }
 
   public long getOffset() { return offset_; }
@@ -101,14 +98,7 @@ public class SortNode extends PlanNode {
   @Override
   protected void computeStats(Analyzer analyzer) {
     super.computeStats(analyzer);
-    cardinality_ = getChild(0).cardinality_;
-    if (hasLimit()) {
-      if (cardinality_ == -1) {
-        cardinality_ = limit_;
-      } else {
-        cardinality_ = Math.min(cardinality_, limit_);
-      }
-    }
+    cardinality_ = capAtLimit(getChild(0).cardinality_);
     LOG.debug("stats Sort: cardinality=" + Long.toString(cardinality_));
   }
 
@@ -138,23 +128,25 @@ public class SortNode extends PlanNode {
   }
 
   @Override
-  protected String getNodeExplainString(String detailPrefix,
+  protected String getNodeExplainString(String prefix, String detailPrefix,
       TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
-    output.append(detailPrefix + "order by: ");
-    for (int i = 0; i < info_.getOrderingExprs().size(); ++i) {
-      if (i > 0) {
-        output.append(", ");
-      }
-      output.append(info_.getOrderingExprs().get(i).toSql() + " ");
-      output.append(info_.getIsAscOrder().get(i) ? "ASC" : "DESC");
+    output.append(String.format("%s%s:%s [LIMIT=%s]\n", prefix, id_.toString(),
+        displayName_, limit_));
+    if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
+      output.append(detailPrefix + "order by: ");
+      for (int i = 0; i < info_.getOrderingExprs().size(); ++i) {
+        if (i > 0) output.append(", ");
+        output.append(info_.getOrderingExprs().get(i).toSql() + " ");
+        output.append(info_.getIsAscOrder().get(i) ? "ASC" : "DESC");
 
-      Boolean nullsFirstParam = info_.getNullsFirstParams().get(i);
-      if (nullsFirstParam != null) {
-        output.append(nullsFirstParam ? " NULLS FIRST" : " NULLS LAST");
+        Boolean nullsFirstParam = info_.getNullsFirstParams().get(i);
+        if (nullsFirstParam != null) {
+          output.append(nullsFirstParam ? " NULLS FIRST" : " NULLS LAST");
+        }
       }
+      output.append("\n");
     }
-    output.append("\n");
     return output.toString();
   }
 
@@ -169,4 +161,7 @@ public class SortNode extends PlanNode {
     Preconditions.checkState(useTopN_);
     perHostMemCost_ = (long) Math.ceil((cardinality_ + offset_) * avgRowSize_);
   }
+
+  @Override
+  public PlanNode clone(PlanNodeId id) { return new SortNode(id, this); }
 }

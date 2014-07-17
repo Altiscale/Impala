@@ -159,7 +159,7 @@ public class CatalogObjectToFromThriftTest {
     HBaseTable newHBaseTable = (HBaseTable) newTable;
     Assert.assertEquals(newHBaseTable.getColumns().size(), 13);
     Assert.assertEquals(newHBaseTable.getColumn("double_col").getType(),
-        PrimitiveType.DOUBLE);
+        ColumnType.DOUBLE);
     Assert.assertEquals(newHBaseTable.getNumClusteringCols(), 1);
   }
 
@@ -194,7 +194,7 @@ public class CatalogObjectToFromThriftTest {
     HBaseTable newHBaseTable = (HBaseTable) newTable;
     Assert.assertEquals(newHBaseTable.getColumns().size(), 13);
     Assert.assertEquals(newHBaseTable.getColumn("double_col").getType(),
-        PrimitiveType.DOUBLE);
+        ColumnType.DOUBLE);
     Assert.assertEquals(newHBaseTable.getNumClusteringCols(), 1);
   }
 

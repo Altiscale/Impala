@@ -29,6 +29,7 @@ include "DataSinks.thrift"
 include "Data.thrift"
 include "RuntimeProfile.thrift"
 include "ImpalaService.thrift"
+include "Llama.thrift"
 
 // constants for TQueryOptions.num_nodes
 const i32 NUM_NODES_ALL = 0
@@ -64,12 +65,85 @@ struct TQueryOptions {
   17: optional i64 parquet_file_size = 0
   18: optional Types.TExplainLevel explain_level
   19: optional bool sync_ddl = 0
+
+  // Request pool this request should be submitted to. If not set
+  // the pool is determined based on the user.
+  20: optional string request_pool
+
+  // Per-host virtual CPU cores required for query (only relevant with RM).
+  21: optional i16 v_cpu_cores
+
+  // Max time in milliseconds the resource broker should wait for
+  // a resource request to be granted by Llama/Yarn (only relevant with RM).
+  22: optional i64 reservation_request_timeout
+
+  // Disables taking advantage of HDFS caching. This has two parts:
+  // 1. disable preferring to schedule to cached replicas
+  // 2. disable the cached read path.
+  23: optional bool disable_cached_reads = 0
+}
+
+// Impala currently has two types of sessions: Beeswax and HiveServer2
+enum TSessionType {
+  BEESWAX,
+  HIVESERVER2
+}
+
+// Per-client session state
+struct TSessionState {
+  // A unique identifier for this session
+  3: required Types.TUniqueId session_id
+
+  // Session Type (Beeswax or HiveServer2)
+  5: required TSessionType session_type
+
+  // The default database for the session
+  1: required string database
+
+  // The user to whom this session belongs
+  2: required string connected_user
+
+  // If set, the user we are impersonating for the current session
+  6: optional string impersonated_user;
+
+  // Client network address
+  4: required Types.TNetworkAddress network_address
+}
+
+// Client request including stmt to execute and query options.
+struct TClientRequest {
+  // SQL stmt to be executed
+  1: required string stmt
+
+  // query options
+  2: required TQueryOptions query_options
+}
+
+// Context of this query, including the client request, session state and
+// global query parameters needed for consistent expr evaluation (e.g., now()).
+struct TQueryContext {
+  // Client request containing stmt to execute and query options.
+  1: required TClientRequest request
+
+  // Session state including user.
+  2: required TSessionState session
+
+  // String containing a timestamp set as the query submission time.
+  3: required string now_string
+
+  // Process ID of the impalad to which the user is connected.
+  4: required i32 pid
+
+  // List of tables missing relevant table and/or column stats. Used for
+  // populating query-profile fields consumed by CM as well as warning messages.
+  5: optional list<CatalogObjects.TTableName> tables_missing_stats
 }
 
 // A scan range plus the parameters needed to execute that scan.
 struct TScanRangeParams {
   1: required PlanNodes.TScanRange scan_range
   2: optional i32 volume_id = -1
+  3: optional bool is_cached = false
 }
 
 // Specification of one output destination of a plan fragment
@@ -108,17 +182,11 @@ struct TPlanFragmentExecParams {
   6: optional Types.TPlanNodeId debug_node_id
   7: optional PlanNodes.TExecNodePhase debug_phase
   8: optional PlanNodes.TDebugAction debug_action
+
+  // The pool to which this request has been submitted. Used to update pool statistics
+  // for admission control.
+  9: optional string request_pool;
 }
-
-// Global query parameters assigned by the coordinator.
-struct TQueryGlobals {
-  // String containing a timestamp set as the current time.
-  1: required string now_string
-
-  // Name of the user executing this query.
-  2: optional string user
-}
-
 
 // Service Protocol Details
 
@@ -150,13 +218,16 @@ struct TExecPlanFragmentParams {
   // required in V1
   6: optional i32 backend_num
 
-  // Global query parameters assigned by coordinator.
+  // Context of this query, including query options, session state and
+  // global query parameters needed for consistent expr evaluation (e.g., now()).
   // required in V1
-  7: optional TQueryGlobals query_globals
+  7: optional TQueryContext query_ctxt
 
-  // options for the query
-  // required in V1
-  8: optional TQueryOptions query_options
+  // Resource reservation to run this plan fragment in.
+  8: optional Llama.TAllocatedResource reserved_resource
+
+  // Address of local node manager (used for expanding resource allocations)
+  9: optional Types.TNetworkAddress local_resource_address
 }
 
 struct TExecPlanFragmentResult {
@@ -277,6 +348,46 @@ struct TTransmitDataResult {
   1: optional Status.TStatus status
 }
 
+// Parameters for RequestPoolService.resolveRequestPool()
+struct TResolveRequestPoolParams {
+  // User to resolve to a pool via the allocation placement policy and
+  // authorize for pool access.
+  1: required string user
+
+  // Pool name specified by the user. The allocation placement policy may
+  // return a different pool.
+  2: required string requested_pool
+}
+
+// Returned by RequestPoolService.resolveRequestPool()
+struct TResolveRequestPoolResult {
+  // Actual pool to use, as determined by the pool allocation policy.
+  1: required string resolved_pool
+
+  // True if the user has access to submit requests to the resolved_pool.
+  2: required bool has_access
+
+  3: optional Status.TStatus status
+}
+
+// Parameters for RequestPoolService.getPoolConfig()
+struct TPoolConfigParams {
+  // Pool name
+  1: required string pool
+}
+
+// Returned by RequestPoolService.getPoolConfig()
+struct TPoolConfigResult {
+  // Maximum number of placed requests before incoming requests are queued.
+  1: required i64 max_requests
+
+  // Maximum number of queued requests before incoming requests are rejected.
+  2: required i64 max_queued
+
+  // Memory limit of the pool before incoming requests are queued.
+  // -1 indicates no limit.
+  3: required i64 mem_limit
+}
 
 service ImpalaInternalService {
   // Called by coord to start asynchronous execution of plan fragment in backend.

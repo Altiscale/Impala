@@ -48,12 +48,12 @@ import com.cloudera.impala.authorization.AuthorizationConfig;
 import com.cloudera.impala.authorization.ImpalaInternalAdminUser;
 import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.authorization.User;
+import com.cloudera.impala.catalog.Function;
 import com.cloudera.impala.common.FileSystemUtil;
 import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.JniUtil;
 import com.cloudera.impala.thrift.TCatalogObject;
-import com.cloudera.impala.thrift.TClientRequest;
 import com.cloudera.impala.thrift.TDescribeTableParams;
 import com.cloudera.impala.thrift.TDescribeTableResult;
 import com.cloudera.impala.thrift.TExecRequest;
@@ -67,12 +67,15 @@ import com.cloudera.impala.thrift.TLoadDataReq;
 import com.cloudera.impala.thrift.TLoadDataResp;
 import com.cloudera.impala.thrift.TLogLevel;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
+import com.cloudera.impala.thrift.TQueryContext;
 import com.cloudera.impala.thrift.TResultSet;
 import com.cloudera.impala.thrift.TShowStatsParams;
 import com.cloudera.impala.thrift.TTableName;
 import com.cloudera.impala.thrift.TUpdateCatalogCacheRequest;
 import com.cloudera.impala.util.GlogAppender;
+import com.cloudera.impala.util.TSessionStateUtil;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 
 /**
  * JNI-callable interface onto a wrapped Frontend instance. The main point is to serialise
@@ -102,16 +105,16 @@ public class JniFrontend {
   }
 
   /**
-   * Jni wrapper for Frontend.createQueryExecRequest2(). Accepts a serialized
-   * TClientRequest; returns a serialized TQueryExecRequest2.
+   * Jni wrapper for Frontend.createExecRequest(). Accepts a serialized
+   * TQueryContext; returns a serialized TQueryExecRequest.
    */
-  public byte[] createExecRequest(byte[] thriftClientRequest)
+  public byte[] createExecRequest(byte[] thriftQueryContext)
       throws ImpalaException {
-    TClientRequest request = new TClientRequest();
-    JniUtil.deserializeThrift(protocolFactory_, request, thriftClientRequest);
+    TQueryContext queryCxt = new TQueryContext();
+    JniUtil.deserializeThrift(protocolFactory_, queryCxt, thriftQueryContext);
 
     StringBuilder explainString = new StringBuilder();
-    TExecRequest result = frontend_.createExecRequest(request, explainString);
+    TExecRequest result = frontend_.createExecRequest(queryCxt, explainString);
     LOG.debug(explainString.toString());
 
     // TODO: avoid creating serializer for each query?
@@ -154,13 +157,13 @@ public class JniFrontend {
   }
 
   /**
-   * Return an explain plan based on thriftQueryRequest, a serialized TQueryRequest.
+   * Return an explain plan based on thriftQueryContext, a serialized TQueryContext.
    * This call is thread-safe.
    */
-  public String getExplainPlan(byte[] thriftQueryRequest) throws ImpalaException {
-    TClientRequest request = new TClientRequest();
-    JniUtil.deserializeThrift(protocolFactory_, request, thriftQueryRequest);
-    String plan = frontend_.getExplainString(request);
+  public String getExplainPlan(byte[] thriftQueryContext) throws ImpalaException {
+    TQueryContext queryCtxt = new TQueryContext();
+    JniUtil.deserializeThrift(protocolFactory_, queryCtxt, thriftQueryContext);
+    String plan = frontend_.getExplainString(queryCtxt);
     LOG.debug("Explain plan: " + plan);
     return plan;
   }
@@ -177,7 +180,8 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, params, thriftGetTablesParams);
     // If the session was not set it indicates this is an internal Impala call.
     User user = params.isSetSession() ?
-        new User(params.getSession().getUser()) : ImpalaInternalAdminUser.getInstance();
+        new User(TSessionStateUtil.getEffectiveUser(params.getSession())) :
+        ImpalaInternalAdminUser.getInstance();
 
     Preconditions.checkState(!params.isSetSession() || user != null );
     List<String> tables = frontend_.getTableNames(params.db, params.pattern, user);
@@ -204,7 +208,8 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, params, thriftGetTablesParams);
     // If the session was not set it indicates this is an internal Impala call.
     User user = params.isSetSession() ?
-        new User(params.getSession().getUser()) : ImpalaInternalAdminUser.getInstance();
+        new User(TSessionStateUtil.getEffectiveUser(params.getSession())) :
+        ImpalaInternalAdminUser.getInstance();
     List<String> dbs = frontend_.getDbNames(params.pattern, user);
 
     TGetDbsResult result = new TGetDbsResult();
@@ -249,8 +254,15 @@ public class JniFrontend {
     JniUtil.deserializeThrift(protocolFactory_, params, thriftGetFunctionsParams);
 
     TGetFunctionsResult result = new TGetFunctionsResult();
-    result.setFn_signatures(
-        frontend_.getFunctions(params.type, params.db, params.pattern));
+    List<String> signatures = Lists.newArrayList();
+    List<String> retTypes = Lists.newArrayList();
+    List<Function> fns = frontend_.getFunctions(params.type, params.db, params.pattern);
+    for (Function fn: fns) {
+      signatures.add(fn.signatureString());
+      retTypes.add(fn.getReturnType().toString());
+    }
+    result.setFn_signatures(signatures);
+    result.setFn_ret_types(retTypes);
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
       return serializer.serialize(result);
@@ -319,6 +331,10 @@ public class JniFrontend {
     } catch (TException e) {
       throw new InternalException(e.getMessage());
     }
+  }
+
+  public void setCatalogInitialized() {
+    frontend_.getCatalog().setIsReady();
   }
 
   // Caching this saves ~50ms per call to getHadoopConfigAsHtml

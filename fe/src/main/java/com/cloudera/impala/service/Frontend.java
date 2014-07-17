@@ -49,8 +49,10 @@ import com.cloudera.impala.authorization.User;
 import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.CatalogException;
 import com.cloudera.impala.catalog.Column;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.DatabaseNotFoundException;
 import com.cloudera.impala.catalog.Db;
+import com.cloudera.impala.catalog.Function;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.HdfsTable;
 import com.cloudera.impala.catalog.ImpaladCatalog;
@@ -65,7 +67,6 @@ import com.cloudera.impala.planner.Planner;
 import com.cloudera.impala.planner.ScanNode;
 import com.cloudera.impala.thrift.TCatalogOpRequest;
 import com.cloudera.impala.thrift.TCatalogOpType;
-import com.cloudera.impala.thrift.TClientRequest;
 import com.cloudera.impala.thrift.TColumn;
 import com.cloudera.impala.thrift.TColumnValue;
 import com.cloudera.impala.thrift.TDdlExecRequest;
@@ -81,7 +82,7 @@ import com.cloudera.impala.thrift.TLoadDataReq;
 import com.cloudera.impala.thrift.TLoadDataResp;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TPlanFragment;
-import com.cloudera.impala.thrift.TPrimitiveType;
+import com.cloudera.impala.thrift.TQueryContext;
 import com.cloudera.impala.thrift.TQueryExecRequest;
 import com.cloudera.impala.thrift.TResetMetadataRequest;
 import com.cloudera.impala.thrift.TResultRow;
@@ -90,13 +91,18 @@ import com.cloudera.impala.thrift.TResultSetMetadata;
 import com.cloudera.impala.thrift.TStatus;
 import com.cloudera.impala.thrift.TStatusCode;
 import com.cloudera.impala.thrift.TStmtType;
+import com.cloudera.impala.thrift.TTableName;
 import com.cloudera.impala.thrift.TUpdateCatalogCacheRequest;
 import com.cloudera.impala.thrift.TUpdateCatalogCacheResponse;
+import com.cloudera.impala.util.PatternMatcher;
 import com.cloudera.impala.util.TResultRowBuilder;
+import com.cloudera.impala.util.TSessionStateUtil;
+import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
+import com.google.common.base.Predicates;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.google.common.base.Joiner;
+import com.google.common.collect.Sets;
 
 /**
  * Frontend API for the impalad process.
@@ -157,35 +163,36 @@ public class Frontend {
       ddl.op_type = TCatalogOpType.SHOW_TABLES;
       ddl.setShow_tables_params(analysis.getShowTablesStmt().toThrift());
       metadata.setColumns(Arrays.asList(
-          new TColumn("name", TPrimitiveType.STRING)));
+          new TColumn("name", ColumnType.STRING.toThrift())));
     } else if (analysis.isShowDbsStmt()) {
       ddl.op_type = TCatalogOpType.SHOW_DBS;
       ddl.setShow_dbs_params(analysis.getShowDbsStmt().toThrift());
       metadata.setColumns(Arrays.asList(
-          new TColumn("name", TPrimitiveType.STRING)));
+          new TColumn("name", ColumnType.STRING.toThrift())));
     } else if (analysis.isShowStatsStmt()) {
       ddl.op_type = TCatalogOpType.SHOW_STATS;
       ddl.setShow_stats_params(analysis.getShowStatsStmt().toThrift());
       metadata.setColumns(Arrays.asList(
-          new TColumn("name", TPrimitiveType.STRING)));
+          new TColumn("name", ColumnType.STRING.toThrift())));
     } else if (analysis.isShowFunctionsStmt()) {
       ddl.op_type = TCatalogOpType.SHOW_FUNCTIONS;
       ShowFunctionsStmt stmt = (ShowFunctionsStmt)analysis.getStmt();
       ddl.setShow_fns_params(stmt.toThrift());
       metadata.setColumns(Arrays.asList(
-          new TColumn("name", TPrimitiveType.STRING)));
+          new TColumn("return type", ColumnType.STRING.toThrift()),
+          new TColumn("signature", ColumnType.STRING.toThrift())));
     } else if (analysis.isShowCreateTableStmt()) {
       ddl.op_type = TCatalogOpType.SHOW_CREATE_TABLE;
       ddl.setShow_create_table_params(analysis.getShowCreateTableStmt().toThrift());
       metadata.setColumns(Arrays.asList(
-          new TColumn("result", TPrimitiveType.STRING)));
+          new TColumn("result", ColumnType.STRING.toThrift())));
     } else if (analysis.isDescribeStmt()) {
       ddl.op_type = TCatalogOpType.DESCRIBE;
       ddl.setDescribe_table_params(analysis.getDescribeStmt().toThrift());
       metadata.setColumns(Arrays.asList(
-          new TColumn("name", TPrimitiveType.STRING),
-          new TColumn("type", TPrimitiveType.STRING),
-          new TColumn("comment", TPrimitiveType.STRING)));
+          new TColumn("name", ColumnType.STRING.toThrift()),
+          new TColumn("type", ColumnType.STRING.toThrift()),
+          new TColumn("comment", ColumnType.STRING.toThrift())));
     } else if (analysis.isAlterTableStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -215,7 +222,7 @@ public class Frontend {
           analysis.getCreateTableAsSelectStmt().getCreateStmt().toThrift());
       ddl.setDdl_params(req);
       metadata.setColumns(Arrays.asList(
-          new TColumn("summary", TPrimitiveType.STRING)));
+          new TColumn("summary", ColumnType.STRING.toThrift())));
     } else if (analysis.isCreateTableLikeStmt()) {
       ddl.op_type = TCatalogOpType.DDL;
       TDdlExecRequest req = new TDdlExecRequest();
@@ -355,9 +362,9 @@ public class Frontend {
    * Parses and plans a query in order to generate its explain string. This method does
    * not increase the query id counter.
    */
-  public String getExplainString(TClientRequest request) throws ImpalaException {
+  public String getExplainString(TQueryContext queryCtxt) throws ImpalaException {
     StringBuilder stringBuilder = new StringBuilder();
-    createExecRequest(request, stringBuilder);
+    createExecRequest(queryCtxt, stringBuilder);
     return stringBuilder.toString();
   }
 
@@ -389,12 +396,13 @@ public class Frontend {
     TResultSet result = new TResultSet();
     TResultSetMetadata resultSchema = new TResultSetMetadata();
     result.setSchema(resultSchema);
-    resultSchema.addToColumns(new TColumn("Column", TPrimitiveType.STRING));
-    resultSchema.addToColumns(new TColumn("Type", TPrimitiveType.STRING));
-    resultSchema.addToColumns(new TColumn("#Distinct Values", TPrimitiveType.BIGINT));
-    resultSchema.addToColumns(new TColumn("#Nulls", TPrimitiveType.BIGINT));
-    resultSchema.addToColumns(new TColumn("Max Size", TPrimitiveType.DOUBLE));
-    resultSchema.addToColumns(new TColumn("Avg Size", TPrimitiveType.DOUBLE));
+    resultSchema.addToColumns(new TColumn("Column", ColumnType.STRING.toThrift()));
+    resultSchema.addToColumns(new TColumn("Type", ColumnType.STRING.toThrift()));
+    resultSchema.addToColumns(
+        new TColumn("#Distinct Values", ColumnType.BIGINT.toThrift()));
+    resultSchema.addToColumns(new TColumn("#Nulls", ColumnType.BIGINT.toThrift()));
+    resultSchema.addToColumns(new TColumn("Max Size", ColumnType.DOUBLE.toThrift()));
+    resultSchema.addToColumns(new TColumn("Avg Size", ColumnType.DOUBLE.toThrift()));
 
     for (Column c: table.getColumnsInHiveOrder()) {
       TResultRowBuilder rowBuilder = new TResultRowBuilder();
@@ -426,9 +434,13 @@ public class Frontend {
    * Returns all function signatures that match the pattern. If pattern is null,
    * matches all functions.
    */
-  public List<String> getFunctions(TFunctionType type, String dbName, String fnPattern)
+  public List<Function> getFunctions(TFunctionType type, String dbName, String fnPattern)
       throws DatabaseNotFoundException {
-    return impaladCatalog_.getFunctionSignatures(type, dbName, fnPattern);
+    Db db = impaladCatalog_.getDb(dbName);
+    if (db == null) {
+      throw new DatabaseNotFoundException("Database '" + dbName + "' not found");
+    }
+    return db.getFunctions(type, PatternMatcher.createHivePatternMatcher(fnPattern));
   }
 
   /**
@@ -444,9 +456,6 @@ public class Frontend {
   }
 
   /**
-<<<<<<< HEAD
-   * Create a populated TExecRequest corresponding to the supplied TClientRequest.
-=======
    * Given a set of table names, returns the set of table names that are missing
    * metadata (are not yet loaded).
    */
@@ -527,19 +536,17 @@ public class Frontend {
    * for a table to be loaded in event the table metadata was invalidated.
    * TODO: Also consider adding an overall timeout that fails analysis.
    */
-  private AnalysisContext.AnalysisResult analyzeStmt(TClientRequest request)
+  private AnalysisContext.AnalysisResult analyzeStmt(TQueryContext queryCtxt)
       throws AnalysisException, InternalException, AuthorizationException {
-    AnalysisContext analysisCtxt = new AnalysisContext(impaladCatalog_,
-        request.sessionState.database,
-        new User(request.sessionState.user));
-    LOG.debug("analyze query " + request.stmt);
+    AnalysisContext analysisCtxt = new AnalysisContext(impaladCatalog_, queryCtxt);
+    LOG.debug("analyze query " + queryCtxt.request.stmt);
 
     // Run analysis in a loop until it either:
     // 1) Completes successfully
     // 2) Fails with an AnalysisException AND there are no missing tables.
     while (true) {
       try {
-        analysisCtxt.analyze(request.stmt);
+        analysisCtxt.analyze(queryCtxt.request.stmt);
         Preconditions.checkState(analysisCtxt.getAnalyzer().getMissingTbls().isEmpty());
         return analysisCtxt.getAnalysisResult();
       } catch (AnalysisException e) {
@@ -560,14 +567,14 @@ public class Frontend {
    * Create a populated TExecRequest corresponding to the supplied TQueryContext.
    */
   public TExecRequest createExecRequest(
-      TClientRequest request, StringBuilder explainString)
+      TQueryContext queryCtxt, StringBuilder explainString)
       throws ImpalaException {
     // Analyze the statement
-    AnalysisContext.AnalysisResult analysisResult = analyzeStmt(request);
+    AnalysisContext.AnalysisResult analysisResult = analyzeStmt(queryCtxt);
     Preconditions.checkNotNull(analysisResult.getStmt());
 
     TExecRequest result = new TExecRequest();
-    result.setQuery_options(request.getQueryOptions());
+    result.setQuery_options(queryCtxt.request.getQuery_options());
     result.setAccess_events(analysisResult.getAccessEvents());
 
     if (analysisResult.isCatalogOp()) {
@@ -579,7 +586,7 @@ public class Frontend {
     } else if (analysisResult.isLoadDataStmt()) {
       result.stmt_type = TStmtType.LOAD;
       result.setResult_set_metadata(new TResultSetMetadata(Arrays.asList(
-          new TColumn("summary", TPrimitiveType.STRING))));
+          new TColumn("summary", ColumnType.STRING.toThrift()))));
       result.setLoad_data_request(analysisResult.getLoadDataStmt().toThrift());
       return result;
     }
@@ -593,7 +600,7 @@ public class Frontend {
     LOG.debug("create plan");
     Planner planner = new Planner();
     ArrayList<PlanFragment> fragments =
-        planner.createPlanFragments(analysisResult, request.queryOptions);
+        planner.createPlanFragments(analysisResult, queryCtxt.request.query_options);
     List<ScanNode> scanNodes = Lists.newArrayList();
     // map from fragment to its index in queryExecRequest.fragments; needed for
     // queryExecRequest.dest_fragment_idx
@@ -602,7 +609,7 @@ public class Frontend {
       TPlanFragment thriftFragment = fragment.toThrift();
       queryExecRequest.addToFragments(thriftFragment);
       Preconditions.checkNotNull(fragment.getPlanRoot());
-      fragment.getPlanRoot().collectSubclasses(ScanNode.class, scanNodes);
+      fragment.getPlanRoot().collect(Predicates.instanceOf(ScanNode.class), scanNodes);
       fragmentIdx.put(fragment, queryExecRequest.fragments.size() - 1);
     }
 
@@ -614,27 +621,38 @@ public class Frontend {
       queryExecRequest.addToDest_fragment_idx(idx.intValue());
     }
 
-    // set scan ranges/locations for scan nodes
+    // Set scan ranges/locations for scan nodes.
+    // Also assemble list of tables names missing stats for assembling a warning message.
     LOG.debug("get scan range locations");
+    Set<TTableName> tablesMissingStats = Sets.newTreeSet();
     for (ScanNode scanNode: scanNodes) {
       queryExecRequest.putToPer_node_scan_ranges(
           scanNode.getId().asInt(),
           scanNode.getScanRangeLocations(
-            request.queryOptions.getMax_scan_range_length()));
+              queryCtxt.request.query_options.getMax_scan_range_length()));
+      if (scanNode.isTableMissingStats()) {
+        tablesMissingStats.add(scanNode.getTupleDesc().getTableName().toThrift());
+      }
+    }
+    for (TTableName tableName: tablesMissingStats) {
+      queryCtxt.addToTables_missing_stats(tableName);
     }
 
     // Compute resource requirements after scan range locations because the cost
     // estimates of scan nodes rely on them.
-    planner.computeResourceReqs(fragments, true, request.queryOptions, queryExecRequest);
+    planner.computeResourceReqs(fragments, true, queryCtxt.request.query_options,
+        queryExecRequest);
 
     // Use VERBOSE by default for all non-explain statements.
     TExplainLevel explainLevel = TExplainLevel.VERBOSE;
-    if (request.queryOptions.isSetExplain_level()) {
-      explainLevel = request.queryOptions.getExplain_level();
+    if (queryCtxt.request.query_options.isSetExplain_level()) {
+      explainLevel = queryCtxt.request.query_options.getExplain_level();
     } else if (analysisResult.isExplainStmt()) {
-      // Use the NORMAL by default for explain statements.
-      explainLevel = TExplainLevel.NORMAL;
+      // Use the STANDARD by default for explain statements.
+      explainLevel = TExplainLevel.STANDARD;
     }
+    // Global query parameters to be set in each TPlanExecRequest.
+    queryExecRequest.setQuery_ctxt(queryCtxt);
 
     explainString.append(planner.getExplainString(fragments, queryExecRequest,
         explainLevel));
@@ -648,9 +666,6 @@ public class Frontend {
     }
 
     result.setQuery_exec_request(queryExecRequest);
-
-    // Global query parameters to be set in each TPlanExecRequest.
-    queryExecRequest.query_globals = analysisResult.getAnalyzer().getQueryGlobals();
 
     if (analysisResult.isQueryStmt()) {
       // fill in the metadata
@@ -684,7 +699,7 @@ public class Frontend {
         finalizeParams.setIs_overwrite(insertStmt.isOverwrite());
         finalizeParams.setTable_name(insertStmt.getTargetTableName().getTbl());
         String db = insertStmt.getTargetTableName().getDb();
-        finalizeParams.setTable_db(db == null ? request.sessionState.database : db);
+        finalizeParams.setTable_db(db == null ? queryCtxt.session.database : db);
         HdfsTable hdfsTable = (HdfsTable) insertStmt.getTargetTable();
         finalizeParams.setHdfs_base_dir(hdfsTable.getHdfsBaseDir());
         finalizeParams.setStaging_dir(
@@ -700,7 +715,7 @@ public class Frontend {
    */
   private void createExplainRequest(String explainString, TExecRequest result) {
     // update the metadata - one string column
-    TColumn colDesc = new TColumn("Explain String", TPrimitiveType.STRING);
+    TColumn colDesc = new TColumn("Explain String", ColumnType.STRING.toThrift());
     TResultSetMetadata metadata = new TResultSetMetadata(Lists.newArrayList(colDesc));
     result.setResult_set_metadata(metadata);
 
@@ -724,7 +739,8 @@ public class Frontend {
   public TResultSet execHiveServer2MetadataOp(TMetadataOpRequest request)
       throws ImpalaException {
     User user = request.isSetSession() ?
-        new User(request.session.getUser()) : ImpalaInternalAdminUser.getInstance();
+        new User(TSessionStateUtil.getEffectiveUser(request.session)) :
+        ImpalaInternalAdminUser.getInstance();
     switch (request.opcode) {
       case GET_TYPE_INFO: return MetadataOp.getTypeInfo();
       case GET_SCHEMAS:

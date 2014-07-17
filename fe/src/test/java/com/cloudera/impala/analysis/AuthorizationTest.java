@@ -34,9 +34,9 @@ import com.cloudera.impala.authorization.AuthorizationConfig;
 import com.cloudera.impala.authorization.User;
 import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Catalog;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.ImpaladCatalog;
-import com.cloudera.impala.catalog.PrimitiveType;
-import com.cloudera.impala.catalog.Udf;
+import com.cloudera.impala.catalog.ScalarFunction;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.InternalException;
@@ -46,6 +46,7 @@ import com.cloudera.impala.testutil.TestUtils;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpcode;
 import com.cloudera.impala.thrift.TNetworkAddress;
+import com.cloudera.impala.thrift.TQueryContext;
 import com.cloudera.impala.thrift.TResultSet;
 import com.cloudera.impala.thrift.TSessionState;
 import com.google.common.base.Preconditions;
@@ -72,9 +73,12 @@ public class AuthorizationTest {
       LocalGroupResourceAuthorizationProvider.class.getName());
   private final static ImpaladCatalog catalog_ =
       new ImpaladTestCatalog(authzConfig_);
+  private final static TQueryContext queryCtxt_ =
+        TestUtils.createQueryContext(Catalog.DEFAULT_DB, USER.getName());
   private final static AnalysisContext analysisContext_ =
-      new AnalysisContext(catalog_, Catalog.DEFAULT_DB, USER);
-  private final static Frontend fe_ = new Frontend(authzConfig_, catalog_);
+      new AnalysisContext(catalog_, queryCtxt_);
+  private final static Frontend fe_ =
+      new Frontend(authzConfig_, new ImpaladTestCatalog(authzConfig_));
 
   @Test
   public void TestSelect() throws AuthorizationException, AnalysisException {
@@ -280,6 +284,9 @@ public class AuthorizationTest {
     } catch (AnalysisException e) {
       Assert.assertEquals(e.getMessage(), "Database does not exist: newdb");
     }
+
+    // All users should be able to use the system db.
+    AuthzOk("use _impala_builtins");
   }
 
   @Test
@@ -293,8 +300,7 @@ public class AuthorizationTest {
     // The admin user should have privileges invalidate the server metadata.
     AnalysisContext adminAc = new AnalysisContext(
         new ImpaladTestCatalog(authzConfig_),
-        Catalog.DEFAULT_DB, ADMIN_USER);
-
+        TestUtils.createQueryContext(Catalog.DEFAULT_DB, ADMIN_USER.getName()));
     AuthzOk(adminAc, "invalidate metadata");
 
     AuthzError("invalidate metadata",
@@ -375,6 +381,9 @@ public class AuthorizationTest {
         "'hdfs://localhost:20500/test-warehouse/alltypes'",
         "User '%s' does not have privileges to access: " +
         "hdfs://localhost:20500/test-warehouse/alltypes");
+
+    AuthzError("create table _impala_builtins.tbl(i int)",
+        "Cannot modify system database.");
   }
 
   @Test
@@ -422,6 +431,10 @@ public class AuthorizationTest {
     AuthzError("create view nodb.alltypes as select * from functional.alltypesagg",
         "User '%s' does not have privileges to execute 'CREATE' on: " +
         "nodb.alltypes");
+
+    AuthzError("create view _impala_builtins.new_view as "
+        + "select * from functional.alltypesagg",
+        "Cannot modify system database.");
   }
 
   @Test
@@ -445,6 +458,10 @@ public class AuthorizationTest {
     // No existent db (no permissions).
     AuthzError("create database nodb",
         "User '%s' does not have privileges to execute 'CREATE' on: nodb");
+
+    // No existent db (no permissions).
+    AuthzError("create database if not exists _impala_builtins",
+        "Cannot modify system database.");
   }
 
   @Test
@@ -472,6 +489,9 @@ public class AuthorizationTest {
         "User '%s' does not have privileges to execute 'DROP' on: nodb");
     AuthzError("drop database if exists nodb",
         "User '%s' does not have privileges to execute 'DROP' on: nodb");
+
+    AuthzError("drop database _impala_builtins",
+        "Cannot modify system database.");
   }
 
   @Test
@@ -501,6 +521,10 @@ public class AuthorizationTest {
     // Using DROP TABLE on a view does not reveal privileged information.
     AuthzError("drop table functional.view_view",
         "User '%s' does not have privileges to execute 'DROP' on: functional.view_view");
+
+    // Using DROP TABLE on a view does not reveal privileged information.
+    AuthzError("drop table if exists _impala_builtins.tbl",
+        "Cannot modify system database.");
   }
 
   @Test
@@ -530,6 +554,10 @@ public class AuthorizationTest {
     // Using DROP VIEW on a table does not reveal privileged information.
     AuthzError("drop view functional.alltypes",
         "User '%s' does not have privileges to execute 'DROP' on: functional.alltypes");
+
+    // Using DROP VIEW on a table does not reveal privileged information.
+    AuthzError("drop view _impala_builtins.my_view",
+        "Cannot modify system database.");
   }
 
   @Test
@@ -775,6 +803,8 @@ public class AuthorizationTest {
   public void TestShowPermissions() throws AuthorizationException, AnalysisException {
     AuthzOk("show tables in functional");
     AuthzOk("show databases");
+    AuthzOk("show tables in _impala_builtins");
+    AuthzOk("show functions in _impala_builtins");
 
     // Database exists, user does not have access.
     AuthzError("show tables in functional_rc",
@@ -931,8 +961,8 @@ public class AuthorizationTest {
         new User(USER.getName() + "@REAL.COM"));
     for (User user: users) {
       ImpaladCatalog catalog = new ImpaladTestCatalog(authzConfig_);
-      AnalysisContext context = new AnalysisContext(catalog_, Catalog.DEFAULT_DB,
-          user);
+      AnalysisContext context = new AnalysisContext(catalog_,
+          TestUtils.createQueryContext(Catalog.DEFAULT_DB, user.getName()));
 
       // Can select from table that user has privileges on.
       AuthzOk(context, "select * from functional.alltypesagg");
@@ -957,10 +987,9 @@ public class AuthorizationTest {
     User currentUser = new User(System.getProperty("user.name"));
     AuthorizationConfig config = new AuthorizationConfig("server1", AUTHZ_POLICY_FILE,
         HadoopGroupResourceAuthorizationProvider.class.getName());
-
     ImpaladCatalog catalog = new ImpaladTestCatalog(config);
-    AnalysisContext context = new AnalysisContext(catalog, Catalog.DEFAULT_DB,
-        currentUser);
+    AnalysisContext context = new AnalysisContext(catalog,
+        TestUtils.createQueryContext(Catalog.DEFAULT_DB, currentUser.getName()));
 
     // Can select from table that user has privileges on.
     AuthzOk(context, "select * from functional.alltypesagg");
@@ -975,9 +1004,8 @@ public class AuthorizationTest {
   public void TestFunction() throws AnalysisException, AuthorizationException {
     // First try with the less privileged user.
     User currentUser = new User("test_user");
-    AnalysisContext context = new AnalysisContext(catalog_, Catalog.DEFAULT_DB,
-        currentUser);
-
+    AnalysisContext context = new AnalysisContext(catalog_,
+        TestUtils.createQueryContext(Catalog.DEFAULT_DB, currentUser.getName()));
     AuthzError(context, "show functions",
         "User '%s' does not have privileges to access: default", currentUser);
     AuthzOk(context, "show functions in tpch");
@@ -1001,8 +1029,8 @@ public class AuthorizationTest {
         "User '%s' does not have privileges to CREATE/DROP functions.", currentUser);
 
     // Admin should be able to do everything
-    AnalysisContext adminContext = new AnalysisContext(catalog_, Catalog.DEFAULT_DB,
-        ADMIN_USER);
+    AnalysisContext adminContext = new AnalysisContext(catalog_,
+        TestUtils.createQueryContext(Catalog.DEFAULT_DB, ADMIN_USER.getName()));
     AuthzOk(adminContext, "show functions");
     AuthzOk(adminContext, "show functions in tpch");
 
@@ -1012,14 +1040,21 @@ public class AuthorizationTest {
         "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'");
     AuthzOk(adminContext, "drop function if exists f()");
 
+    // Can't add function to system db
+    AuthzError(adminContext, "create function _impala_builtins.f() returns int location " +
+        "'/test-warehouse/libTestUdfs.so' symbol='NoArgs'",
+        "Cannot modify system database.", ADMIN_USER);
+    AuthzError(adminContext, "drop function if exists pi()",
+        "Cannot modify system database.", ADMIN_USER);
+
     // Add default.f(), tpch.f()
-    catalog_.addFunction(new Udf(new FunctionName("default", "f"),
-        new ArrayList<PrimitiveType>(), PrimitiveType.INT, null, null));
-    catalog_.addFunction(new Udf(new FunctionName("tpch", "f"),
-        new ArrayList<PrimitiveType>(), PrimitiveType.INT, null, null));
+    catalog_.addFunction(new ScalarFunction(new FunctionName("default", "f"),
+        new ArrayList<ColumnType>(), ColumnType.INT, null, null, null, null));
+    catalog_.addFunction(new ScalarFunction(new FunctionName("tpch", "f"),
+        new ArrayList<ColumnType>(), ColumnType.INT, null, null, null, null));
 
     AuthzError(context, "select default.f()",
-        "User '%s' does not have privileges to access: default.*",
+        "User '%s' does not have privileges to access: default",
         currentUser);
     // Couldn't create tpch.f() but can run it.
     AuthzOk(context, "select tpch.f()");
@@ -1141,8 +1176,7 @@ public class AuthorizationTest {
   private static void TestWithIncorrectConfig(AuthorizationConfig authzConfig, User user)
       throws AnalysisException {
     AnalysisContext ac = new AnalysisContext(new ImpaladTestCatalog(authzConfig),
-        Catalog.DEFAULT_DB, user);
-
+        TestUtils.createQueryContext(Catalog.DEFAULT_DB, user.getName()));
     AuthzError(ac, "select * from functional.alltypesagg",
         "User '%s' does not have privileges to execute 'SELECT' on: " +
         "functional.alltypesagg", user);
