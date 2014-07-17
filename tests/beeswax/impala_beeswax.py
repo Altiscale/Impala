@@ -36,8 +36,7 @@ class ImpalaBeeswaxException(Exception):
   __name__ = "ImpalaBeeswaxException"
   def __init__(self, message, inner_exception):
     self.__message = message
-    if inner_exception is not None:
-      self.inner_exception = inner_exception
+    self.inner_exception = inner_exception
 
   def __str__(self):
     return "%s:\n %s" % (self.__name__, self.__message)
@@ -58,6 +57,7 @@ class QueryResult(object):
     self.summary = summary
     self.schema = schema
     self.runtime_profile = runtime_profile
+    self.log = None
 
   def get_data(self):
     return self.__format_data()
@@ -135,8 +135,11 @@ class ImpalaBeeswaxClient(object):
 
   def __get_transport(self):
     """Creates the proper transport type based environment (secure vs unsecure)"""
-    return create_transport(use_kerberos=self.use_kerberos,
-        host=self.impalad[0], port=int(self.impalad[1]), service='impala')
+    trans_type = 'buffered'
+    if self.use_kerberos:
+      trans_type = 'kerberos'
+    return create_transport(host=self.impalad[0], port=int(self.impalad[1]),
+                            service='impala', transport_type=trans_type)
 
   def execute(self, query_string):
     """Re-directs the query to its appropriate handler, returns QueryResult"""
@@ -148,10 +151,11 @@ class ImpalaBeeswaxClient(object):
     result.time_taken = time.time() - start
     # Don't include the time it takes to get the runtime profile in the execution time
     result.runtime_profile = self.get_runtime_profile(handle)
+    result.log = self.get_log(handle.log_context)
     # Closing INSERT queries is done as part of fetching the results so don't close
     # the handle twice.
     if self.__get_query_type(query_string) != 'insert':
-      self.__do_rpc(lambda: self.imp_service.close(handle))
+      self.close_query(handle)
     return result
 
   def get_runtime_profile(self, handle):
@@ -178,6 +182,9 @@ class ImpalaBeeswaxClient(object):
 
   def cancel_query(self, query_id):
     return self.__do_rpc(lambda: self.imp_service.Cancel(query_id))
+
+  def close_query(self, handle):
+    self.__do_rpc(lambda: self.imp_service.close(handle))
 
   def wait_for_completion(self, query_handle):
     """Given a query handle, polls the coordinator waiting for the query to complete"""
@@ -209,7 +216,7 @@ class ImpalaBeeswaxClient(object):
     """Refresh a specific table from the catalog"""
     return self.execute("refresh %s.%s" % (db_name, table_name))
 
-  def fetch_results(self, query_string, query_handle):
+  def fetch_results(self, query_string, query_handle, max_rows = -1):
     """Fetches query results given a handle and query type (insert, use, other)"""
     query_type = self.__get_query_type(query_string)
     if query_type == 'use':
@@ -222,17 +229,18 @@ class ImpalaBeeswaxClient(object):
     if query_type == 'insert':
       exec_result = self.__fetch_insert_results(query_handle)
     else:
-      exec_result = self.__fetch_results(query_handle)
+      exec_result = self.__fetch_results(query_handle, max_rows)
     exec_result.query = query_string
     return exec_result
 
-  def __fetch_results(self, handle):
+  def __fetch_results(self, handle, max_rows = -1):
     """Handles query results, returns a QueryResult object"""
     schema = self.__do_rpc(lambda: self.imp_service.get_results_metadata(handle)).schema
     # The query has finished, we can fetch the results
     result_rows = []
-    while True:
-      results = self.__do_rpc(lambda: self.imp_service.fetch(handle, False, -1))
+    while len(result_rows) < max_rows or max_rows < 0:
+      fetch_rows = -1 if max_rows < 0 else max_rows - len(result_rows)
+      results = self.__do_rpc(lambda: self.imp_service.fetch(handle, False, fetch_rows))
       result_rows.extend(results.data)
       if not results.has_more:
         break
@@ -257,9 +265,12 @@ class ImpalaBeeswaxClient(object):
     # to deal with escaped quotes in string literals
     lexer = shlex.shlex(query_string.lstrip(), posix=True)
     lexer.escapedquotes += "'"
+    tokens = list(lexer)
+    # Do not classify explain queries as 'insert'
+    if (tokens[0].lower() == "explain"):
+      return tokens[0].lower()
     # Because the WITH clause may precede INSERT or SELECT queries,
     # just checking the first token is insufficient.
-    tokens = list(lexer)
     if filter(self.INSERT_REGEX.match, tokens):
       return "insert"
     return tokens[0].lower()

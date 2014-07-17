@@ -6,6 +6,7 @@ import logging
 import pytest
 from tests.common.test_vector import *
 from tests.common.impala_test_suite import ImpalaTestSuite
+from tests.util.test_file_parser import QueryTestSectionReader
 
 class TestQueries(ImpalaTestSuite):
   @classmethod
@@ -18,20 +19,21 @@ class TestQueries(ImpalaTestSuite):
                     "making result verication fail."))
     self.run_test_case('QueryTest/distinct', vector)
 
-  def test_aggregation(self, vector):
-    if vector.get_value('table_format').file_format == 'hbase':
-      pytest.xfail(reason="IMPALA-283 - select count(*) produces inconsistent results")
-    self.run_test_case('QueryTest/aggregation', vector)
-
   def test_exprs(self, vector):
     # TODO: Enable some of these tests for Avro if possible
     # Don't attempt to evaluate timestamp expressions with Avro tables (which)
     # don't support a timestamp type)"
-    if vector.get_value('table_format').file_format == 'avro':
+    table_format = vector.get_value('table_format')
+    if table_format.file_format == 'avro':
       pytest.skip()
-    if vector.get_value('table_format').file_format == 'hbase':
+    if table_format.file_format == 'hbase':
       pytest.xfail("A lot of queries check for NULLs, which hbase does not recognize")
     self.run_test_case('QueryTest/exprs', vector)
+
+    # This will change the current database to matching table format and then execute
+    # select current_database(). An error will be thrown if multiple values are returned.
+    current_db = self.execute_scalar('select current_database()', vector=vector)
+    assert current_db == QueryTestSectionReader.get_db_name(table_format)
 
   def test_hdfs_scan_node(self, vector):
     self.run_test_case('QueryTest/hdfs-scan-node', vector)
@@ -95,9 +97,14 @@ class TestQueries(ImpalaTestSuite):
     table_format = vector.get_value('table_format')
     if table_format.file_format in ['hbase', 'rc', 'parquet']:
       msg = ("Failing on rc/snap/block despite resolution of IMP-624,IMP-503. "
-             "Failing on parquet because nulltable does not exist in parquet")
+             "Failing on parquet because tables do not exist")
       pytest.xfail(msg)
     self.run_test_case('QueryTest/misc', vector)
+
+  def test_null_data(self, vector):
+    if vector.get_value('table_format').file_format == 'hbase':
+      pytest.xfail("null data does not appear to work in hbase")
+    self.run_test_case('QueryTest/null_data', vector)
 
   def test_overflow(self, vector):
     table_format = vector.get_value('table_format')

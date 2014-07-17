@@ -16,8 +16,8 @@
 # Starts up a mini-dfs test cluster and related services
 
 # If -format is passed, format the mini-dfs cluster.
-HDFS_FORMAT_CLUSTER=""
 
+HDFS_FORMAT_CLUSTER=""
 if [ "$1" == "-format" ]; then
   echo "Formatting cluster"
   HDFS_FORMAT_CLUSTER="-format"
@@ -27,12 +27,25 @@ elif [[ $1 ]]; then
   exit 1
 fi
 
+set -u
+
 # Kill and clean data for a clean start.
-$IMPALA_HOME/testdata/bin/kill-all.sh
+echo "Killing running services..."
+$IMPALA_HOME/testdata/bin/kill-all.sh &>${IMPALA_TEST_CLUSTER_LOG_DIR}/kill-all.log
 
-# Start up DFS, then Hbase
+set -e
+
+# Starts up a mini-cluster which includes:
+# - HDFS with 3 DNs
+# - One Yarn ResourceManager
+# - Multiple Yarn NodeManagers, exactly one per HDFS DN
 echo "Starting all cluster services..."
+echo " --> Starting mini-DFS cluster"
 $IMPALA_HOME/testdata/bin/run-mini-dfs.sh ${HDFS_FORMAT_CLUSTER}
-$IMPALA_HOME/testdata/bin/run-hbase.sh
 
-$IMPALA_HOME/testdata/bin/run-hive-server.sh
+echo " --> Starting HBase"
+$IMPALA_HOME/testdata/bin/run-hbase.sh &>${IMPALA_TEST_CLUSTER_LOG_DIR}/run-hbase.log
+
+echo " --> Starting Hive Server and Metastore Service"
+$IMPALA_HOME/testdata/bin/run-hive-server.sh\
+    &>${IMPALA_TEST_CLUSTER_LOG_DIR}/run-hive-server.log

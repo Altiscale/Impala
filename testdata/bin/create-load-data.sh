@@ -26,6 +26,9 @@ if [[ $1 ]]; then
 else
   echo "Loading hive builtins"
   ${IMPALA_HOME}/testdata/bin/load-hive-builtins.sh
+
+  echo "Generating HBase data"
+  ${IMPALA_HOME}/testdata/bin/create-hbase.sh
 fi
 set -u
 
@@ -37,8 +40,6 @@ pushd ${IMPALA_HOME}/bin
 ./start-impala-cluster.py -s 3 --wait_for_cluster --log_dir=${IMPALAD_LOG_DIR}
 # Use unbuffered logging by executing these data loading steps with 'python -u'
 python -u ./load-data.py --workloads functional-query --exploration_strategy exhaustive
-echo "Loading data into hbasealltypeserror and hbasealltypeserrononulls"
-${IMPALA_HOME}/testdata/bin/create-hbase.sh
 python -u ./load-data.py --workloads tpcds --exploration_strategy core
 python -u ./load-data.py --workloads tpch --exploration_strategy core
 # Load all the auxiliary workloads (if any exist)
@@ -50,9 +51,9 @@ else
 fi
 popd
 
-# Create a table w/ 1234 partitions that is empty. Used to validate fetching partitions
-# in batches.
-${IMPALA_HOME}/testdata/bin/create-table-many-blocks.sh -p 1234 -b 0
+# Create a table w/ 1234 partitions. Used to validate fetching/updating partitions in
+# batches.
+${IMPALA_HOME}/testdata/bin/create-table-many-blocks.sh -p 1234 -b 1
 
 # Split HBase table
 echo "Splitting HBase table"
@@ -125,6 +126,10 @@ hadoop fs -put -f ${IMPALA_HOME}/testdata/data/bad_parquet_data.parquet \
 
 # Data file produced by parquet-mr with repeated values (produces 0 bit width dictionary)
 hadoop fs -put -f ${IMPALA_HOME}/testdata/data/repeated_values.parquet \
+                  /test-warehouse/bad_parquet_parquet
+
+# IMPALA-720: data file produced by parquet-mr with multiple row groups
+hadoop fs -put -f ${IMPALA_HOME}/testdata/data/multiple_rowgroups.parquet \
                   /test-warehouse/bad_parquet_parquet
 
 # Remove an index file so we test an un-indexed LZO file

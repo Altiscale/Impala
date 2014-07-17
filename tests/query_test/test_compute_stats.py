@@ -14,6 +14,7 @@
 # limitations under the License.
 from tests.common.test_vector import *
 from tests.common.impala_test_suite import *
+from tests.common.test_dimensions import create_uncompressed_text_dimension
 
 # Tests the COMPUTE STATS command for gathering table and column stats.
 # TODO: Merge this test file with test_col_stats.py
@@ -30,9 +31,7 @@ class TestComputeStats(ImpalaTestSuite):
     cls.TestMatrix.add_dimension(create_single_exec_option_dimension())
     # Do not run these tests using all dimensions because the expected results
     # are different for different file formats.
-    cls.TestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format == 'text' and\
-        v.get_value('table_format').compression_codec == 'none')
+    cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
 
   def setup_method(self, method):
     # cleanup and create a fresh test database
@@ -43,7 +42,8 @@ class TestComputeStats(ImpalaTestSuite):
     self.cleanup_db(self.TEST_DB_NAME)
 
   def test_compute_stats(self, vector):
-    try:
-      self.run_test_case('QueryTest/compute-stats', vector)
-    except AssertionError:
-      pytest.xfail('IMPALA-688: HBase show stats/compute stats')
+    self.run_test_case('QueryTest/compute-stats', vector)
+    # To cut down on test execution time, only run the compute stats test against many
+    # partitions if performing an exhaustive test run.
+    if self.exploration_strategy() != 'exhaustive': return
+    self.run_test_case('QueryTest/compute-stats-many-partitions', vector)

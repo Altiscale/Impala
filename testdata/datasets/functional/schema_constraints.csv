@@ -43,15 +43,15 @@ table_name:alltypeserror, constraint:exclude, table_format:parquet/none/none
 table_name:alltypeserrornonulls, constraint:exclude, table_format:parquet/none/none
 table_name:unsupported_types, constraint:exclude, table_format:parquet/none/none
 table_name:escapechartesttable, constraint:exclude, table_format:parquet/none/none
-table_name:nulltable, constraint:exclude, table_format:parquet/none/none
-table_name:nullescapedtable, constraint:exclude, table_format:parquet/none/none
 table_name:TblWithRaggedColumns, constraint:exclude, table_format:parquet/none/none
 
 # the text_ tables are for testing test delimiters and escape chars in text files
 table_name:text_comma_backslash_newline, constraint:restrict_to, table_format:text/none/none
 table_name:text_dollar_hash_pipe, constraint:restrict_to, table_format:text/none/none
+table_name:text_thorn_ecirc_newline, constraint:restrict_to, table_format:text/none/none
 
 table_name:bad_serde, constraint:restrict_to, table_format:text/none/none
+table_name:rcfile_lazy_binary_serde, constraint:restrict_to, table_format:rc/none/none
 table_name:unsupported_partition_types, constraint:restrict_to, table_format:text/none/none
 table_name:nullformat_custom, constraint:exclude, table_format:parquet/none/none
 
@@ -88,3 +88,8 @@ table_name:widerow, constraint:exclude, table_format:hbase/none/none
 # with no corresponding LOAD statement.
 table_name:nullformat_custom, constraint:exclude, table_format:hbase/none/none
 table_name:unsupported_types, constraint:exclude, table_format:hbase/none/none
+
+# hbase doesn't seem to like very wide tables
+table_name:widetable_250_cols, constraint:exclude, table_format:hbase/none/none
+table_name:widetable_500_cols, constraint:exclude, table_format:hbase/none/none
+table_name:widetable_1000_cols, constraint:exclude, table_format:hbase/none/none

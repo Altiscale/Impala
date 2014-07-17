@@ -22,11 +22,7 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
         disable_codegen_options=[False],
         batch_sizes=[0],
         sync_ddl=[0, 1]))
-
-    # There is no reason to run these tests using all table format dimensions.
-    cls.TestMatrix.add_constraint(lambda v:\
-        v.get_value('table_format').file_format == 'text' and\
-        v.get_value('table_format').compression_codec == 'none')
+    cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
 
   def setup_method(self, method):
     self.cleanup_db('hive_test_db')
@@ -38,25 +34,19 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
     self.run_test_case('QueryTest/show', vector)
 
   def test_show_stats(self, vector):
-    try:
-      self.run_test_case('QueryTest/show-stats', vector)
-    except AssertionError:
-      pytest.xfail('IMPALA-688: HBase show stats/compute stats')
+    self.run_test_case('QueryTest/show-stats', vector)
 
   def test_describe_table(self, vector):
     self.run_test_case('QueryTest/describe', vector)
 
   def test_describe_formatted(self, vector):
     # Describe a partitioned table.
-    try:
-      self.exec_and_compare_hive_and_impala_hs2("describe formatted functional.alltypes")
-      self.exec_and_compare_hive_and_impala_hs2(
-          "describe formatted functional_text_lzo.alltypes")
-      # Describe an unpartitioned table.
-      self.exec_and_compare_hive_and_impala_hs2("describe formatted tpch.lineitem")
-      self.exec_and_compare_hive_and_impala_hs2("describe formatted functional.jointbl")
-    except Exception:
-      pytest.xfail(reason="IMPALA-1085, hiveserver2 does not start on occasion")
+    self.exec_and_compare_hive_and_impala_hs2("describe formatted functional.alltypes")
+    self.exec_and_compare_hive_and_impala_hs2(
+        "describe formatted functional_text_lzo.alltypes")
+    # Describe an unpartitioned table.
+    self.exec_and_compare_hive_and_impala_hs2("describe formatted tpch.lineitem")
+    self.exec_and_compare_hive_and_impala_hs2("describe formatted functional.jointbl")
 
     try:
       # Describe a view

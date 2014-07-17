@@ -26,19 +26,27 @@ class TestMiniStress(ImpalaTestSuite):
   def add_test_dimensions(cls):
     super(TestMiniStress, cls).add_test_dimensions()
     cls.TestMatrix.add_dimension(TestDimension('test_id', *TEST_IDS))
-    cls.TestMatrix.add_constraint(lambda v: v.get_value('exec_option')['batch_size'] == 0)
+    if cls.exploration_strategy() != 'exhaustive':
+      cls.TestMatrix.add_constraint(lambda v:\
+          v.get_value('exec_option')['batch_size'] == 0)
+    else:
+      cls.TestMatrix.add_constraint(lambda v:\
+          v.get_value('exec_option')['batch_size'] != 1)
+
 
   @pytest.mark.stress
   def test_mini_stress(self, vector):
     for i in xrange(NUM_ITERATIONS):
       self.run_test_case('stress', vector)
 
+  @pytest.mark.skipif(True,
+      reason="Skip until the race in the catalog server is resolved")
   @pytest.mark.stress
   def test_run_invalidate_refresh(self, vector):
     """Verifies that running concurrent invalidate table/catalog and refresh commands
     don't cause failures with other running workloads and ensures catalog versions
     are strictly increasing."""
-    target_db = QueryTestSectionReader.get_db_name(vector.get_value('table_format'))
+    target_db = self.execute_scalar('select current_database()', vector=vector)
     impala_cluster = ImpalaCluster()
     impalad = impala_cluster.impalads[0].service
     catalogd = impala_cluster.catalogd.service
@@ -63,7 +71,7 @@ class TestMiniStress(ImpalaTestSuite):
 
   def get_table_version(self, impala_service, db_name, tbl_name):
     """Gets the given table's catalog version using the given impalad/catalogd service"""
-    obj_dump = impala_service.get_catalog_object_dump('TABLE', db_name + '.' + tbl_name)
+    obj_dump = impala_service.get_catalog_object_dump('table', db_name + '.' + tbl_name)
     result = re.search(r'catalog_version \(i64\) = (\d+)', obj_dump)
     assert result, 'Unable to find catalog version in object dump: ' + obj_dump
     catalog_version = result.group(1)

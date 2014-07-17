@@ -10,6 +10,8 @@
 import logging
 import pytest
 from copy import deepcopy
+
+from testdata.common import widetable
 from tests.common.test_vector import *
 from tests.common.impala_test_suite import *
 from tests.util.test_file_parser import *
@@ -36,6 +38,30 @@ class TestScannersAllTableFormats(ImpalaTestSuite):
     new_vector.get_value('exec_option')['batch_size'] = vector.get_value('batch_size')
     self.run_test_case('QueryTest/scanners', new_vector)
 
+# Test all the scanners with a simple limit clause. The limit clause triggers
+# cancellation in the scanner code paths.
+class TestScannersAllTableFormatsWithLimit(ImpalaTestSuite):
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestScannersAllTableFormatsWithLimit, cls).add_test_dimensions()
+    # Exhaustively generate all table format vectors. This can still be overridden
+    # using the --table_formats flag.
+    cls.TestMatrix.add_dimension(cls.create_table_info_dimension('exhaustive'))
+
+  def test_limit(self, vector):
+    # Use a small batch size so changing the limit affects the timing of cancellation
+    vector.get_value('exec_option')['batch_size'] = 100
+    iterations = 50
+    query_template = "select * from alltypes limit %s"
+    for i in range(1, iterations):
+      # Vary the limit to vary the timing of cancellation
+      query = query_template % ((iterations * 100) % 1000 + 1)
+      self.execute_query(query, vector.get_value('exec_option'),
+          table_format=vector.get_value('table_format'))
 
 # Test case to verify the scanners work properly when the table metadata (specifically the
 # number of columns in the table) does not match the number of columns in the data file.
@@ -120,6 +146,39 @@ class TestWideRow(ImpalaTestSuite):
     # TODO: figure out exact breakdown of memory usage (IMPALA-681)
     new_vector.get_value('exec_option')['mem_limit'] = 80 * 1024 * 1024
     self.run_test_case('QueryTest/wide-row', new_vector)
+
+class TestWideTable(ImpalaTestSuite):
+  # TODO: expand this to more rows when we have the capability
+  NUM_COLS = [250, 500, 1000]
+
+  @classmethod
+  def get_workload(cls):
+    return 'functional-query'
+
+  @classmethod
+  def add_test_dimensions(cls):
+    super(TestWideTable, cls).add_test_dimensions()
+    cls.TestMatrix.add_constraint(
+      lambda v: v.get_value('table_format').file_format != 'hbase')
+
+    cls.TestMatrix.add_dimension(TestDimension("num_cols", *cls.NUM_COLS))
+
+  def test_wide_table(self, vector):
+    NUM_COLS = vector.get_value('num_cols')
+    NUM_ROWS = 10
+    DB_NAME = QueryTestSectionReader.get_db_name(vector.get_value('table_format'))
+    TABLE_NAME = "%s.widetable_%s_cols" % (DB_NAME, NUM_COLS)
+
+    result = self.client.execute("select count(*) from %s " % TABLE_NAME)
+    assert result.data == [str(NUM_ROWS)]
+
+    expected_result = widetable.get_data(NUM_COLS, NUM_ROWS, quote_strings=True)
+    result = self.client.execute("select * from %s" % TABLE_NAME)
+
+    types = parse_column_types(result.schema)
+    expected = QueryTestResult(expected_result, types, order_matters=False)
+    actual = QueryTestResult(parse_result_rows(result), types, order_matters=False)
+    assert expected == actual
 
 class TestParquet(ImpalaTestSuite):
   @classmethod
