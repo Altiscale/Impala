@@ -26,9 +26,9 @@ echo "Removing everything in ${IMPALA_HOME}/thirdparty"
 echo "Fetching gtest"
 wget http://googletest.googlecode.com/files/gtest-${IMPALA_GTEST_VERSION}.zip
 unzip -o gtest-${IMPALA_GTEST_VERSION}.zip
-rm gtest-${IMPALA_GTEST_VERSION}.zip
+rm -f gtest-${IMPALA_GTEST_VERSION}.zip
 
 echo "Fetching snappy"
 wget http://snappy.googlecode.com/files/snappy-${IMPALA_SNAPPY_VERSION}.tar.gz
 tar xpzf snappy-${IMPALA_SNAPPY_VERSION}.tar.gz
-rm snappy-${IMPALA_SNAPPY_VERSION}.tar.gz
+rm -f snappy-${IMPALA_SNAPPY_VERSION}.tar.gz
