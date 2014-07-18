@@ -233,5 +233,5 @@ fi
 # Build cdh4-extras
 if [ $BUILD_ALL -eq 1 ] || [ $BUILD_CDH4EXTRAS -eq 1 ]; then
   build_preamble $IMPALA_HOME/thirdparty/cdh4-extras cdh4-extras
-  mvn package -DskipTests
+  mvn -X package -DskipTests
 fi

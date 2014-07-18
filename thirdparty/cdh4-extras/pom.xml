@@ -34,7 +34,7 @@
   <url>.</url>
 
   <properties>
-    <hadoop.version>${env.IMPALA_HADOOP_VERSION}</hadoop.version>
+    <hadoop.version>${env.IMPALA_HADOOP_OLD_VERSION}</hadoop.version>
   </properties>
 
   <repositories>
