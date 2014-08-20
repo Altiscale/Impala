@@ -34,7 +34,7 @@ if [ "x${HADOOP_VERSION}" = "x" ] ; then
   echo "ok - applying HADOOP_VERSION=$HADOOP_VERSION"
 fi
 if [ "x${HIVE_VERSION}" = "x" ] ; then
-  export HIVE_VERSION=0.13.1
+  export HIVE_VERSION=0.12.0
   echo "ok - applying HIVE_VERSION=$HIVE_VERSION"
 fi
 
