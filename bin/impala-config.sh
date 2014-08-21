@@ -28,7 +28,7 @@ if [ ! -d $JAVA_HOME ] ; then
 fi
 echo "ok - exist JAVA_HOME=$JAVA_HOME"
 
-# Default hadoop and hive version is 2.2.0 and 0.12.0
+# Default hadoop and hive version is 2.4.1 and 0.12.0
 if [ "x${HADOOP_VERSION}" = "x" ] ; then
   export HADOOP_VERSION=2.4.1
   echo "ok - applying HADOOP_VERSION=$HADOOP_VERSION"
