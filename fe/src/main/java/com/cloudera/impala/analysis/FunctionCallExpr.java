@@ -60,6 +60,8 @@ public class FunctionCallExpr extends Expr {
     params_ = params;
     // Just inherit the function object from 'e'.
     fn_ = e.fn_;
+    type_ = e.type_;
+    Preconditions.checkState(!type_.isWildcardDecimal());
     if (params.exprs() != null) children_.addAll(params.exprs());
   }
 
@@ -163,6 +165,96 @@ public class FunctionCallExpr extends Expr {
         fnName_, params_.isStar() ? "*" : Joiner.on(", ").join(argTypes));
   }
 
+  /**
+   * Builtins that return decimals are specified as the wildcard decimal(decimal(*,*))
+   * and the specific decimal can only be determined based on the inputs. We currently
+   * don't have a mechanism to specify this with the UDF interface. Until we add
+   * that (i.e. allowing UDFs to participate in the planning phase), we will
+   * manually resolve the wildcard types for the few functions that need it.
+   * This can only be called for functions that return wildcard decimals and the first
+   * argument is a wildcard decimal.
+   * TODO: this prevents UDFs from using wildcard decimals and is in general not scalable.
+   * We should add a prepare_fn() to UDFs for doing this.
+   */
+  private ColumnType resolveDecimalReturnType(Analyzer analyzer)
+      throws AnalysisException, AuthorizationException {
+    Preconditions.checkState(type_.isWildcardDecimal());
+    Preconditions.checkState(fn_.getBinaryType() == TFunctionBinaryType.BUILTIN);
+    Preconditions.checkState(children_.size() > 0);
+
+    // Find first decimal input (some functions, such as if(), begin with non-decimal
+    // arguments).
+    ColumnType childType = null;
+    for (Expr child : children_) {
+      if (child.type_.isDecimal()) {
+        childType = child.type_;
+        break;
+      }
+    }
+    Preconditions.checkState(childType != null && !childType.isWildcardDecimal());
+    ColumnType returnType = childType;
+
+    if (fnName_.getFunction().equalsIgnoreCase("sum")) {
+      return childType.getMaxResolutionType();
+    }
+
+    int digitsBefore = childType.decimalPrecision() - childType.decimalScale();
+    int digitsAfter = childType.decimalScale();
+    if (fnName_.getFunction().equalsIgnoreCase("ceil") ||
+               fnName_.getFunction().equalsIgnoreCase("ceiling") ||
+               fnName_.getFunction().equals("floor")) {
+      // These functions just return with scale 0 but can trigger rounding. We need
+      // to increase the precision by 1 to handle that.
+      ++digitsBefore;
+      digitsAfter = 0;
+    } else if (fnName_.getFunction().equalsIgnoreCase("truncate") ||
+               fnName_.getFunction().equalsIgnoreCase("round")) {
+      if (children_.size() > 1) {
+        // The second argument to these functions is the desired scale, otherwise
+        // the default is 0.
+        Preconditions.checkState(children_.size() == 2);
+        if (children_.get(1).isNullLiteral()) {
+          throw new AnalysisException(fnName_.getFunction() +
+              "() cannot be called with a NULL second argument.");
+        }
+
+        if (!children_.get(1).isConstant()) {
+          // We don't allow calling truncate or round with a non-constant second
+          // (desired scale) argument. e.g. select round(col1, col2). This would
+          // mean we don't know the scale of the resulting type and would need some
+          // kind of dynamic type handling which is not yet possible. This seems like
+          // a reasonable restriction.
+          throw new AnalysisException(fnName_.getFunction() +
+              "() must be called with a constant second argument.");
+        }
+        IntLiteral scaleLiteral = (IntLiteral)LiteralExpr.create(
+            children_.get(1), analyzer.getQueryCtx());
+        digitsAfter = (int)scaleLiteral.getValue();
+        if (Math.abs(digitsAfter) > ColumnType.MAX_SCALE) {
+          throw new AnalysisException("Cannot round/truncate to scales greater than " +
+              ColumnType.MAX_SCALE + ".");
+        }
+        children_.set(1, scaleLiteral.uncheckedCastTo(ColumnType.INT));
+        // Round/Truncate to a negative scale means to round to the digit before
+        // the decimal e.g. round(1234.56, -2) would be 1200.
+        // The resulting scale is always 0.
+        digitsAfter = Math.max(digitsAfter, 0);
+      } else {
+        // Round()/Truncate() with no second argument.
+        digitsAfter = 0;
+      }
+
+      if (fnName_.getFunction().equalsIgnoreCase("round") &&
+          digitsAfter < childType.decimalScale()) {
+        // If we are rounding to fewer decimal places, it's possible we need another
+        // digit before the decimal.
+        ++digitsBefore;
+      }
+    }
+    Preconditions.checkState(returnType.isDecimal() && !returnType.isWildcardDecimal());
+    return ColumnType.createDecimalTypeInternal(digitsBefore + digitsAfter, digitsAfter);
+  }
+
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException,
       AuthorizationException {
@@ -177,10 +269,10 @@ public class FunctionCallExpr extends Expr {
       // TODO: rethink how we generate the merge aggregation.
       AggregateFunction aggFn = (AggregateFunction)fn_;
       ColumnType intermediateType = aggFn.getIntermediateType();
-      type_ = fn_.getReturnType();
       if (intermediateType == null) intermediateType = type_;
       // TODO: this needs to change when the intermediate type != the return type
       Preconditions.checkArgument(intermediateType.equals(fn_.getReturnType()));
+      Preconditions.checkState(!type_.isWildcardDecimal());
       return;
     }
 
@@ -262,12 +354,7 @@ public class FunctionCallExpr extends Expr {
     castForFunctionCall();
     type_ = fn_.getReturnType();
     if (type_.isDecimal() && type_.isWildcardDecimal()) {
-      // TODO: we specify decimal(*,*) for some builtins. It would be nice to expose
-      // this mechanism (where the function can at planning type resolve types).
-      Preconditions.checkState(fn_.getBinaryType() == TFunctionBinaryType.BUILTIN);
-      Preconditions.checkState(children_.size() > 0);
-      type_ = children_.get(0).type_;
-      Preconditions.checkState(type_.isDecimal() && !type_.isWildcardDecimal());
+      type_ = resolveDecimalReturnType(analyzer);
     }
   }
 }

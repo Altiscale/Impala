@@ -58,11 +58,10 @@ class ResourceResolver {
   boost::unordered_map<TNetworkAddress, TNetworkAddress> impalad_to_dn_;
   boost::unordered_map<TNetworkAddress, TNetworkAddress> dn_to_impalad_;
 
-  // True if running against a MiniLlama, which has different rules for host resolution.
-  bool is_mini_llama_;
-
-  // Called only if is_mini_llama_ is set to populate impalad_to_dn_ and dn_to_impalad_
-  void CreateMiniLlamaMapping(const boost::unordered_set<TNetworkAddress>& unique_hosts);
+  // Called only in pseudo-distributed setups (i.e. testing only) to populate
+  // impalad_to_dn_ and dn_to_impalad_
+  void CreateLocalLlamaNodeMapping(
+      const boost::unordered_set<TNetworkAddress>& unique_hosts);
 };
 
 // Tracks all the state necessary to create expansion requests for all fragments of a
@@ -118,9 +117,13 @@ class QueryResourceMgr {
   void NotifyThreadUsageChange(int delta);
 
   // All callbacks registered here are called in round-robin fashion when more VCores are
-  // acquired.
+  // acquired. Returns a unique ID that can be used as an argument to
+  // RemoveVcoreAvailableCb().
   typedef boost::function<void ()> VcoreAvailableCb;
-  void AddVcoreAvailableCb(const VcoreAvailableCb& callback);
+  int32_t AddVcoreAvailableCb(const VcoreAvailableCb& callback);
+
+  // Removes the callback with the given ID.
+  void RemoveVcoreAvailableCb(int32_t callback_id);
 
   // Creates an expansion request for the reservation corresponding to this resource
   // context.
@@ -143,8 +146,8 @@ class QueryResourceMgr {
   TUniqueId query_id_;
 
   // Network address of the local service registered with Llama. Usually corresponds to
-  // <local-address>:0, unless a MiniLlama is being used (see
-  // ResourceResolver::CreateMiniLlamaMapping()).
+  // <local-address>:0, unless a pseudo-dstributed Llama is being used (see
+  // ResourceResolver::CreateLocalLlamaNodeMapping()).
   TNetworkAddress local_resource_location_;
 
   // Used to control shutdown of AcquireCpuResources().
@@ -155,10 +158,15 @@ class QueryResourceMgr {
   boost::mutex callbacks_lock_;
 
   // List of callbacks to notify when a new VCore resource is available.
-  std::vector<VcoreAvailableCb> callbacks_;
+  typedef boost::unordered_map<int32_t, VcoreAvailableCb> CallbackMap;
+  CallbackMap callbacks_;
 
   // Round-robin iterator to notify callbacks about new VCores one at a time.
-  std::vector<VcoreAvailableCb>::iterator callbacks_it_;
+  CallbackMap::iterator callbacks_it_;
+
+  // Total number of callbacks that were ever registered. Used to give each callback a
+  // unique ID so that they can be removed.
+  int32_t callback_count_;
 
   // Protects threads_running_, threads_changed_cv_ and vcores_.
   boost::mutex threads_running_lock_;

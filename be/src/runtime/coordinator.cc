@@ -53,6 +53,7 @@
 #include "util/container-util.h"
 #include "util/network-util.h"
 #include "util/llama-util.h"
+#include "util/table-printer.h"
 #include "gen-cpp/ImpalaInternalService.h"
 #include "gen-cpp/ImpalaInternalService_types.h"
 #include "gen-cpp/Frontend_types.h"
@@ -228,11 +229,13 @@ Coordinator::Coordinator(ExecEnv* exec_env)
     has_called_wait_(false),
     returned_all_results_(false),
     executor_(NULL), // Set in Prepare()
+    query_mem_tracker_(), // Set in Exec()
     num_remaining_backends_(0),
     obj_pool_(new ObjectPool()) {
 }
 
 Coordinator::~Coordinator() {
+  query_mem_tracker_.reset();
 }
 
 TExecNodePhase::type GetExecNodePhase(const string& key) {
@@ -293,19 +296,19 @@ Status Coordinator::Exec(QuerySchedule& schedule, vector<Expr*>* output_exprs) {
     finalize_params_ = request.finalize_params;
   }
 
+  VLOG_QUERY << "Exec() query_id=" << schedule.query_id();
   stmt_type_ = request.stmt_type;
-
   query_id_ = schedule.query_id();
-  VLOG_QUERY << "Exec() query_id=" << query_id_;
   desc_tbl_ = request.desc_tbl;
-  query_ctxt_ = request.query_ctxt;
+  query_ctx_ = request.query_ctx;
 
   query_profile_.reset(
       new RuntimeProfile(obj_pool(), "Execution Profile " + PrintId(query_id_)));
+  finalization_timer_ = ADD_TIMER(query_profile_, "FinalizationTimer");
+
   SCOPED_TIMER(query_profile_->total_time_counter());
 
   vector<FragmentExecParams>* fragment_exec_params = schedule.exec_params();
-
   TNetworkAddress coord = MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port);
 
   // to keep things simple, make async Cancel() calls wait until plan fragment
@@ -336,55 +339,27 @@ Status Coordinator::Exec(QuerySchedule& schedule, vector<Expr*>* output_exprs) {
     RETURN_IF_ERROR(Expr::CreateExprTrees(
         runtime_state()->obj_pool(), request.fragments[0].output_exprs, output_exprs));
     RETURN_IF_ERROR(Expr::Prepare(*output_exprs, runtime_state(), row_desc()));
-    // Run optimization only after preparing the executor and the output exprs.
-    executor_->OptimizeLlvmModule();
   } else {
+    // The coordinator instance may require a query mem tracker even if there is no
+    // coordinator fragment. For example, result-caching tracks memory via the query mem
+    // tracker.
+    // If there is a fragment, the fragment executor created above initializes the query
+    // mem tracker. If not, the query mem tracker is created here.
+    int64_t query_limit = -1;
+    if (query_ctx_.request.query_options.__isset.mem_limit &&
+        query_ctx_.request.query_options.mem_limit > 0) {
+      query_limit = query_ctx_.request.query_options.mem_limit;
+    }
+    MemTracker* pool_tracker = MemTracker::GetRequestPoolMemTracker(
+        schedule.request_pool(), exec_env_->process_mem_tracker());
+    query_mem_tracker_ =
+        MemTracker::GetQueryMemTracker(query_id_, query_limit, pool_tracker, NULL);
+
     executor_.reset(NULL);
   }
 
-  // register coordinator's fragment profile now, before those of the backends,
-  // so it shows up at the top
-  finalization_timer_ = ADD_TIMER(query_profile_, "FinalizationTimer");
-
-  if (executor_.get() != NULL) {
-    query_profile_->AddChild(executor_->profile());
-    executor_->profile()->set_name("Coordinator Fragment");
-    CollectScanNodeCounters(executor_->profile(), &coordinator_counters_);
-  }
-
-  // Initialize per fragment profile data
-  fragment_profiles_.resize(request.fragments.size());
-  for (int i = 0; i < request.fragments.size(); ++i) {
-    fragment_profiles_[i].num_instances = 0;
-
-    // Special case fragment idx 0 if there is a coordinator. There is only one
-    // instance of this profile so the average is just the coordinator profile.
-    if (i == 0 && has_coordinator_fragment) {
-      fragment_profiles_[i].averaged_profile = executor_->profile();
-      continue;
-    }
-    stringstream ss;
-    ss << "Averaged Fragment " << i;
-    fragment_profiles_[i].averaged_profile =
-        obj_pool()->Add(new RuntimeProfile(obj_pool(), ss.str(), true));
-    // Insert the avg profiles in ascending fragment number order. If
-    // there is a coordinator fragment, it's been placed in
-    // fragment_profiles_[0].averaged_profile, ensuring that this code
-    // will put the first averaged profile immediately after it. If
-    // there is no coordinator fragment, the first averaged profile
-    // will be inserted as the first child of query_profile_, and then
-    // all other averaged fragments will follow.
-    query_profile_->AddChild(fragment_profiles_[i].averaged_profile, true,
-        (i > 0) ? fragment_profiles_[i-1].averaged_profile : NULL);
-
-    ss.str("");
-    ss << "Fragment " << i;
-    fragment_profiles_[i].root_profile =
-        obj_pool()->Add(new RuntimeProfile(obj_pool(), ss.str()));
-    // Note: we don't start the wall timer here for the fragment
-    // profile; it's uninteresting and misleading.
-    query_profile_->AddChild(fragment_profiles_[i].root_profile);
-  }
+  // Initialize the execution profile structures.
+  InitExecProfile(request);
 
   DebugOptions debug_options;
   ProcessQueryOptions(schedule.query_options(), &debug_options);
@@ -452,7 +427,6 @@ Status Coordinator::Exec(QuerySchedule& schedule, vector<Expr*>* output_exprs) {
   stringstream ss;
   ss << "Query " << query_id_;
   progress_ = ProgressUpdater(ss.str(), schedule.num_scan_ranges());
-  progress_.set_logging_level(1);
 
   return Status::OK;
 }
@@ -489,7 +463,7 @@ Status Coordinator::UpdateStatus(const Status& status, const TUniqueId* instance
   return query_status_;
 }
 
-void Coordinator::BuildPermissionCache(hdfsFS fs, const string& path_str,
+void Coordinator::PopulatePathPermissionCache(hdfsFS fs, const string& path_str,
     PermissionCache* permissions_cache) {
   // Find out if the path begins with a hdfs:// -style prefix, and remove it and the
   // location (e.g. host:port) if so.
@@ -518,9 +492,8 @@ void Coordinator::BuildPermissionCache(hdfsFS fs, const string& path_str,
   }
 
   // Now for each prefix, stat() it to see if a) it exists and b) if so what its
-  // permissions are. Every directory in prefix will be created if it isn't already, so
-  // when we meet a directory that doesn't exist, we record the fact that we need to
-  // create it, and the permissions of its parent dir to inherit.
+  // permissions are. When we meet a directory that doesn't exist, we record the fact that
+  // we need to create it, and the permissions of its parent dir to inherit.
   //
   // Every prefix is recorded in the PermissionCache so we don't do more than one stat()
   // for each path. If we need to create the directory, we record it as the pair (true,
@@ -559,18 +532,38 @@ Status Coordinator::FinalizeSuccessfulInsert() {
   // 1. If OVERWRITE, remove all the files in the target directory
   // 2. Create all the necessary partition directories.
   HdfsOperationSet partition_create_ops(&hdfs_connection);
-  BOOST_FOREACH(const PartitionRowCount::value_type& partition,
-      partition_row_counts_) {
+  DescriptorTbl* descriptor_table;
+  DescriptorTbl::Create(obj_pool(), desc_tbl_, &descriptor_table);
+  HdfsTableDescriptor* hdfs_table = static_cast<HdfsTableDescriptor*>(
+      descriptor_table->GetTableDescriptor(finalize_params_.table_id));
+  DCHECK(hdfs_table != NULL) << "INSERT target table not known in descriptor table: "
+                             << finalize_params_.table_id;
+
+  // Loop over all partitions that were updated by this insert, and create the set of
+  // filesystem operations required to create the correct partition structure on disk.
+  BOOST_FOREACH(const PartitionStatusMap::value_type& partition, per_partition_status_) {
     SCOPED_TIMER(ADD_CHILD_TIMER(query_profile_, "Overwrite/PartitionCreationTimer",
           "FinalizationTimer"));
+
+    // Look up the partition in the descriptor table.
     stringstream part_path_ss;
-    // Fully-qualified partition path
-    part_path_ss << finalize_params_.hdfs_base_dir << "/" << partition.first;
-    const string part_path = part_path_ss.str();
+    if (partition.second.id == -1) {
+      // If this is a non-existant partition, use the default partition location of
+      // <base_dir>/part_key_1=val/part_key_2=val/...
+      part_path_ss << finalize_params_.hdfs_base_dir << "/" << partition.first;
+    } else {
+      HdfsPartitionDescriptor* part = hdfs_table->GetPartition(partition.second.id);
+      DCHECK(part != NULL) << "Partition " << partition.second.id
+                           << " not known in descriptor table";
+      part_path_ss << part->location();
+    }
+    const string& part_path = part_path_ss.str();
+
+    // If this is an overwrite insert, we will need to delete any updated partitions
     if (finalize_params_.is_overwrite) {
       if (partition.first.empty()) {
         // If the root directory is written to, then the table must not be partitioned
-        DCHECK(partition_row_counts_.size() == 1);
+        DCHECK(per_partition_status_.size() == 1);
         // We need to be a little more careful, and only delete data files in the root
         // because the tmp directories the sink(s) wrote are there also.
         // So only delete files in the table directory - all files are treated as data
@@ -595,7 +588,7 @@ Status Coordinator::FinalizeSuccessfulInsert() {
         // TODO: There's a potential race here between checking for the directory
         // and a third-party deleting it.
         if (FLAGS_insert_inherit_permissions) {
-          BuildPermissionCache(hdfs_connection, part_path, &permissions_cache);
+          PopulatePathPermissionCache(hdfs_connection, part_path, &permissions_cache);
         }
         if (hdfsExists(hdfs_connection, part_path.c_str()) != -1) {
           partition_create_ops.Add(DELETE_THEN_CREATE, part_path);
@@ -606,9 +599,11 @@ Status Coordinator::FinalizeSuccessfulInsert() {
       }
     } else {
       if (FLAGS_insert_inherit_permissions) {
-        BuildPermissionCache(hdfs_connection, part_path, &permissions_cache);
+        PopulatePathPermissionCache(hdfs_connection, part_path, &permissions_cache);
       }
-      partition_create_ops.Add(CREATE_DIR, part_path);
+      if (hdfsExists(hdfs_connection, part_path.c_str()) == -1) {
+        partition_create_ops.Add(CREATE_DIR, part_path);
+      }
     }
   }
 
@@ -690,7 +685,6 @@ Status Coordinator::FinalizeSuccessfulInsert() {
     }
   }
 
-
   return Status::OK;
 }
 
@@ -755,12 +749,11 @@ Status Coordinator::Wait() {
       // No other backends should have updated these structures if the coordinator has a
       // fragment.  (Backends have a sink only if the coordinator does not)
       DCHECK_EQ(files_to_move_.size(), 0);
-      DCHECK_EQ(partition_row_counts_.size(), 0);
+      DCHECK_EQ(per_partition_status_.size(), 0);
 
       // Because there are no other updates, safe to copy the maps rather than merge them.
       files_to_move_ = *state->hdfs_files_to_move();
-      partition_row_counts_ = *state->num_appended_rows();
-      partition_insert_stats_ = *state->insert_stats();
+      per_partition_status_ = *state->per_partition_status();
     }
   } else {
     // Query finalization can only happen when all backends have reported
@@ -780,7 +773,7 @@ Status Coordinator::Wait() {
 
   if (stmt_type_ == TStmtType::DML) {
     query_profile_->AddInfoString("Insert Stats",
-        DataSink::OutputInsertStats(partition_insert_stats_, "\n"));
+        DataSink::OutputInsertStats(per_partition_status_, "\n"));
     // For DML queries, when Wait is done, the query is complete.  Report aggregate
     // query profiles at this point.
     // TODO: make sure ReportQuerySummary gets called on error
@@ -871,6 +864,94 @@ void Coordinator::PrintBackendInfo() {
                     exec_state->total_split_size, TCounterType::BYTES);
       }
     }
+  }
+}
+
+void Coordinator::InitExecProfile(const TQueryExecRequest& request) {
+  // Initialize the structure to collect execution summary of every plan node.
+  exec_summary_.__isset.nodes = true;
+  for (int i = 0; i < request.fragments.size(); ++i) {
+    if (!request.fragments[i].__isset.plan) continue;
+    const TPlan& plan = request.fragments[i].plan;
+    int fragment_first_node_idx = exec_summary_.nodes.size();
+
+    for (int j = 0; j < plan.nodes.size(); ++j) {
+      stringstream node_label;
+      node_label << plan.nodes[j].node_id << ":"
+                 << PrintPlanNodeType(plan.nodes[j].node_type);
+
+      TPlanNodeExecSummary node;
+      node.node_id = plan.nodes[j].node_id;
+      node.fragment_id = i;
+      node.label = plan.nodes[j].label;
+      node.__set_label_detail(plan.nodes[j].label_detail);
+      node.num_children = plan.nodes[j].num_children;
+
+      if (plan.nodes[j].__isset.estimated_stats) {
+        node.__set_estimated_stats(plan.nodes[j].estimated_stats);
+      }
+
+      plan_node_id_to_summary_map_[plan.nodes[j].node_id] = exec_summary_.nodes.size();
+      exec_summary_.nodes.push_back(node);
+    }
+
+    if (request.fragments[i].__isset.output_sink &&
+        request.fragments[i].output_sink.type == TDataSinkType::DATA_STREAM_SINK) {
+      const TDataStreamSink& sink = request.fragments[i].output_sink.stream_sink;
+      int exch_idx = plan_node_id_to_summary_map_[sink.dest_node_id];
+      if (sink.output_partition.type == TPartitionType::UNPARTITIONED) {
+        exec_summary_.nodes[exch_idx].__set_is_broadcast(true);
+      }
+      exec_summary_.__isset.exch_to_sender_map = true;
+      exec_summary_.exch_to_sender_map[exch_idx] = fragment_first_node_idx;
+    }
+  }
+
+  if (executor_.get() != NULL) {
+    // register coordinator's fragment profile now, before those of the backends,
+    // so it shows up at the top
+    query_profile_->AddChild(executor_->profile());
+    stringstream ss;
+    ss << "Coordinator Fragment " << request.fragments[0].display_name;
+    executor_->profile()->set_name(ss.str());
+    CollectScanNodeCounters(executor_->profile(), &coordinator_counters_);
+  }
+
+  // Initialize the runtime profile structure. This adds the per fragment average
+  // profiles followed by the per fragment instance profiles.
+  bool has_coordinator_fragment =
+      request.fragments[0].partition.type == TPartitionType::UNPARTITIONED;
+  fragment_profiles_.resize(request.fragments.size());
+  for (int i = 0; i < request.fragments.size(); ++i) {
+    fragment_profiles_[i].num_instances = 0;
+
+    // Special case fragment idx 0 if there is a coordinator. There is only one
+    // instance of this profile so the average is just the coordinator profile.
+    if (i == 0 && has_coordinator_fragment) {
+      fragment_profiles_[i].averaged_profile = executor_->profile();
+      continue;
+    }
+    stringstream ss;
+    ss << "Averaged Fragment " << request.fragments[i].display_name;
+    fragment_profiles_[i].averaged_profile =
+        obj_pool()->Add(new RuntimeProfile(obj_pool(), ss.str(), true));
+    // Insert the avg profiles in ascending fragment number order. If
+    // there is a coordinator fragment, it's been placed in
+    // fragment_profiles_[0].averaged_profile, ensuring that this code
+    // will put the first averaged profile immediately after it. If
+    // there is no coordinator fragment, the first averaged profile
+    // will be inserted as the first child of query_profile_, and then
+    // all other averaged fragments will follow.
+    query_profile_->AddChild(fragment_profiles_[i].averaged_profile, true,
+        (i > 0) ? fragment_profiles_[i-1].averaged_profile : NULL);
+
+    ss.str("");
+    ss << "Fragment " << request.fragments[i].display_name;
+    fragment_profiles_[i].root_profile =
+        obj_pool()->Add(new RuntimeProfile(obj_pool(), ss.str()));
+    // Note: we don't start the wall timer here for the fragment
+    // profile; it's uninteresting and misleading.
+    query_profile_->AddChild(fragment_profiles_[i].root_profile);
   }
 }
 
@@ -1152,19 +1233,17 @@ Status Coordinator::UpdateFragmentExecStatus(const TReportExecStatusParams& para
     lock_guard<mutex> l(lock_);
     // Merge in table update data (partitions written to, files to be moved as part of
     // finalization)
-
-    BOOST_FOREACH(const PartitionRowCount::value_type& partition,
-        params.insert_exec_status.num_appended_rows) {
-      partition_row_counts_[partition.first] += partition.second;
+    BOOST_FOREACH(const PartitionStatusMap::value_type& partition,
+        params.insert_exec_status.per_partition_status) {
+      TInsertPartitionStatus* status = &(per_partition_status_[partition.first]);
+      status->num_appended_rows += partition.second.num_appended_rows;
+      status->id = partition.second.id;
+      if (!status->__isset.stats) status->__set_stats(TInsertStats());
+      DataSink::MergeInsertStats(partition.second.stats, &status->stats);
     }
     files_to_move_.insert(
         params.insert_exec_status.files_to_move.begin(),
         params.insert_exec_status.files_to_move.end());
-
-    if (params.insert_exec_status.__isset.insert_stats) {
-      const PartitionInsertStats& stats = params.insert_exec_status.insert_stats;
-      DataSink::MergeInsertStats(stats, &partition_insert_stats_);
-    }
   }
 
   if (VLOG_FILE_IS_ON) {
@@ -1227,12 +1306,16 @@ RuntimeState* Coordinator::runtime_state() {
   return executor_.get() == NULL ? NULL : executor_->runtime_state();
 }
 
+MemTracker* Coordinator::query_mem_tracker() {
+  return executor_.get() == NULL ? query_mem_tracker_.get() :
+      executor_->runtime_state()->query_mem_tracker();
+}
+
 bool Coordinator::PrepareCatalogUpdate(TUpdateCatalogRequest* catalog_update) {
   // Assume we are called only after all fragments have completed
   DCHECK(has_called_wait_);
 
-  BOOST_FOREACH(const PartitionRowCount::value_type& partition,
-      partition_row_counts_) {
+  BOOST_FOREACH(const PartitionStatusMap::value_type& partition, per_partition_status_) {
     catalog_update->created_partitions.insert(partition.first);
   }
 
@@ -1279,6 +1362,33 @@ void Coordinator::ComputeFragmentSummaryStats(BackendExecState* backend_exec_sta
   data.root_profile->AddChild(backend_exec_state->profile);
 }
 
+void Coordinator::UpdateExecSummary(RuntimeProfile* profile) {
+  vector<RuntimeProfile*> children;
+  profile->GetAllChildren(&children);
+
+  for (int j = 0; j < children.size(); ++j) {
+    int id = ExecNode::GetNodeIdFromProfile(children[j]);
+    if (id == -1) continue;
+
+    TPlanNodeExecSummary& exec_summary =
+        exec_summary_.nodes[plan_node_id_to_summary_map_[id]];
+    TExecStats stats;
+
+    RuntimeProfile::Counter* rows_counter = children[j]->GetCounter("RowsReturned");
+    RuntimeProfile::Counter* mem_counter = children[j]->GetCounter("PeakMemoryUsage");
+    if (rows_counter != NULL) stats.__set_cardinality(rows_counter->value());
+    if (mem_counter != NULL) stats.__set_memory_used(mem_counter->value());
+    stats.__set_latency_ns(children[j]->local_time());
+    // TODO: we don't track cpu time per node now. Do that.
+    exec_summary.__isset.exec_stats = true;
+
+    // TODO: we can't call UpdateExecSummary until the query is complete because
+    // we just keep appending to exec_summary.exec_stats. We already maintain
+    // fragment instance so this shouldn't be hard to fix.
+    exec_summary.exec_stats.push_back(stats);
+  }
+}
+
 // This function appends summary information to the query_profile_ before
 // outputting it to VLOG.  It adds:
 //   1. Averaged remote fragment profiles (TODO: add outliers)
@@ -1293,7 +1403,10 @@ void Coordinator::ReportQuerySummary() {
 
   // The fragment has finished executing.  Update the profile to compute the
   // fraction of time spent in each node.
-  if (executor_.get() != NULL) executor_->profile()->ComputeTimeInProfile();
+  if (executor_.get() != NULL) {
+    executor_->profile()->ComputeTimeInProfile();
+    UpdateExecSummary(executor_->profile());
+  }
 
   if (!backend_exec_states_.empty()) {
     // Average all remote fragments for each fragment.
@@ -1301,6 +1414,7 @@ void Coordinator::ReportQuerySummary() {
       backend_exec_states_[i]->profile->ComputeTimeInProfile();
       UpdateAverageProfile(backend_exec_states_[i]);
       ComputeFragmentSummaryStats(backend_exec_states_[i]);
+      UpdateExecSummary(backend_exec_states_[i]->profile);
     }
 
     InstanceComparator comparator;
@@ -1397,8 +1511,6 @@ void Coordinator::SetExecPlanFragmentParams(
   rpc_params->__set_protocol_version(ImpalaInternalServiceVersion::V1);
   rpc_params->__set_fragment(fragment);
   rpc_params->__set_desc_tbl(desc_tbl_);
-  rpc_params->params.__set_query_id(query_id_);
-  rpc_params->params.__set_fragment_instance_id(params.instance_ids[instance_idx]);
   TNetworkAddress exec_host = params.hosts[instance_idx];
   if (schedule.HasReservation()) {
     // The reservation has already have been validated at this point.
@@ -1424,10 +1536,111 @@ void Coordinator::SetExecPlanFragmentParams(
   rpc_params->params.__set_per_node_scan_ranges(scan_ranges);
   rpc_params->params.__set_per_exch_num_senders(params.per_exch_num_senders);
   rpc_params->params.__set_destinations(params.destinations);
+  rpc_params->params.__set_sender_id(params.sender_id_base + instance_idx);
   rpc_params->__isset.params = true;
-  rpc_params->__set_coord(coord);
-  rpc_params->__set_backend_num(backend_num);
-  rpc_params->__set_query_ctxt(query_ctxt_);
+  rpc_params->fragment_instance_ctx.__set_query_ctx(query_ctx_);
+  rpc_params->fragment_instance_ctx.fragment_instance_id =
+      params.instance_ids[instance_idx];
+  rpc_params->fragment_instance_ctx.fragment_instance_idx = instance_idx;
+  rpc_params->fragment_instance_ctx.num_fragment_instances = params.instance_ids.size();
+  rpc_params->fragment_instance_ctx.backend_num = backend_num;
+  rpc_params->__isset.fragment_instance_ctx = true;
+}
+
+void Coordinator::PrintExecSummary(int indent_level, bool is_child_fragment,
+    int* node_idx, vector<vector<string> >* result) const {
+  const TPlanNodeExecSummary& node = exec_summary_.nodes[*node_idx];
+  const TExecStats& est_stats = node.estimated_stats;
+
+  TExecStats agg_stats;
+  TExecStats max_stats;
+
+#define COMPUTE_MAX_SUM_STATS(NAME)\
+  agg_stats.NAME += node.exec_stats[i].NAME;\
+  max_stats.NAME = std::max(max_stats.NAME, node.exec_stats[i].NAME)
+
+  // Compute avg and max of each stat.
+  for (int i = 0; i < node.exec_stats.size(); ++i) {
+    COMPUTE_MAX_SUM_STATS(latency_ns);
+    COMPUTE_MAX_SUM_STATS(cpu_time_ns);
+    COMPUTE_MAX_SUM_STATS(cardinality);
+    COMPUTE_MAX_SUM_STATS(memory_used);
+  }
+
+  int64_t avg_time = node.exec_stats.size() == 0 ? 0 :
+      agg_stats.latency_ns / node.exec_stats.size();
+
+  // Print the level to indicate nesting with "|--"
+  stringstream label_ss;
+  if (indent_level != 0) {
+    label_ss << "|";
+  }
+  for (int i = 0; i < indent_level; ++i) {
+    label_ss << (is_child_fragment ? "  " : "--");
+  }
+  label_ss << node.label;
+
+  vector<string> row;
+  row.push_back(label_ss.str());
+  row.push_back(lexical_cast<string>(node.exec_stats.size())); // Num instances
+  row.push_back(PrettyPrinter::Print(avg_time, TCounterType::TIME_NS));
+  row.push_back(PrettyPrinter::Print(max_stats.latency_ns, TCounterType::TIME_NS));
+  row.push_back(PrettyPrinter::Print(
+      node.is_broadcast ? max_stats.cardinality : agg_stats.cardinality,
+      TCounterType::UNIT));
+  row.push_back(PrettyPrinter::Print(est_stats.cardinality, TCounterType::UNIT));
+  row.push_back(PrettyPrinter::Print(max_stats.memory_used, TCounterType::BYTES));
+  row.push_back(PrettyPrinter::Print(est_stats.memory_used, TCounterType::BYTES));
+  row.push_back(node.label_detail);
+  result->push_back(row);
+
+  map<int, int>::const_iterator child_fragment_idx_it =
+      exec_summary_.exch_to_sender_map.find(*node_idx);
+  if (child_fragment_idx_it != exec_summary_.exch_to_sender_map.end()) {
+    DCHECK_EQ(node.num_children, 0);
+    int child_fragment_id = child_fragment_idx_it->second;
+    PrintExecSummary(indent_level, true, &child_fragment_id, result);
+  }
+  ++*node_idx;
+  if (node.num_children == 0) return;
+
+  // Print the non-left children to the stream first.
+  vector<vector<string> > child0_result;
+  PrintExecSummary(indent_level, false, node_idx, &child0_result);
+
+  for (int i = 1; i < node.num_children; ++i) {
+    PrintExecSummary(indent_level + 1, false, node_idx, result);
+  }
+  for (int i = 0; i < child0_result.size(); ++i) {
+    result->push_back(child0_result[i]);
+  }
+}
+
+string Coordinator::PrintExecSummary() const {
+  // Bail if InitExecProfile() has not been called.
+  if (!exec_summary_.__isset.nodes) return "";
+
+  TablePrinter printer;
+  printer.set_max_output_width(30);
+  printer.AddColumn("Operator", true);
+  printer.AddColumn("#Hosts", false);
+  printer.AddColumn("Avg Time", false);
+  printer.AddColumn("Max Time", false);
+  printer.AddColumn("#Rows", false);
+  printer.AddColumn("Est. #Rows", false);
+  printer.AddColumn("Peak Mem", false);
+  printer.AddColumn("Est. Peak Mem", false);
+  printer.AddColumn("Detail", true);
+
+  vector<vector<string> > rows;
+  int node_idx = 0;
+  PrintExecSummary(0, false, &node_idx, &rows);
+  for (int i = 0; i < rows.size(); ++i) {
+    printer.AddRow(rows[i]);
+  }
+  string summary_str = printer.ToString("\n");
+  VLOG_QUERY << "Summary query_id=" << query_id_ << summary_str;
+  return summary_str;
 }
 
 }

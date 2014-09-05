@@ -21,12 +21,15 @@ import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.analysis.Analyzer;
 import com.cloudera.impala.analysis.Expr;
+import com.cloudera.impala.analysis.SlotDescriptor;
 import com.cloudera.impala.analysis.SortInfo;
 import com.cloudera.impala.common.InternalException;
+import com.cloudera.impala.service.BackendConfig;
 import com.cloudera.impala.thrift.TExplainLevel;
 import com.cloudera.impala.thrift.TPlanNode;
 import com.cloudera.impala.thrift.TPlanNodeType;
 import com.cloudera.impala.thrift.TQueryOptions;
+import com.cloudera.impala.thrift.TSortInfo;
 import com.cloudera.impala.thrift.TSortNode;
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
@@ -34,48 +37,40 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
 /**
- * Sorting.
- *
+ * Node that implements a sort with or without a limit. useTopN_ is true for sorts
+ * with limits that are implemented by a TopNNode in the backend. SortNode is used
+ * otherwise.
+ * Will always materialize the new tuple info_.sortTupleDesc_.
  */
 public class SortNode extends PlanNode {
   private final static Logger LOG = LoggerFactory.getLogger(SortNode.class);
+
+  // The sort information produced in analysis.
   private final SortInfo info_;
+  // info_.sortTupleSlotExprs_ substituted with the baseTblSmap_ for materialized slots
+  // in init().
+  List<Expr> baseTblMaterializedTupleExprs_;
   private final boolean useTopN_;
-  private final boolean isDefaultLimit_;
-
-  protected long offset_; // The offset of the first row to return
-
-  // set in init() or c'tor
-  private List<Expr> baseTblOrderingExprs_;
+  // The offset of the first row to return.
+  protected long offset_;
 
   public SortNode(PlanNodeId id, PlanNode input, SortInfo info, boolean useTopN,
-      boolean isDefaultLimit, long offset) {
-    super(id, "TOP-N");
-    // If this is the default limit_, we shouldn't have a non-zero offset set.
-    Preconditions.checkArgument(!isDefaultLimit || offset == 0);
+      long offset) {
+    super(id, Lists.newArrayList(info.getSortTupleDescriptor().getId()),
+        getDisplayName(useTopN, false));
     info_ = info;
     useTopN_ = useTopN;
-    isDefaultLimit_ = isDefaultLimit;
-    tupleIds_.addAll(input.getTupleIds());
-    nullableTupleIds_.addAll(input.getNullableTupleIds());
     children_.add(input);
     offset_ = offset;
   }
 
-  /**
-   * Copy c'tor used in clone().
-   */
-  private SortNode(PlanNodeId id, SortNode src) {
-    super(id, src, "TOP-N");
-    info_ = src.info_;
-    baseTblOrderingExprs_ = src.baseTblOrderingExprs_;
-    useTopN_ = src.useTopN_;
-    isDefaultLimit_ = src.isDefaultLimit_;
-    offset_ = src.offset_;
-  }
-
   public long getOffset() { return offset_; }
   public void setOffset(long offset) { offset_ = offset; }
+  public boolean hasOffset() { return offset_ > 0; }
+
+  public boolean useTopN() { return useTopN_; }
+
+  public SortInfo getSortInfo() { return info_; }
 
   @Override
   public void setCompactData(boolean on) { compactData_ = on; }
@@ -86,12 +81,18 @@ public class SortNode extends PlanNode {
   @Override
   public void init(Analyzer analyzer) throws InternalException {
     assignConjuncts(analyzer);
+    // Compute the memory layout for the generated tuple.
+    computeMemLayout(analyzer);
     computeStats(analyzer);
-    baseTblSmap_ = getChild(0).getBaseTblSmap();
-    // don't set the ordering exprs if they're already set (they were assigned in the
-    // clone c'tor)
-    if (baseTblOrderingExprs_ == null) {
-      baseTblOrderingExprs_ = Expr.cloneList(info_.getOrderingExprs(), baseTblSmap_);
+    createDefaultSmap();
+    List<SlotDescriptor> sortTupleSlots = info_.getSortTupleDescriptor().getSlots();
+    List<Expr> slotExprs = info_.getSortTupleSlotExprs();
+    Preconditions.checkState(sortTupleSlots.size() == slotExprs.size());
+    baseTblMaterializedTupleExprs_ = Lists.newArrayList();
+    for (int i = 0; i < slotExprs.size(); ++i) {
+      if (sortTupleSlots.get(i).isMaterialized()) {
+        baseTblMaterializedTupleExprs_.add(slotExprs.get(i).clone(baseTblSmap_));
+      }
     }
   }
 
@@ -120,19 +121,22 @@ public class SortNode extends PlanNode {
   @Override
   protected void toThrift(TPlanNode msg) {
     msg.node_type = TPlanNodeType.SORT_NODE;
-    msg.sort_node = new TSortNode(
-        Expr.treesToThrift(baseTblOrderingExprs_), info_.getIsAscOrder(), useTopN_,
-        isDefaultLimit_);
-    msg.sort_node.setNulls_first(info_.getNullsFirst());
-    msg.sort_node.setOffset(offset_);
+    TSortInfo sort_info = new TSortInfo(Expr.treesToThrift(info_.getOrderingExprs()),
+        info_.getIsAscOrder(), info_.getNullsFirst());
+    Preconditions.checkState(tupleIds_.size() == 1,
+        "Incorrect size for tupleIds_ in SortNode");
+    sort_info.sort_tuple_slot_exprs = Expr.treesToThrift(baseTblMaterializedTupleExprs_);
+    TSortNode sort_node = new TSortNode(sort_info, useTopN_);
+    sort_node.setOffset(offset_);
+    msg.sort_node = sort_node;
   }
 
   @Override
   protected String getNodeExplainString(String prefix, String detailPrefix,
       TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
-    output.append(String.format("%s%s:%s [LIMIT=%s]\n", prefix, id_.toString(),
-        displayName_, limit_));
+    output.append(String.format("%s%s:%s%s\n", prefix, id_.toString(),
+        displayName_, getNodeExplainDetail(detailLevel)));
     if (detailLevel.ordinal() >= TExplainLevel.STANDARD.ordinal()) {
       output.append(detailPrefix + "order by: ");
       for (int i = 0; i < info_.getOrderingExprs().size(); ++i) {
@@ -150,6 +154,15 @@ public class SortNode extends PlanNode {
     return output.toString();
   }
 
+  private String getNodeExplainDetail(TExplainLevel detailLevel) {
+    if (!hasLimit()) return "";
+    if (hasOffset()) {
+      return String.format(" [LIMIT=%s OFFSET=%s]", limit_, offset_);
+    } else {
+      return String.format(" [LIMIT=%s]", limit_);
+    }
+  }
+
   @Override
   protected String getOffsetExplainString(String prefix) {
     return offset_ != 0 ? prefix + "offset: " + Long.toString(offset_) + "\n" : "";
@@ -158,10 +171,40 @@ public class SortNode extends PlanNode {
   @Override
   public void computeCosts(TQueryOptions queryOptions) {
     Preconditions.checkState(hasValidStats());
-    Preconditions.checkState(useTopN_);
-    perHostMemCost_ = (long) Math.ceil((cardinality_ + offset_) * avgRowSize_);
+    if (useTopN_) {
+      perHostMemCost_ = (long) Math.ceil((cardinality_ + offset_) * avgRowSize_);
+      return;
+    }
+
+    // For an external sort, set the memory cost to be what is required for a 2-phase
+    // sort. If the input to be sorted would take up N blocks in memory, then the
+    // memory required for a 2-phase sort is sqrt(N) blocks. A single run would be of
+    // size sqrt(N) blocks, and we could merge sqrt(N) such runs with sqrt(N) blocks
+    // of memory.
+    double fullInputSize = getChild(0).cardinality_ * avgRowSize_;
+    boolean hasVarLenSlots = false;
+    for (SlotDescriptor slotDesc: info_.getSortTupleDescriptor().getSlots()) {
+      if (slotDesc.isMaterialized() && !slotDesc.getType().isFixedLengthType()) {
+        hasVarLenSlots = true;
+        break;
+      }
+    }
+
+    // The block size used by the sorter is the same as the configured I/O read size.
+    long blockSize = BackendConfig.INSTANCE.getReadSize();
+    // The external sorter writes fixed-len and var-len data in separate sequences of
+    // blocks on disk and reads from both sequences when merging. This effectively
+    // doubles the block size when there are var-len columns present.
+    if (hasVarLenSlots) blockSize *= 2;
+    double numInputBlocks = Math.ceil(fullInputSize / blockSize);
+    perHostMemCost_ = blockSize * (long) Math.ceil(Math.sqrt(numInputBlocks));
   }
 
-  @Override
-  public PlanNode clone(PlanNodeId id) { return new SortNode(id, this); }
+  private static String getDisplayName(boolean isTopN, boolean isMergeOnly) {
+    if (isTopN) {
+      return "TOP-N";
+    } else {
+      return "SORT";
+    }
+  }
 }

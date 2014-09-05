@@ -40,14 +40,14 @@ DEFINE_double(max_vcore_oversubscription_ratio, 2.5, "(Advanced) The maximum rat
     " on a single node");
 
 ResourceResolver::ResourceResolver(const unordered_set<TNetworkAddress>& unique_hosts) {
-  ResourceBroker* broker = ExecEnv::GetInstance()->resource_broker();
-  is_mini_llama_ = (broker == NULL) ? false : broker->is_mini_llama();
-  if (is_mini_llama_) CreateMiniLlamaMapping(unique_hosts);
+  if (ExecEnv::GetInstance()->is_pseudo_distributed_llama()) {
+    CreateLocalLlamaNodeMapping(unique_hosts);
+  }
 }
 
 void ResourceResolver::GetResourceHostport(const TNetworkAddress& src,
     TNetworkAddress* dest) {
-  if (is_mini_llama_) {
+  if (ExecEnv::GetInstance()->is_pseudo_distributed_llama()) {
     *dest = impalad_to_dn_[src];
   } else {
     dest->hostname = src.hostname;
@@ -55,9 +55,9 @@ void ResourceResolver::GetResourceHostport(const TNetworkAddress& src,
   }
 }
 
-void ResourceResolver::CreateMiniLlamaMapping(
+void ResourceResolver::CreateLocalLlamaNodeMapping(
     const unordered_set<TNetworkAddress>& unique_hosts) {
-  DCHECK(is_mini_llama_);
+  DCHECK(ExecEnv::GetInstance()->is_pseudo_distributed_llama());
   const vector<string>& llama_nodes =
       ExecEnv::GetInstance()->resource_broker()->llama_nodes();
   DCHECK(!llama_nodes.empty());
@@ -66,6 +66,7 @@ void ResourceResolver::CreateMiniLlamaMapping(
     TNetworkAddress dn_hostport = MakeNetworkAddress(llama_nodes[llama_node_ix]);
     impalad_to_dn_[host] = dn_hostport;
     dn_to_impalad_[dn_hostport] = host;
+    LOG(INFO) << "Mapping Datanode " << dn_hostport << " to Impalad: " << host;
     // Round robin the registered Llama nodes.
     llama_node_ix = (llama_node_ix + 1) % llama_nodes.size();
   }
@@ -74,7 +75,7 @@ void ResourceResolver::CreateMiniLlamaMapping(
 QueryResourceMgr::QueryResourceMgr(const TUniqueId& reservation_id,
     const TNetworkAddress& local_resource_location, const TUniqueId& query_id)
     : reservation_id_(reservation_id), query_id_(query_id),
-      local_resource_location_(local_resource_location), exit_(false),
+      local_resource_location_(local_resource_location), exit_(false), callback_count_(0),
       threads_running_(0), vcores_(0) {
   max_vcore_oversubscription_ratio_ = FLAGS_max_vcore_oversubscription_ratio;
 }
@@ -142,9 +143,18 @@ void QueryResourceMgr::NotifyThreadUsageChange(int delta) {
   if (AboveVcoreSubscriptionThreshold()) threads_changed_cv_.notify_all();
 }
 
-void QueryResourceMgr::AddVcoreAvailableCb(const VcoreAvailableCb& callback) {
+int32_t QueryResourceMgr::AddVcoreAvailableCb(const VcoreAvailableCb& callback) {
   lock_guard<mutex> l(callbacks_lock_);
-  callbacks_.push_back(callback);
+  callbacks_[callback_count_] = callback;
+  callbacks_it_ = callbacks_.begin();
+  return callback_count_++;
+}
+
+void QueryResourceMgr::RemoveVcoreAvailableCb(int32_t callback_id) {
+  lock_guard<mutex> l(callbacks_lock_);
+  CallbackMap::iterator it = callbacks_.find(callback_id);
+  DCHECK(it != callbacks_.end()) << "Could not find callback with id: " << callback_id;
+  callbacks_.erase(it);
   callbacks_it_ = callbacks_.begin();
 }
 
@@ -207,7 +217,7 @@ void QueryResourceMgr::AcquireVcoreResources(
     {
       lock_guard<mutex> l(callbacks_lock_);
       if (callbacks_.size() != 0) {
-        (*callbacks_it_)();
+        callbacks_it_->second();
         if (++callbacks_it_ == callbacks_.end()) callbacks_it_ = callbacks_.begin();
       }
     }
@@ -231,6 +241,11 @@ void QueryResourceMgr::Shutdown() {
     callbacks_.clear();
   }
   threads_changed_cv_.notify_all();
+
+  // Delete all non-reservation requests associated with this reservation ID. If this the
+  // coordinator, the SimpleScheduler will actually release the resources by releasing the
+  // original reservation ID.
+  ExecEnv::GetInstance()->resource_broker()->ClearRequests(reservation_id_, false);
 }
 
 QueryResourceMgr::~QueryResourceMgr() {

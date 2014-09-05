@@ -49,6 +49,7 @@ import com.cloudera.impala.authorization.AuthorizationConfig;
 import com.cloudera.impala.authorization.ImpalaInternalAdminUser;
 import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.authorization.User;
+import com.cloudera.impala.catalog.DataSource;
 import com.cloudera.impala.catalog.Function;
 import com.cloudera.impala.common.FileSystemUtil;
 import com.cloudera.impala.common.ImpalaException;
@@ -58,17 +59,21 @@ import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TDescribeTableParams;
 import com.cloudera.impala.thrift.TDescribeTableResult;
 import com.cloudera.impala.thrift.TExecRequest;
+import com.cloudera.impala.thrift.TGetDataSrcsParams;
+import com.cloudera.impala.thrift.TGetDataSrcsResult;
 import com.cloudera.impala.thrift.TGetDbsParams;
 import com.cloudera.impala.thrift.TGetDbsResult;
 import com.cloudera.impala.thrift.TGetFunctionsParams;
 import com.cloudera.impala.thrift.TGetFunctionsResult;
+import com.cloudera.impala.thrift.TGetHadoopConfigRequest;
+import com.cloudera.impala.thrift.TGetHadoopConfigResponse;
 import com.cloudera.impala.thrift.TGetTablesParams;
 import com.cloudera.impala.thrift.TGetTablesResult;
 import com.cloudera.impala.thrift.TLoadDataReq;
 import com.cloudera.impala.thrift.TLoadDataResp;
 import com.cloudera.impala.thrift.TLogLevel;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TQueryCtx;
 import com.cloudera.impala.thrift.TResultSet;
 import com.cloudera.impala.thrift.TShowStatsParams;
 import com.cloudera.impala.thrift.TTableName;
@@ -77,6 +82,7 @@ import com.cloudera.impala.util.GlogAppender;
 import com.cloudera.impala.util.TSessionStateUtil;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 
 /**
  * JNI-callable interface onto a wrapped Frontend instance. The main point is to serialise
@@ -97,17 +103,24 @@ public class JniFrontend {
    * Create a new instance of the Jni Frontend.
    */
   public JniFrontend(boolean lazy, String serverName, String authorizationPolicyFile,
-      String policyProviderClassName, int impalaLogLevel, int otherLogLevel)
-      throws InternalException {
+      String sentryConfigFile, String authPolicyProviderClass, int impalaLogLevel,
+      int otherLogLevel) throws InternalException {
     GlogAppender.Install(TLogLevel.values()[impalaLogLevel],
         TLogLevel.values()[otherLogLevel]);
 
     // Validate the authorization configuration before initializing the Frontend.
     // If there are any configuration problems Impala startup will fail.
-    AuthorizationConfig authorizationConfig = new AuthorizationConfig(serverName,
-        authorizationPolicyFile, policyProviderClassName);
-    authorizationConfig.validateConfig();
-    frontend_ = new Frontend(authorizationConfig);
+    AuthorizationConfig authConfig = new AuthorizationConfig(serverName,
+        authorizationPolicyFile, sentryConfigFile, authPolicyProviderClass);
+    authConfig.validateConfig();
+    if (authConfig.isEnabled()) {
+      LOG.info("Authorization is 'ENABLED' using %s",
+          authConfig.isFileBasedPolicy() ? " file based policy from: " +
+          authConfig.getPolicyFile() : " using Sentry Policy Service.");
+    } else {
+      LOG.info("Authorization is 'DISABLED'.");
+    }
+    frontend_ = new Frontend(authConfig);
   }
 
   /**
@@ -116,11 +129,11 @@ public class JniFrontend {
    */
   public byte[] createExecRequest(byte[] thriftQueryContext)
       throws ImpalaException {
-    TQueryContext queryCxt = new TQueryContext();
-    JniUtil.deserializeThrift(protocolFactory_, queryCxt, thriftQueryContext);
+    TQueryCtx queryCtx = new TQueryCtx();
+    JniUtil.deserializeThrift(protocolFactory_, queryCtx, thriftQueryContext);
 
     StringBuilder explainString = new StringBuilder();
-    TExecRequest result = frontend_.createExecRequest(queryCxt, explainString);
+    TExecRequest result = frontend_.createExecRequest(queryCtx, explainString);
     LOG.debug(explainString.toString());
 
     // TODO: avoid creating serializer for each query?
@@ -167,9 +180,9 @@ public class JniFrontend {
    * This call is thread-safe.
    */
   public String getExplainPlan(byte[] thriftQueryContext) throws ImpalaException {
-    TQueryContext queryCtxt = new TQueryContext();
-    JniUtil.deserializeThrift(protocolFactory_, queryCtxt, thriftQueryContext);
-    String plan = frontend_.getExplainString(queryCtxt);
+    TQueryCtx queryCtx = new TQueryCtx();
+    JniUtil.deserializeThrift(protocolFactory_, queryCtx, thriftQueryContext);
+    String plan = frontend_.getExplainString(queryCtx);
     LOG.debug("Explain plan: " + plan);
     return plan;
   }
@@ -221,6 +234,36 @@ public class JniFrontend {
     TGetDbsResult result = new TGetDbsResult();
     result.setDbs(dbs);
 
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    try {
+      return serializer.serialize(result);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
+  }
+
+  /**
+   * Returns a list of data sources matching an optional pattern.
+   * The argument is a serialized TGetDataSrcsResult object.
+   * The return type is a serialised TGetDataSrcsResult object.
+   * @see Frontend#getDataSrcs
+   */
+  public byte[] getDataSrcMetadata(byte[] thriftParams) throws ImpalaException {
+    TGetDataSrcsParams params = new TGetDataSrcsParams();
+    JniUtil.deserializeThrift(protocolFactory_, params, thriftParams);
+
+    TGetDataSrcsResult result = new TGetDataSrcsResult();
+    List<DataSource> dataSources = frontend_.getDataSrcs(params.pattern);
+    result.setData_src_names(Lists.<String>newArrayListWithCapacity(dataSources.size()));
+    result.setLocations(Lists.<String>newArrayListWithCapacity(dataSources.size()));
+    result.setClass_names(Lists.<String>newArrayListWithCapacity(dataSources.size()));
+    result.setApi_versions(Lists.<String>newArrayListWithCapacity(dataSources.size()));
+    for (DataSource dataSource: dataSources) {
+      result.addToData_src_names(dataSource.getName());
+      result.addToLocations(dataSource.getLocation().toUri().getPath());
+      result.addToClass_names(dataSource.getClassName());
+      result.addToApi_versions(dataSource.getApiVersion());
+    }
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
       return serializer.serialize(result);
@@ -377,6 +420,24 @@ public class JniFrontend {
       output.append("</table>");
     }
     return output.toString();
+  }
+
+  /**
+   * Returns the corresponding config value for the given key as a serialized
+   * TGetHadoopConfigResponse. If the config value is null, the 'value' field in the
+   * thrift response object will not be set.
+   */
+  public byte[] getHadoopConfig(byte[] serializedRequest) throws ImpalaException {
+    TGetHadoopConfigRequest request = new TGetHadoopConfigRequest();
+    JniUtil.deserializeThrift(protocolFactory_, request, serializedRequest);
+    TGetHadoopConfigResponse result = new TGetHadoopConfigResponse();
+    result.setValue(CONF.get(request.getName()));
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    try {
+      return serializer.serialize(result);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
   }
 
   public class CdhVersion implements Comparable<CdhVersion> {

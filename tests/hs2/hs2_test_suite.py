@@ -49,7 +49,10 @@ def operation_id_to_query_id(operation_id):
   return "%s:%s" % (lo, hi)
 
 class HS2TestSuite(ImpalaTestSuite):
+  TEST_DB = 'hs2_db'
+
   def setup(self):
+    self.cleanup_db(self.TEST_DB)
     host, port = IMPALAD_HS2_HOST_PORT.split(":")
     self.socket = TSocket(host, port)
     self.transport = TBufferedTransport(self.socket)
@@ -58,6 +61,7 @@ class HS2TestSuite(ImpalaTestSuite):
     self.hs2_client = TCLIService.Client(self.protocol)
 
   def teardown(self):
+    self.cleanup_db(self.TEST_DB)
     if self.socket:
       self.socket.close()
 
@@ -105,3 +109,11 @@ class HS2TestSuite(ImpalaTestSuite):
     HS2TestSuite.check_response(fetch_results_resp, TCLIService.TStatusCode.ERROR_STATUS,
                                 expected_error_prefix)
     return fetch_results_resp
+
+  def result_metadata(self, handle):
+    """ Gets the schema for the query identified by the handle """
+    req = TCLIService.TGetResultSetMetadataReq()
+    req.operationHandle = handle
+    resp = self.hs2_client.GetResultSetMetadata(req)
+    HS2TestSuite.check_response(resp)
+    return resp

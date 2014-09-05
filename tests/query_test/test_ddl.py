@@ -1,5 +1,18 @@
 #!/usr/bin/env python
 # Copyright (c) 2012 Cloudera, Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 # Impala tests for DDL statements
 import logging
 import pytest
@@ -14,7 +27,7 @@ from tests.common.impala_test_suite import *
 # Validates DDL statements (create, drop)
 class TestDdlStatements(ImpalaTestSuite):
   TEST_DBS = ['ddl_test_db', 'alter_table_test_db', 'alter_table_test_db2',
-              'function_ddl_test', 'udf_test']
+              'function_ddl_test', 'udf_test', 'data_src_test']
 
   @classmethod
   def get_workload(self):
@@ -23,11 +36,16 @@ class TestDdlStatements(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestDdlStatements, cls).add_test_dimensions()
+    sync_ddl_opts = [0, 1]
+    if cls.exploration_strategy() != 'exhaustive':
+      # Only run with sync_ddl on exhaustive since it increases test runtime.
+      sync_ddl_opts = [0]
+
     cls.TestMatrix.add_dimension(create_exec_option_dimension(
         cluster_sizes=ALL_NODES_ONLY,
         disable_codegen_options=[False],
         batch_sizes=[0],
-        sync_ddl=[0, 1]))
+        sync_ddl=sync_ddl_opts))
 
     # There is no reason to run these tests using all dimensions.
     cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
@@ -93,7 +111,7 @@ class TestDdlStatements(ImpalaTestSuite):
     self.__create_db_synced('ddl_test_db', vector)
     self.run_test_case('QueryTest/create', vector, use_db='ddl_test_db',
         multiple_impalad=self.__use_multiple_impalad(vector))
-
+  
   @pytest.mark.execute_serially
   def test_alter_table(self, vector):
     vector.get_value('exec_option')['abort_on_error'] = False
@@ -125,52 +143,89 @@ class TestDdlStatements(ImpalaTestSuite):
   def test_create_drop_function(self, vector):
     # This will create, run, and drop the same function repeatedly, exercising the
     # lib cache mechanism.
-    # TODO: it's hard to tell that the cache is working (i.e. if it did
-    # nothing to drop the cache, these tests would still pass). Testing
-    # that is a bit harder and requires us to update the udf binary in
-    # the middle.
     create_fn_stmt = """create function f() returns int
         location '/test-warehouse/libTestUdfs.so' symbol='NoArgs'"""
     select_stmt = """select f() from functional.alltypes limit 10"""
-    drop_fn_stmt = "drop function f()"
-    self.__create_db_synced('udf_test', vector)
+    drop_fn_stmt = "drop function %s f()"
+    self.create_drop_ddl(vector, "udf_test", [create_fn_stmt], [drop_fn_stmt],
+        select_stmt)
+
+  @pytest.mark.execute_serially
+  def test_create_drop_data_src(self, vector):
+    # This will create, run, and drop the same data source repeatedly, exercising
+    # the lib cache mechanism.
+    create_ds_stmt = """CREATE DATA SOURCE test_data_src
+        LOCATION '/test-warehouse/data-sources/test-data-source.jar'
+        CLASS 'com.cloudera.impala.extdatasource.AllTypesDataSource'
+        API_VERSION 'V1'"""
+    create_tbl_stmt = """CREATE TABLE data_src_tbl (x int)
+        PRODUCED BY DATA SOURCE test_data_src"""
+    drop_ds_stmt = "drop data source %s test_data_src"
+    drop_tbl_stmt = "drop table %s data_src_tbl"
+    select_stmt = "select * from data_src_tbl limit 1"
+
+    create_stmts = [create_ds_stmt, create_tbl_stmt]
+    drop_stmts = [drop_tbl_stmt, drop_ds_stmt]
+    self.create_drop_ddl(vector, "data_src_test", create_stmts, drop_stmts,
+        select_stmt)
+
+  def create_drop_ddl(self, vector, db_name, create_stmts, drop_stmts, select_stmt):
+    # Helper method to run CREATE/DROP DDL commands repeatedly and exercise the lib cache
+    # create_stmts is the list of CREATE statements to be executed in order drop_stmts is
+    # the list of DROP statements to be executed in order. Each statement should have a
+    # '%s' placeholder to insert "IF EXISTS" or "". The select_stmt is just a single
+    # statement to test after executing the CREATE statements.
+    # TODO: it's hard to tell that the cache is working (i.e. if it did nothing to drop
+    # the cache, these tests would still pass). Testing that is a bit harder and requires
+    # us to update the udf binary in the middle.
+    self.__create_db_synced(db_name, vector)
     self.client.set_configuration(vector.get_value('exec_option'))
 
-    self.client.execute("use udf_test")
-    self.client.execute("drop function if exists f()")
+    self.client.execute("use %s" % (db_name,))
+    for drop_stmt in drop_stmts: self.client.execute(drop_stmt % ("if exists"))
     for i in xrange(1, 10):
-      self.client.execute(create_fn_stmt)
+      for create_stmt in create_stmts: self.client.execute(create_stmt)
       self.client.execute(select_stmt)
-      self.client.execute(drop_fn_stmt)
+      for drop_stmt in drop_stmts: self.client.execute(drop_stmt % (""))
 
   @pytest.mark.execute_serially
   def test_create_alter_bulk_partition(self, vector):
-    # Only run during exhaustive exploration strategy, this doesn't add a lot of extra
-    # coverage to the existing test cases and takes a couple minutes to execute.
-    if self.exploration_strategy() != 'exhaustive': pytest.skip()
+    # Change the scale depending on the exploration strategy, with 50 partitions this
+    # takes a few minutes to run, with 10 partitions it takes ~50s for two configurations.
+    num_parts = 50
+    if self.exploration_strategy() != 'exhaustive': num_parts = 10
 
     self.client.execute("use default")
     self.client.execute("drop table if exists foo_part")
     self.client.execute("create table foo_part(i int) partitioned by(j int, s string)")
 
-    # Add some partitions
-    for i in xrange(10):
+    # Add some partitions (first batch of two)
+    for i in xrange(num_parts / 5):
       start = time.time()
       self.client.execute("alter table foo_part add partition(j=%d, s='%s')" % (i, i))
       print 'ADD PARTITION #%d exec time: %s' % (i, time.time() - start)
 
     # Modify one of the partitions
-    self.client.execute("""alter table foo_part partition(j=5, s='5')
+    self.client.execute("""alter table foo_part partition(j=1, s='1')
         set fileformat parquetfile""")
 
+    # Alter one partition to a non-existent location twice (IMPALA-741)
+    self.hdfs_client.delete_file_dir("tmp/dont_exist1/", recursive=True)
+    self.hdfs_client.delete_file_dir("tmp/dont_exist2/", recursive=True)
+
+    self.execute_query_expect_success(self.client,
+        "alter table foo_part partition(j=1,s='1') set location '/tmp/dont_exist1'")
+    self.execute_query_expect_success(self.client,
+        "alter table foo_part partition(j=1,s='1') set location '/tmp/dont_exist2'")
+
     # Add some more partitions
-    for i in xrange(10, 50):
+    for i in xrange(num_parts / 5, num_parts):
       start = time.time()
       self.client.execute("alter table foo_part add partition(j=%d,s='%s')" % (i,i))
       print 'ADD PARTITION #%d exec time: %s' % (i, time.time() - start)
 
     # Insert data and verify it shows up.
-    self.client.execute("insert into table foo_part partition(j=5, s='5') select 1")
+    self.client.execute("insert into table foo_part partition(j=1, s='1') select 1")
     assert '1' == self.execute_scalar("select count(*) from foo_part")
     self.client.execute("drop table foo_part")
 

@@ -78,6 +78,11 @@ public class HashJoinNode extends PlanNode {
   // join conjuncts_ from the JOIN clause that aren't equi-join predicates
   private List<Expr> otherJoinConjuncts_;
 
+  // If true, this node can add filters for the probe side that can be generated
+  // after reading the build side. This can be very helpful if the join is selective and
+  // there are few build rows.
+  private boolean addProbeFilters_;
+
   public HashJoinNode(
       PlanNode outer, PlanNode inner, TableRef innerRef,
       List<Pair<Expr, Expr> > eqJoinConjuncts, List<Expr> otherJoinConjuncts) {
@@ -115,6 +120,7 @@ public class HashJoinNode extends PlanNode {
   public TableRef getInnerRef() { return innerRef_; }
   public DistributionMode getDistributionMode() { return distrMode_; }
   public void setDistributionMode(DistributionMode distrMode) { distrMode_ = distrMode; }
+  public void setAddProbeFilters(boolean b) { addProbeFilters_ = true; }
 
   @Override
   public void init(Analyzer analyzer) throws InternalException {
@@ -198,9 +204,9 @@ public class HashJoinNode extends PlanNode {
       // FK/PK join (which doesn't alter the cardinality of the left-hand side)
       cardinality_ = getChild(0).cardinality_;
     } else if (getChild(0).cardinality_ != -1 && getChild(1).cardinality_ != -1) {
-      cardinality_ = Math.round(
-          (double) getChild(0).cardinality_
-            * (double) getChild(1).cardinality_ / (double) maxNumDistinct);
+      cardinality_ = multiplyCardinalities(getChild(0).cardinality_,
+          getChild(1).cardinality_);
+      cardinality_ = Math.round((double)cardinality_ / (double) maxNumDistinct);
     }
 
     // Impose lower/upper bounds on the cardinality based on the join type.
@@ -225,8 +231,9 @@ public class HashJoinNode extends PlanNode {
       }
       case FULL_OUTER_JOIN: {
         if (getChild(0).cardinality_ != -1 && getChild(1).cardinality_ != -1) {
-          cardinality_ =
-              Math.max(getChild(0).cardinality_ + getChild(1).cardinality_, cardinality_);
+          long cardinalitySum = addCardinalities(getChild(0).cardinality_,
+              getChild(1).cardinality_);
+          cardinality_ = Math.max(cardinalitySum, cardinality_);
         }
         break;
       }
@@ -265,16 +272,22 @@ public class HashJoinNode extends PlanNode {
     for (Expr e: otherJoinConjuncts_) {
       msg.hash_join_node.addToOther_join_conjuncts(e.treeToThrift());
     }
+    msg.hash_join_node.setAdd_probe_filters(addProbeFilters_);
+  }
+
+  @Override
+  protected String getDisplayLabelDetail() {
+    StringBuilder output = new StringBuilder(joinOp_.toString());
+    if (distrMode_ != DistributionMode.NONE) output.append(", " + distrMode_.toString());
+    return output.toString();
   }
 
   @Override
   protected String getNodeExplainString(String prefix, String detailPrefix,
       TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
-    output.append(String.format("%s%s:%s [%s", prefix, id_.toString(),
-        displayName_, joinOp_.toString()));
-    if (distrMode_ != DistributionMode.NONE) output.append(", " + distrMode_.toString());
-    output.append("]\n");
+    output.append(String.format("%s%s [%s]\n", prefix, getDisplayLabel(),
+        getDisplayLabelDetail()));
 
     if (detailLevel.ordinal() > TExplainLevel.MINIMAL.ordinal()) {
       output.append(detailPrefix + "hash predicates: ");

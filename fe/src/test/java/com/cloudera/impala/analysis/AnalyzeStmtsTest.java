@@ -41,35 +41,105 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("SELECT INT_COL FROM FUNCTIONAL.ALLtypes");
     AnalyzesOk("SELECT INT_COL FROM FUNCTIONAL.alltypes");
     AnalyzesOk("select functional.AllTypes.Int_Col from functional.alltypes");
+  }
 
-    // explicit aliases work
-    AnalyzesOk("select a.int_col from functional.alltypes a");
-    // columns without table alias can be resolved if they are not ambiguous
-    AnalyzesOk("select int_col, zip from functional.alltypes, functional.testtbl");
-    // implicit fully-qualified table name as alias works
-    AnalyzesOk("select functional.alltypes.int_col from functional.alltypes");
-    // implicit non-fully-qualified table name as alias works
-    AnalyzesOk("select alltypes.int_col from functional.alltypes");
+  @Test
+  public void TestTableAliases() throws AnalysisException {
+    String[] tables = new String[] { "alltypes", "alltypes_view" };
+    String[] columns = new String[] { "int_col", "*" };
 
-    // implicit fully-qualified table name on non-fully qualified table reference
-    AnalyzesOk("select functional.alltypes.int_col from alltypes",
-        createAnalyzer("functional"));
-    // implicit non-fully-qualified table name on non-fully qualified table reference
-    AnalyzesOk("select alltypes.int_col from alltypes",
-        createAnalyzer("functional"));
+    for (String tbl: tables) {
+      for (String col: columns) {
+        // Test implicit table aliases with unqualified table/view name.
+        AnalyzesOk(String.format("select %s from %s", col, tbl),
+            createAnalyzer("functional"));
+        AnalyzesOk(String.format("select %s.%s from %s", tbl, col, tbl),
+            createAnalyzer("functional"));
+        AnalyzesOk(String.format("select functional.%s.%s from %s", tbl, col, tbl),
+            createAnalyzer("functional"));
 
-    // duplicate alias
-    AnalysisError("select a.int_col, a.id " +
-        "          from functional.alltypes a, functional.testtbl a",
-        "Duplicate table alias");
-    // duplicate implicit alias
-    AnalysisError("select int_col from functional.alltypes, " +
-        "functional.alltypes", "Duplicate table alias");
+        // Test implicit table aliases with fully-qualified table/view name.
+        AnalyzesOk(String.format("select %s from functional.%s", col, tbl));
+        AnalyzesOk(String.format("select %s.%s from functional.%s", tbl, col, tbl));
+        AnalyzesOk(String.format("select functional.%s.%s from functional.%s",
+            tbl, col, tbl));
 
-    // resolves dbs correctly
-    AnalyzesOk("select zip from functional.testtbl");
-    AnalysisError("select int_col from functional.testtbl",
-        "couldn't resolve column reference");
+        // Explicit table alias.
+        AnalyzesOk(String.format("select %s from functional.%s a", col, tbl));
+        AnalyzesOk(String.format("select a.%s from functional.%s a", col, tbl));
+        // Explicit table alias must be used.
+        AnalysisError(String.format("select %s.%s from functional.%s a", tbl, col, tbl),
+            String.format("unknown table alias '%s'", tbl));
+        AnalysisError(String.format("select functional.%s.%s from functional.%s a",
+            tbl, col, tbl),
+            String.format("unknown table alias 'functional.%s'", tbl));
+      }
+    }
+
+    for (String t1: tables) {
+      for (String t2: tables) {
+        if (t1 == t2) continue;
+        for (String col: columns) {
+          // Multiple implicit fully-qualified aliases work.
+          AnalyzesOk(String.format(
+              "select functional.%s.%s, functional.%s.%s " +
+                  "from functional.%s, functional.%s", t1, col, t2, col, t1, t2));
+        }
+      }
+    }
+
+    for (String tbl: tables) {
+      // Duplicate explicit alias.
+      AnalysisError(String.format(
+          "select a.int_col, a.id from %s a, testtbl a", tbl),
+          createAnalyzer("functional"),
+          "Duplicate table alias");
+      AnalysisError(String.format(
+          "select a.int_col, a.id from functional.%s a, functional.testtbl a", tbl),
+          "Duplicate table alias");
+      // Duplicate implicit alias.
+      AnalysisError(String.format(
+          "select int_col from %s, %s", tbl, tbl),
+          createAnalyzer("functional"),
+          "Duplicate table alias");
+      AnalysisError(String.format(
+          "select int_col from functional.%s, functional.%s", tbl, tbl),
+          "Duplicate table alias");
+      // Duplicate implicit/explicit alias.
+      AnalysisError(String.format(
+          "select %s.int_col from %s, testtbl %s", tbl, tbl, tbl, tbl),
+          createAnalyzer("functional"),
+          "Duplicate table alias");
+      AnalysisError(String.format(
+          "select %s.int_col from functional.%s, functional.testtbl %s", tbl, tbl, tbl),
+          "Duplicate table alias");
+    }
+
+    // Unqualified '*' is not ambiguous.
+    AnalyzesOk("select * from functional.alltypes " +
+        "cross join functional_parquet.alltypes");
+
+    // Ambiguous unqualified column reference.
+    AnalysisError("select int_col from functional.alltypes " +
+        "cross join functional_parquet.alltypes",
+        "unqualified column reference 'int_col' is ambiguous");
+    // Ambiguous implicit unqualified table alias.
+    AnalysisError("select alltypes.int_col from functional.alltypes " +
+        "cross join functional_parquet.alltypes",
+        "unqualified table alias 'alltypes' in column reference 'alltypes.int_col' " +
+        "is ambiguous");
+    AnalysisError("select alltypes.* from functional.alltypes " +
+        "cross join functional_parquet.alltypes",
+        "unqualified table alias 'alltypes' is ambiguous");
+
+    // Mixing unqualified and fully-qualified table refs without explicit aliases is an
+    // error because we'd expect a consistent result if we created a view of this stmt
+    // (table names are fully qualified during view creation -> duplicate table alias).
+    AnalysisError("select alltypes.smallint_col, functional.alltypes.int_col " +
+            "from alltypes inner join functional.alltypes " +
+            "on (alltypes.id = functional.alltypes.id)",
+        createAnalyzer("functional"),
+        "Duplicate table alias: 'functional.alltypes'");
   }
 
   @Test
@@ -107,7 +177,19 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError("select *", "'*' expression in select list requires FROM clause.");
     AnalysisError("select 1, *, 2+4",
         "'*' expression in select list requires FROM clause.");
-    AnalysisError("select a.*", "unknown table: a");
+    AnalysisError("select a.*", "unknown table alias 'a'");
+  }
+
+  @Test
+  public void TestInvalidDecimalPartition() throws AnalysisException {
+    // Test reading from a partitioned table with invalid decimal partition key
+    // values (see IMPALA-1040).
+    AnalysisError("select * from functional.invalid_decimal_part_tbl1",
+        "Failed to load metadata for table: functional.invalid_decimal_part_tbl1");
+    AnalysisError("select * from functional.invalid_decimal_part_tbl2",
+        "Failed to load metadata for table: functional.invalid_decimal_part_tbl2");
+    AnalysisError("select * from functional.invalid_decimal_part_tbl3",
+        "Failed to load metadata for table: functional.invalid_decimal_part_tbl3");
   }
 
   @Test
@@ -136,7 +218,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select a.x from (select count(id) x from functional.AllTypes) a");
     AnalyzesOk("select a.* from (select count(id) from functional.AllTypes) a");
     AnalysisError("select a.id from (select id y from functional_hbase.alltypessmall) a",
-        "unknown column 'id' (table alias 'a')");
+        "couldn't resolve column reference: 'a.id'");
     AnalyzesOk("select * from (select * from functional.AllTypes) a where year = 2009");
     AnalyzesOk("select * from (select * from functional.alltypesagg) a right outer join" +
         "             (select * from functional.alltypessmall) b using (id, int_col) " +
@@ -229,9 +311,26 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select * from (select zip, count(*) " +
         "       from (select * from functional.testtbl) x " +
         "       group by 1 order by count(*) + min(zip) limit 5) x");
+    AnalyzesOk("select * from (select zip, count(*) " +
+        "       from (select * from functional.testtbl) x " +
+        "       group by 1 order by count(*) + min(zip)) x");
+    AnalysisError("select * from (select zip, count(*) " +
+        "       from (select * from functional.testtbl) x " +
+        "       group by 1 offset 5) x",
+        "OFFSET requires an ORDER BY clause: OFFSET 5");
+    AnalysisError("select * from (select zip, count(*) " +
+        "       from (select * from functional.testtbl) x " +
+        "       group by 1 order by count(*) + min(zip) offset 5) x",
+        "Order-by with offset without limit not supported in nested queries");
     AnalyzesOk("select c1, c2 from (select zip c1 , count(*) c2 " +
         "                     from (select * from functional.testtbl) x group by 1) x " +
         "        order by 2, 1 limit 5");
+    AnalyzesOk("select c1, c2 from (select zip c1 , count(*) c2 " +
+        "                     from (select * from functional.testtbl) x group by 1) x " +
+        "        order by 2, 1");
+    AnalyzesOk("select c1, c2 from (select zip c1 , count(*) c2 " +
+        "                     from (select * from functional.testtbl) x group by 1) x " +
+        "        order by 2, 1 offset 5");
 
     // test NULLs
     AnalyzesOk("select * from (select NULL) a");
@@ -262,13 +361,21 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "(select int_col + 6, id from functional.alltypes) b " +
         "on (a.id = b.id)",
         createAnalyzerUsingHiveColLabels(),
-        "Unqualified column reference '_c0' is ambiguous");
+        "unqualified column reference '_c0' is ambiguous");
     // auto-generated column doesn't exist
     AnalysisError("select _c0, a, _c2, _c3 from " +
         "(select int_col * 1, int_col as a, int_col, !bool_col, concat(string_col) " +
         "from functional.alltypes) t",
         createAnalyzerUsingHiveColLabels(),
         "couldn't resolve column reference: '_c2'");
+
+    // Regression test for IMPALA-984.
+    AnalyzesOk("SELECT 1 " +
+        "FROM functional.decimal_tbl AS t1 LEFT JOIN " +
+          "(SELECT SUM(t1.d2) - SUM(t1.d3) as double_col_3, " +
+           "SUM(t1.d2) IS NULL " +
+          "FROM functional.decimal_tbl AS t1) AS t3 " +
+        "ON t3.double_col_3 = t1.d3");
   }
 
   @Test
@@ -303,17 +410,17 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError(
         "select a.int_col from functional.alltypes a " +
         "join functional.alltypes b on (a.int_col = b.badcol)",
-        "unknown column 'badcol'");
+        "couldn't resolve column reference: 'b.badcol'");
     // ambiguous col ref
     AnalysisError(
         "select a.int_col from functional.alltypes a " +
         "join functional.alltypes b on (int_col = int_col)",
-        "Unqualified column reference 'int_col' is ambiguous");
+        "unqualified column reference 'int_col' is ambiguous");
     // unknown alias
     AnalysisError(
         "select a.int_col from functional.alltypes a join functional.alltypes b on " +
         "(a.int_col = badalias.int_col)",
-        "unknown table alias: 'badalias'");
+        "unknown table alias 'badalias' in column reference 'badalias.int_col'");
     // incompatible comparison
     AnalysisError(
         "select a.int_col from functional.alltypes a join " +
@@ -335,7 +442,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "join functional.alltypes c on " +
         "(b.int_col = c.int_col and b.string_col = c.string_col " +
         "and b.bool_col = c.bool_col)",
-        "unknown table alias: 'c'");
+        "unknown table alias 'c' in column reference 'c.int_col'");
 
     // outer joins require ON/USING clause
     AnalyzesOk("select * from functional.alltypes a left outer join " +
@@ -459,6 +566,13 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "from functional.alltypes group by 1");
     AnalyzesOk("select year(timestamp_col), count(*) " +
         "from functional.alltypes group by year(timestamp_col)");
+
+    AnalyzesOk("select round(c1) from functional.decimal_tiny");
+    AnalyzesOk("select round(c1, 2) from functional.decimal_tiny");
+    AnalysisError("select round(c1, cast(c3 as int)) from functional.decimal_tiny",
+        "round() must be called with a constant second argument.");
+    AnalysisError("select truncate(c1, cast(c3 as int)) from functional.decimal_tiny",
+        "truncate() must be called with a constant second argument.");
   }
 
   void addTestUda(String name, ColumnType retType, ColumnType... argTypes) {
@@ -582,7 +696,6 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     }
 
     // Decimal
-    /*
     AnalyzesOk("select min(d1), max(d2), count(d3), sum(d4) "
         + "from functional.decimal_tbl");
     AnalyzesOk("select ndv(d1), distinctpc(d2), distinctpcsa(d3), count(distinct d4) "
@@ -590,7 +703,10 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select avg(d5) from functional.decimal_tbl");
     AnalysisError("select group_concat(d5) from functional.decimal_tbl",
         "No matching function with signature: group_concat(DECIMAL(10,5))");
-        */
+
+    // Test select stmt avg smap.
+    AnalyzesOk("select cast(avg(c1) as decimal(10,4)) as c from " +
+        "functional.decimal_tiny group by c3 having c = 5.1106 order by 1");
   }
 
   @Test
@@ -704,10 +820,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // ok for constants in select list not to be in group by list
     AnalyzesOk("select true, NULL, 1*2+5 as a, zip, count(*) from functional.testtbl " +
         "group by zip");
-
-    // TODO: reneable
-//    AnalyzesOk("select d1, d2, count(*) from functional.decimal_tbl " +
-//        "group by 1, 2");
+    AnalyzesOk("select d1, d2, count(*) from functional.decimal_tbl " +
+        "group by 1, 2");
 
     // doesn't group by all non-agg select list items
     AnalysisError("select zip, count(*) from functional.testtbl",
@@ -725,7 +839,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // arbitrary exprs not returning boolean
     AnalysisError("select count(*) from functional.alltypes " +
         "group by bool_col having 5 + 10 * 5.6",
-        "HAVING clause '5.0 + 10.0 * 5.6' requires return type 'BOOLEAN'. " +
+        "HAVING clause '5 + 10 * 5.6' requires return type 'BOOLEAN'. " +
         "Actual type is 'DOUBLE'.");
     AnalysisError("select count(*) from functional.alltypes " +
         "group by bool_col having int_col",
@@ -791,8 +905,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select zip, id from functional.testtbl order by zip desc");
     AnalyzesOk("select zip, id from functional.testtbl " +
         "order by true asc, false desc, NULL asc");
-
-    //AnalyzesOk("select d1, d2 from functional.decimal_tbl order by d1");
+    AnalyzesOk("select d1, d2 from functional.decimal_tbl order by d1");
 
     // resolves ordinals
     AnalyzesOk("select zip, id from functional.testtbl order by 1");
@@ -809,7 +922,8 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalyzesOk("select zip z, id C, id D from functional.testtbl order by z, C, d");
 
     // can introduce additional aggregates in order by clause
-    AnalyzesOk("select zip, count(*) from functional.testtbl group by 1 order by count(*)");
+    AnalyzesOk("select zip, count(*) from functional.testtbl group by 1 " +
+        " order by count(*)");
     AnalyzesOk("select zip, count(*) from functional.testtbl " +
         "group by 1 order by count(*) + min(zip)");
     AnalysisError("select zip, count(*) from functional.testtbl group by 1 order by id",
@@ -837,6 +951,21 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     AnalysisError("select string_col a, int_col A from " +
         "functional.alltypessmall order by a limit 1",
         "Column a in order clause is ambiguous");
+
+    // Test if an ignored order by produces the expected warning.
+    String warning = "Ignoring ORDER BY clause without LIMIT or OFFSET ";
+    String selectWarning = warning + "in nested query, view or union operand";
+    AnalyzesOk("select * from (select * from functional.alltypes order by int_col) A",
+        selectWarning + ": ORDER BY int_col ASC");
+    AnalyzesOk("select * from functional.alltypes order by int_col desc union all " +
+        "select * from functional.alltypes", selectWarning + ": ORDER BY int_col DESC");
+    String dmlWarning = warning + "in INSERT/CTAS";
+    AnalyzesOk("insert into functional.alltypes partition (year, month) " +
+        "select * from functional.alltypes order by int_col",
+        dmlWarning + ": ORDER BY int_col ASC");
+    AnalyzesOk("create table functional.alltypescopy as " +
+        "select * from functional.alltypes order by int_col",
+        dmlWarning + ": ORDER BY int_col ASC");
   }
 
   @Test
@@ -891,16 +1020,47 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "union select float_col, smallint_col from functional.alltypes " +
         "union select double_col, tinyint_col from functional.alltypes");
 
-    // With order by and limit.
+    // With order by, offset and limit.
     AnalyzesOk("(select int_col from functional.alltypes) " +
         "union (select tinyint_col from functional.alltypessmall) " +
         "order by int_col limit 1");
+    AnalyzesOk("(select int_col from functional.alltypes) " +
+        "union (select tinyint_col from functional.alltypessmall) " +
+        "order by int_col");
+    AnalyzesOk("(select int_col from functional.alltypes) " +
+        "union (select tinyint_col from functional.alltypessmall) " +
+        "order by int_col offset 5");
+    // Order by w/o limit is ignored in the union operand below.
+    AnalyzesOk("select int_col from functional.alltypes order by int_col " +
+        "union (select tinyint_col from functional.alltypessmall) ");
+    AnalysisError("select int_col from functional.alltypes order by int_col offset 5 " +
+        "union (select tinyint_col from functional.alltypessmall) ",
+        "Order-by with offset without limit not supported in nested queries");
+    AnalysisError("select int_col from functional.alltypes offset 5 " +
+        "union (select tinyint_col from functional.alltypessmall) ",
+        "OFFSET requires an ORDER BY clause: OFFSET 5");
+    // Order by w/o limit is ignored in the union operand below.
+    AnalyzesOk("select int_col from functional.alltypes " +
+        "union (select tinyint_col from functional.alltypessmall " +
+        "order by tinyint_col) ");
+    AnalysisError("select int_col from functional.alltypes " +
+        "union (select tinyint_col from functional.alltypessmall " +
+        "order by tinyint_col offset 5) ",
+        "Order-by with offset without limit not supported in nested queries");
+    AnalysisError("select int_col from functional.alltypes " +
+        "union (select tinyint_col from functional.alltypessmall offset 5) ",
+        "OFFSET requires an ORDER BY clause: OFFSET 5");
     // Bigger order by.
     AnalyzesOk("(select tinyint_col, double_col from functional.alltypes) " +
         "union (select smallint_col, float_col from functional.alltypes) " +
         "union (select int_col, bigint_col from functional.alltypes) " +
         "union (select bigint_col, int_col from functional.alltypes) " +
         "order by double_col, tinyint_col");
+    // Multiple union operands with valid order by clauses.
+    AnalyzesOk("select int_col from functional.alltypes order by int_col " +
+        "union select int_col from functional.alltypes order by int_col limit 10 " +
+        "union (select int_col from functional.alltypes " +
+        "order by int_col limit 10 offset 5) order by int_col offset 5");
     // Bigger order by with ordinals.
     AnalyzesOk("(select tinyint_col, double_col from functional.alltypes) " +
         "union (select smallint_col, float_col from functional.alltypes) " +
@@ -956,7 +1116,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
     // Make sure table aliases aren't visible across union operands.
     AnalysisError("select a.smallint_col from functional.alltypes a " +
         "union select a.int_col from functional.alltypessmall",
-        "unknown table alias: 'a'");
+        "unknown table alias 'a' in column reference 'a.int_col'");
   }
 
   @Test
@@ -991,10 +1151,14 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "(3, true, 3, 3, 3, 3, 3.0, 3.0, 'c', 'c', cast(0 as timestamp), 2009, 3))");
     // Test multiple aliases. Values() is like union, the column labels are 'x' and 'y'.
     AnalyzesOk("values((1 as x, 'a' as y), (2 as k, 'b' as j))");
-    // Test order by and limit.
+    // Test order by, offset and limit.
     AnalyzesOk("values(1 as x, 'a') order by 2 limit 10");
     AnalyzesOk("values(1 as x, 'a' as y), (2, 'b') order by y limit 10");
     AnalyzesOk("values((1, 'a'), (2, 'b')) order by 1 limit 10");
+    AnalyzesOk("values((1, 'a'), (2, 'b')) order by 2");
+    AnalyzesOk("values((1, 'a'), (2, 'b')) order by 1 offset 5");
+    AnalysisError("values((1, 'a'), (2, 'b')) offset 5",
+        "OFFSET requires an ORDER BY clause: OFFSET 5");
 
     AnalysisError("values(1, 'a', 1.0, *)",
         "'*' expression in select list requires FROM clause.");
@@ -1152,7 +1316,7 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
         "Duplicate table alias: 't1'");
     // If one was given, we must use the explicit alias for column references.
     AnalysisError("with t1 as (select 'a' x) select t1.x from t1 as t2",
-        "unknown table alias: 't1'");
+        "unknown table alias 't1' in column reference 't1.x'");
     // WITH-clause tables cannot be inserted into.
     AnalysisError("with t1 as (select 'a' x) insert into t1 values('b' x)",
         "Table does not exist: default.t1");
@@ -1853,13 +2017,13 @@ public class AnalyzeStmtsTest extends AnalyzerTest {
    */
   @Test
   public void cloneTest() {
-    testNumberOfMembers(QueryStmt.class, 9);
+    testNumberOfMembers(QueryStmt.class, 10);
     testNumberOfMembers(UnionStmt.class, 7);
     testNumberOfMembers(ValuesStmt.class, 0);
 
     // Also check TableRefs.
-    testNumberOfMembers(TableRef.class, 11);
-    testNumberOfMembers(BaseTableRef.class, 2);
+    testNumberOfMembers(TableRef.class, 12);
+    testNumberOfMembers(BaseTableRef.class, 1);
     testNumberOfMembers(InlineViewRef.class, 6);
     testNumberOfMembers(ViewRef.class, 2);
   }

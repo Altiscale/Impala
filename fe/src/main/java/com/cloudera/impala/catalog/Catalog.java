@@ -14,21 +14,14 @@
 
 package com.cloudera.impala.catalog;
 
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicReference;
 
-import com.cloudera.impala.analysis.ArithmeticExpr;
-import com.cloudera.impala.analysis.BinaryPredicate;
-import com.cloudera.impala.analysis.CaseExpr;
-import com.cloudera.impala.analysis.CastExpr;
-import com.cloudera.impala.analysis.CompoundPredicate;
+import org.apache.log4j.Logger;
+
 import com.cloudera.impala.analysis.FunctionName;
-import com.cloudera.impala.analysis.LikePredicate;
-import com.cloudera.impala.builtins.ScalarBuiltins;
 import com.cloudera.impala.catalog.MetaStoreClientPool.MetaStoreClient;
 import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TFunction;
@@ -37,7 +30,6 @@ import com.cloudera.impala.thrift.TTableName;
 import com.cloudera.impala.util.PatternMatcher;
 import com.google.common.base.Joiner;
 import com.google.common.base.Preconditions;
-import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 
 /**
@@ -59,6 +51,8 @@ import com.google.common.collect.Lists;
  * Builtins are populated on startup in initBuiltins().
  */
 public abstract class Catalog {
+  private static final Logger LOG = Logger.getLogger(Catalog.class);
+
   // Initial catalog version.
   public final static long INITIAL_CATALOG_VERSION = 0L;
   public static final String DEFAULT_DB = "default";
@@ -68,6 +62,10 @@ public abstract class Catalog {
 
   protected final MetaStoreClientPool metaStoreClientPool_ = new MetaStoreClientPool(0);
 
+  // Cache of authorization policy metadata. Populated from data retried from the
+  // Sentry Service, if configured.
+  protected AuthorizationPolicy authPolicy_ = new AuthorizationPolicy();
+
   // Thread safe cache of database metadata. Uses an AtomicReference so reset()
   // operations can atomically swap dbCache_ references.
   // TODO: Update this to use a CatalogObjectCache?
@@ -75,8 +73,16 @@ public abstract class Catalog {
       new AtomicReference<ConcurrentHashMap<String, Db>>(
           new ConcurrentHashMap<String, Db>());
 
-  // Cache of the DB containing the builtins.
+  // DB that contains all builtins
   private static Db builtinsDb_;
+
+  // Cache of data sources.
+  protected final CatalogObjectCache<DataSource> dataSources_;
+
+  // Cache of known HDFS cache pools. Allows for checking the existence
+  // of pools without hitting HDFS.
+  protected final CatalogObjectCache<HdfsCachePool> hdfsCachePools_ =
+      new CatalogObjectCache<HdfsCachePool>(false);
 
   /**
    * Creates a new instance of a Catalog. If initMetastoreClientPool is true, will
@@ -86,10 +92,12 @@ public abstract class Catalog {
     if (initMetastoreClientPool) {
       metaStoreClientPool_.addClients(META_STORE_CLIENT_POOL_SIZE);
     }
-    initBuiltins();
+    dataSources_ = new CatalogObjectCache<DataSource>();
+    builtinsDb_ = new BuiltinsDb(BUILTINS_DB, this);
+    addDb(builtinsDb_);
   }
 
-  public Db getBuiltinsDb() { return builtinsDb_;}
+  public Db getBuiltinsDb() { return builtinsDb_; }
 
   /**
    * Adds a new database to the catalog, replacing any existing database with the same
@@ -178,6 +186,64 @@ public abstract class Catalog {
   }
 
   /**
+   * Adds a data source to the in-memory map of data sources. It is not
+   * persisted to the metastore.
+   * @return true if this item was added or false if the existing value was preserved.
+   */
+  public boolean addDataSource(DataSource dataSource) {
+    return dataSources_.add(dataSource);
+  }
+
+  /**
+   * Removes a data source from the in-memory map of data sources.
+   * @return the item that was removed if it existed in the cache, null otherwise.
+   */
+  public DataSource removeDataSource(String dataSourceName) {
+    Preconditions.checkNotNull(dataSourceName);
+    return dataSources_.remove(dataSourceName.toLowerCase());
+  }
+
+  /**
+   * Gets the specified data source.
+   */
+  public DataSource getDataSource(String dataSourceName) {
+    Preconditions.checkNotNull(dataSourceName);
+    return dataSources_.get(dataSourceName.toLowerCase());
+  }
+
+  /**
+   * Gets a list of all data sources.
+   */
+  public List<DataSource> getDataSources() {
+    return dataSources_.getValues();
+  }
+
+  /**
+   * Returns a list of data sources names that match pattern. See filterStringsByPattern
+   * for details of the pattern match semantics.
+   *
+   * pattern may be null (and thus matches everything).
+   */
+  public List<String> getDataSourceNames(String pattern) {
+    return filterStringsByPattern(dataSources_.keySet(), pattern);
+  }
+
+  /**
+   * Returns a list of data sources that match pattern. See filterStringsByPattern
+   * for details of the pattern match semantics.
+   *
+   * pattern may be null (and thus matches everything).
+   */
+  public List<DataSource> getDataSources(String pattern) {
+    List<String> names = filterStringsByPattern(dataSources_.keySet(), pattern);
+    List<DataSource> dataSources = Lists.newArrayListWithCapacity(names.size());
+    for (String name: names) {
+      dataSources.add(dataSources_.get(name));
+    }
+    return dataSources;
+  }
+
+  /**
    * Adds a function to the catalog.
    * Returns true if the function was successfully added.
    * Returns false if the function already exists.
@@ -226,6 +292,21 @@ public abstract class Catalog {
     Db db = getDb(name.getDb());
     if (db == null) return false;
     return db.containsFunction(name.getFunction());
+  }
+
+  /**
+   * Adds a new HdfsCachePool to the catalog.
+   */
+  public boolean addHdfsCachePool(HdfsCachePool cachePool) {
+    return hdfsCachePools_.add(cachePool);
+  }
+
+  /**
+   * Gets a HdfsCachePool given a cache pool name. Returns null if the cache
+   * pool does not exist.
+   */
+  public HdfsCachePool getHdfsCachePool(String poolName) {
+    return hdfsCachePools_.get(poolName);
   }
 
   /**
@@ -353,288 +434,57 @@ public abstract class Catalog {
         result.setFn(fn.toThrift());
         break;
       }
+      case DATA_SOURCE: {
+        String dataSrcName = objectDesc.getData_source().getName();
+        DataSource dataSrc = getDataSource(dataSrcName);
+        if (dataSrc == null) {
+          throw new CatalogException("Data source not found: " + dataSrcName);
+        }
+        result.setType(dataSrc.getCatalogObjectType());
+        result.setCatalog_version(dataSrc.getCatalogVersion());
+        result.setData_source(dataSrc.toThrift());
+        break;
+      }
+      case HDFS_CACHE_POOL: {
+        HdfsCachePool pool = getHdfsCachePool(objectDesc.getCache_pool().getPool_name());
+        if (pool == null) {
+          throw new CatalogException(
+              "Hdfs cache pool not found: " + objectDesc.getCache_pool().getPool_name());
+        }
+        result.setType(pool.getCatalogObjectType());
+        result.setCatalog_version(pool.getCatalogVersion());
+        result.setCache_pool(pool.toThrift());
+        break;
+      }
+      case ROLE:
+        Role role = authPolicy_.getRole(objectDesc.getRole().getRole_name());
+        if (role == null) {
+          throw new CatalogException("Role not found: " +
+              objectDesc.getRole().getRole_name());
+        }
+        result.setType(role.getCatalogObjectType());
+        result.setCatalog_version(role.getCatalogVersion());
+        result.setRole(role.toThrift());
+        break;
+      case PRIVILEGE:
+        Role tmpRole = authPolicy_.getRole(objectDesc.getPrivilege().getRole_id());
+        if (tmpRole == null) {
+          throw new CatalogException("No role associated with ID: " +
+              objectDesc.getPrivilege().getRole_id());
+        }
+        for (RolePrivilege p: tmpRole.getPrivileges()) {
+          if (p.getName().equals(objectDesc.getPrivilege().getPrivilege_name())) {
+            result.setType(p.getCatalogObjectType());
+            result.setCatalog_version(p.getCatalogVersion());
+            result.setPrivilege(p.toThrift());
+            break;
+          }
+        }
+        throw new CatalogException("Privilege not found: " +
+            objectDesc.getPrivilege().getPrivilege_name());
       default: throw new IllegalStateException(
           "Unexpected TCatalogObject type: " + objectDesc.getType());
     }
     return result;
-  }
-
-  /**
-   * Initializes all the builtins.
-   */
-  private void initBuiltins() {
-    if (builtinsDb_ != null) {
-      // Only in the FE test setup do we hit this case.
-      addDb(builtinsDb_);
-      return;
-    }
-    Preconditions.checkState(getDb(BUILTINS_DB) == null);
-    Preconditions.checkState(builtinsDb_ == null);
-    builtinsDb_ = new Db(BUILTINS_DB, this);
-    builtinsDb_.setIsSystemDb(true);
-    addDb(builtinsDb_);
-
-    // Populate all aggregate builtins.
-    initAggregateBuiltins();
-
-    // Populate all scalar builtins.
-    ArithmeticExpr.initBuiltins(builtinsDb_);
-    BinaryPredicate.initBuiltins(builtinsDb_);
-    CastExpr.initBuiltins(builtinsDb_);
-    CaseExpr.initBuiltins(builtinsDb_);
-    CompoundPredicate.initBuiltins(builtinsDb_);
-    LikePredicate.initBuiltins(builtinsDb_);
-    ScalarBuiltins.initBuiltins(builtinsDb_);
-  }
-
-  private static final Map<ColumnType, String> HLL_UPDATE_SYMBOL =
-      ImmutableMap.<ColumnType, String>builder()
-        .put(ColumnType.BOOLEAN,
-            "9HllUpdateIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.TINYINT,
-            "9HllUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.SMALLINT,
-            "9HllUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.INT,
-            "9HllUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.BIGINT,
-            "9HllUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.FLOAT,
-            "9HllUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.DOUBLE,
-            "9HllUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.STRING,
-            "9HllUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
-        .put(ColumnType.TIMESTAMP,
-            "9HllUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.DECIMAL, "")
-        .build();
-
-  private static final Map<ColumnType, String> PC_UPDATE_SYMBOL =
-      ImmutableMap.<ColumnType, String>builder()
-        .put(ColumnType.BOOLEAN,
-            "8PcUpdateIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.TINYINT,
-            "8PcUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.SMALLINT,
-            "8PcUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.INT,
-            "8PcUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.BIGINT,
-            "8PcUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.FLOAT,
-            "8PcUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.DOUBLE,
-            "8PcUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-        .put(ColumnType.STRING,
-            "8PcUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
-        .put(ColumnType.TIMESTAMP,
-            "8PcUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-         .put(ColumnType.DECIMAL, "")
-        .build();
-
-    private static final Map<ColumnType, String> PCSA_UPDATE_SYMBOL =
-      ImmutableMap.<ColumnType, String>builder()
-          .put(ColumnType.BOOLEAN,
-              "10PcsaUpdateIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.TINYINT,
-              "10PcsaUpdateIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.SMALLINT,
-              "10PcsaUpdateIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.INT,
-              "10PcsaUpdateIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.BIGINT,
-              "10PcsaUpdateIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.FLOAT,
-              "10PcsaUpdateIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.DOUBLE,
-              "10PcsaUpdateIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.STRING,
-              "10PcsaUpdateIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS3_")
-          .put(ColumnType.TIMESTAMP,
-              "10PcsaUpdateIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PNS2_9StringValE")
-          .put(ColumnType.DECIMAL, "")
-          .build();
-
-  private static final Map<ColumnType, String> MIN_UPDATE_SYMBOL =
-      ImmutableMap.<ColumnType, String>builder()
-        .put(ColumnType.BOOLEAN,
-            "3MinIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.TINYINT,
-            "3MinIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.SMALLINT,
-            "3MinIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.INT,
-            "3MinIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.BIGINT,
-            "3MinIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.FLOAT,
-            "3MinIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.DOUBLE,
-            "3MinIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.STRING,
-            "3MinIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.TIMESTAMP,
-            "3MinIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.DECIMAL, "")
-        .build();
-
-  private static final Map<ColumnType, String> MAX_UPDATE_SYMBOL =
-      ImmutableMap.<ColumnType, String>builder()
-        .put(ColumnType.BOOLEAN,
-            "3MaxIN10impala_udf10BooleanValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.TINYINT,
-            "3MaxIN10impala_udf10TinyIntValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.SMALLINT,
-            "3MaxIN10impala_udf11SmallIntValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.INT,
-            "3MaxIN10impala_udf6IntValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.BIGINT,
-            "3MaxIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.FLOAT,
-            "3MaxIN10impala_udf8FloatValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.DOUBLE,
-            "3MaxIN10impala_udf9DoubleValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.STRING,
-            "3MaxIN10impala_udf9StringValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.TIMESTAMP,
-            "3MaxIN10impala_udf12TimestampValEEEvPNS2_15FunctionContextERKT_PS6_")
-        .put(ColumnType.DECIMAL, "")
-        .build();
-
-  // Populate all the aggregate builtins in the catalog.
-  // null symbols indicate the function does not need that step of the evaluation.
-  // An empty symbol indicates a TODO for the BE to implement the function.
-  // TODO: We could also generate this in python but I'm not sure that is easier.
-  private void initAggregateBuiltins() {
-    final String prefix = "_ZN6impala18AggregateFunctions";
-    final String initNullString = prefix +
-        "14InitNullStringEPN10impala_udf15FunctionContextEPNS1_9StringValE";
-    final String initNull = prefix +
-        "8InitNullEPN10impala_udf15FunctionContextEPNS1_6AnyValE";
-    final String stringValSerializeOrFinalize = prefix +
-        "28StringValSerializeOrFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE";
-
-    Db db = builtinsDb_;
-    // Count (*)
-    // TODO: the merge function should be Sum but the way we rewrite distincts
-    // makes that not work.
-    db.addBuiltin(AggregateFunction.createBuiltin(db, "count",
-        new ArrayList<ColumnType>(),
-        ColumnType.BIGINT, ColumnType.BIGINT,
-        prefix + "8InitZeroIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextEPT_",
-        prefix + "15CountStarUpdateEPN10impala_udf15FunctionContextEPNS1_9BigIntValE",
-        prefix + "15CountStarUpdateEPN10impala_udf15FunctionContextEPNS1_9BigIntValE",
-        null, null, false));
-
-    for (ColumnType t : ColumnType.getSupportedTypes()) {
-      if (t.isNull()) continue; // NULL is handled through type promotion.
-      // Count
-      db.addBuiltin(AggregateFunction.createBuiltin(db, "count",
-          Lists.newArrayList(t), ColumnType.BIGINT, ColumnType.BIGINT,
-          prefix + "8InitZeroIN10impala_udf9BigIntValEEEvPNS2_15FunctionContextEPT_",
-          prefix + "11CountUpdateEPN10impala_udf15FunctionContextERKNS1_6AnyValEPNS1_9BigIntValE",
-          prefix + "11CountUpdateEPN10impala_udf15FunctionContextERKNS1_6AnyValEPNS1_9BigIntValE",
-          null, null, false));
-      // Min
-      String minMaxInit = t.isStringType() ? initNullString : initNull;
-      String minMaxSerializeOrFinalize = t.isStringType() ?
-          stringValSerializeOrFinalize : null;
-      db.addBuiltin(AggregateFunction.createBuiltin(db, "min",
-          Lists.newArrayList(t), t, t, minMaxInit,
-          prefix + MIN_UPDATE_SYMBOL.get(t),
-          prefix + MIN_UPDATE_SYMBOL.get(t),
-          minMaxSerializeOrFinalize, minMaxSerializeOrFinalize, true));
-      // Max
-      db.addBuiltin(AggregateFunction.createBuiltin(db, "max",
-          Lists.newArrayList(t), t, t, minMaxInit,
-          prefix + MAX_UPDATE_SYMBOL.get(t),
-          prefix + MAX_UPDATE_SYMBOL.get(t),
-          minMaxSerializeOrFinalize, minMaxSerializeOrFinalize, true));
-      // NDV
-      // TODO: this needs to switch to CHAR(64) as the intermediate type
-      db.addBuiltin(AggregateFunction.createBuiltin(db, "ndv",
-          Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-          prefix + "7HllInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-          prefix + HLL_UPDATE_SYMBOL.get(t),
-          prefix + "8HllMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-          stringValSerializeOrFinalize,
-          prefix + "11HllFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-          true));
-
-      // distinctpc
-      // TODO: this needs to switch to CHAR(64) as the intermediate type
-      db.addBuiltin(AggregateFunction.createBuiltin(db, "distinctpc",
-          Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-          prefix + "6PcInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-          prefix + PC_UPDATE_SYMBOL.get(t),
-          prefix + "7PcMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-          stringValSerializeOrFinalize,
-          prefix + "10PcFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-          true));
-
-      // distinctpcsa
-      // TODO: this needs to switch to CHAR(64) as the intermediate type
-      db.addBuiltin(AggregateFunction.createBuiltin(db, "distinctpcsa",
-          Lists.newArrayList(t), ColumnType.STRING, ColumnType.STRING,
-          prefix + "6PcInitEPN10impala_udf15FunctionContextEPNS1_9StringValE",
-          prefix + PCSA_UPDATE_SYMBOL.get(t),
-          prefix + "7PcMergeEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-          stringValSerializeOrFinalize,
-          prefix + "12PcsaFinalizeEPN10impala_udf15FunctionContextERKNS1_9StringValE",
-          true));
-    }
-
-    // Sum
-    db.addBuiltin(AggregateFunction.createBuiltin(db, "sum",
-        Lists.newArrayList(ColumnType.BIGINT), ColumnType.BIGINT, ColumnType.BIGINT,
-        initNull,
-        prefix + "3SumIN10impala_udf9BigIntValES3_EEvPNS2_15FunctionContextERKT_PT0_",
-        prefix + "3SumIN10impala_udf9BigIntValES3_EEvPNS2_15FunctionContextERKT_PT0_",
-        null, null, false));
-    db.addBuiltin(AggregateFunction.createBuiltin(db, "sum",
-        Lists.newArrayList(ColumnType.DOUBLE), ColumnType.DOUBLE, ColumnType.DOUBLE,
-        initNull,
-        prefix + "3SumIN10impala_udf9DoubleValES3_EEvPNS2_15FunctionContextERKT_PT0_",
-        prefix + "3SumIN10impala_udf9DoubleValES3_EEvPNS2_15FunctionContextERKT_PT0_",
-        null, null, false));
-    db.addBuiltin(AggregateFunction.createBuiltin(db, "sum",
-        Lists.newArrayList(ColumnType.DECIMAL), ColumnType.DECIMAL, ColumnType.DECIMAL,
-        initNull,
-        prefix + "",
-        prefix + "",
-        null, null, false));
-
-    for (ColumnType t: ColumnType.getNumericTypes()) {
-      // Avg
-      // TODO: because of avg rewrite, BE doesn't implement it yet.
-      db.addBuiltin(AggregateFunction.createBuiltin(db, "avg",
-          Lists.newArrayList(t), ColumnType.DOUBLE, ColumnType.DOUBLE,
-          "", "", "", null, "", false));
-    }
-    // Avg(Timestamp)
-    // TODO: why does this make sense? Avg(timestamp) returns a double.
-    db.addBuiltin(AggregateFunction.createBuiltin(db, "avg",
-        Lists.newArrayList(ColumnType.TIMESTAMP),
-        ColumnType.DOUBLE, ColumnType.DOUBLE,
-        "", "", "", null, "", false));
-
-    // Group_concat(string)
-    db.addBuiltin(AggregateFunction.createBuiltin(db, "group_concat",
-        Lists.newArrayList(ColumnType.STRING),
-        ColumnType.STRING, ColumnType.STRING,
-        initNullString,
-        prefix + "12StringConcatEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-        prefix + "12StringConcatEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-        stringValSerializeOrFinalize, stringValSerializeOrFinalize, false));
-    // Group_concat(string, string)
-    db.addBuiltin(AggregateFunction.createBuiltin(db, "group_concat",
-        Lists.newArrayList(ColumnType.STRING, ColumnType.STRING),
-        ColumnType.STRING, ColumnType.STRING,
-        initNullString,
-        prefix +
-            "12StringConcatEPN10impala_udf15FunctionContextERKNS1_9StringValES6_PS4_",
-        prefix + "12StringConcatEPN10impala_udf15FunctionContextERKNS1_9StringValEPS4_",
-        stringValSerializeOrFinalize, stringValSerializeOrFinalize, false));
   }
 }

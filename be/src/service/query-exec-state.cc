@@ -34,6 +34,7 @@ using namespace boost;
 using namespace boost::uuids;
 using namespace beeswax;
 using namespace strings;
+using namespace apache::hive::service::cli::thrift;
 
 DECLARE_int32(catalog_service_port);
 DECLARE_string(catalog_service_host);
@@ -49,9 +50,9 @@ static const string PER_HOST_VCORES_KEY = "Estimated Per-Host VCores";
 static const string TABLES_MISSING_STATS_KEY = "Tables Missing Stats";
 
 ImpalaServer::QueryExecState::QueryExecState(
-    const TQueryContext& query_ctxt, ExecEnv* exec_env, Frontend* frontend,
+    const TQueryCtx& query_ctx, ExecEnv* exec_env, Frontend* frontend,
     ImpalaServer* server, shared_ptr<SessionState> session)
-  : query_ctxt_(query_ctxt),
+  : query_ctx_(query_ctx),
     last_active_time_(numeric_limits<int64_t>::max()),
     ref_count_(0L),
     exec_env_(exec_env),
@@ -76,14 +77,6 @@ ImpalaServer::QueryExecState::QueryExecState(
   query_events_->Start();
   profile_.AddChild(&summary_profile_);
 
-  // Creating a random_generator every time is not free, but
-  // benchmarks show it to be slightly cheaper than contending for a
-  // single generator under a lock (since random_generator is not
-  // thread-safe).
-  random_generator uuid_generator;
-  uuid query_uuid = uuid_generator();
-  UUIDToTUniqueId(query_uuid, &query_id_);
-
   profile_.set_name("Query (id=" + PrintId(query_id()) + ")");
   summary_profile_.AddInfoString("Session ID", PrintId(session_id()));
   summary_profile_.AddInfoString("Session Type", PrintTSessionType(session_type()));
@@ -93,11 +86,13 @@ ImpalaServer::QueryExecState::QueryExecState(
   summary_profile_.AddInfoString("Query State", PrintQueryState(query_state_));
   summary_profile_.AddInfoString("Query Status", "OK");
   summary_profile_.AddInfoString("Impala Version", GetVersionString(/* compact */ true));
-  summary_profile_.AddInfoString("User", connected_user());
+  summary_profile_.AddInfoString("User", effective_user());
+  summary_profile_.AddInfoString("Connected User", connected_user());
+  summary_profile_.AddInfoString("Delegated User", do_as_user());
   summary_profile_.AddInfoString("Network Address",
       lexical_cast<string>(session_->network_address));
   summary_profile_.AddInfoString("Default Db", default_db());
-  summary_profile_.AddInfoString("Sql Statement", query_ctxt_.request.stmt);
+  summary_profile_.AddInfoString("Sql Statement", query_ctx_.request.stmt);
 }
 
 Status ImpalaServer::QueryExecState::SetResultCache(QueryResultSet* cache,
@@ -183,7 +178,7 @@ Status ImpalaServer::QueryExecState::ExecLocalCatalogOp(
           params->__isset.show_pattern ? &(params->show_pattern) : NULL;
       TGetTablesResult table_names;
       RETURN_IF_ERROR(frontend_->GetTableNames(params->db, table_name,
-          &query_ctxt_.session, &table_names));
+          &query_ctx_.session, &table_names));
       SetResultSet(table_names.tables);
       return Status::OK;
     }
@@ -193,8 +188,19 @@ Status ImpalaServer::QueryExecState::ExecLocalCatalogOp(
       const string* db_pattern =
           params->__isset.show_pattern ? (&params->show_pattern) : NULL;
       RETURN_IF_ERROR(
-          frontend_->GetDbNames(db_pattern, &query_ctxt_.session, &db_names));
+          frontend_->GetDbNames(db_pattern, &query_ctx_.session, &db_names));
       SetResultSet(db_names.dbs);
+      return Status::OK;
+    }
+    case TCatalogOpType::SHOW_DATA_SRCS: {
+      const TShowDataSrcsParams* params = &catalog_op.show_data_srcs_params;
+      TGetDataSrcsResult result;
+      const string* pattern =
+          params->__isset.show_pattern ? (&params->show_pattern) : NULL;
+      RETURN_IF_ERROR(
+          frontend_->GetDataSrcMetadata(pattern, &result));
+      SetResultSet(result.data_src_names, result.locations, result.class_names,
+          result.api_versions);
       return Status::OK;
     }
     case TCatalogOpType::SHOW_STATS: {
@@ -212,7 +218,7 @@ Status ImpalaServer::QueryExecState::ExecLocalCatalogOp(
       const string* fn_pattern =
           params->__isset.show_pattern ? (&params->show_pattern) : NULL;
       RETURN_IF_ERROR(frontend_->GetFunctions(
-          params->type, params->db, fn_pattern, &query_ctxt_.session, &functions));
+          params->type, params->db, fn_pattern, &query_ctx_.session, &functions));
       SetResultSet(functions.fn_ret_types, functions.fn_signatures);
       return Status::OK;
     }
@@ -264,10 +270,10 @@ Status ImpalaServer::QueryExecState::ExecQueryOrDmlRequest(
     ss << query_exec_request.per_host_vcores;
     summary_profile_.AddInfoString(PER_HOST_VCORES_KEY, ss.str());
   }
-  if (query_exec_request.query_ctxt.__isset.tables_missing_stats &&
-      !query_exec_request.query_ctxt.tables_missing_stats.empty()) {
+  if (query_exec_request.query_ctx.__isset.tables_missing_stats &&
+      !query_exec_request.query_ctx.tables_missing_stats.empty()) {
     stringstream ss;
-    const vector<TTableName>& tbls = query_exec_request.query_ctxt.tables_missing_stats;
+    const vector<TTableName>& tbls = query_exec_request.query_ctx.tables_missing_stats;
     for (int i = 0; i < tbls.size(); ++i) {
       if (i != 0) ss << ",";
       ss << tbls[i].db_name << "." << tbls[i].table_name;
@@ -298,9 +304,8 @@ Status ImpalaServer::QueryExecState::ExecQueryOrDmlRequest(
   if (FLAGS_enable_rm) {
     DCHECK(exec_env_->resource_broker() != NULL);
   }
-  schedule_.reset(new QuerySchedule(query_id_, query_exec_request,
-          exec_request_.query_options, &summary_profile_, query_events_));
-
+  schedule_.reset(new QuerySchedule(query_id(), query_exec_request,
+      exec_request_.query_options, effective_user(), &summary_profile_, query_events_));
   coord_.reset(new Coordinator(exec_env_));
   Status status = exec_env_->scheduler()->Schedule(coord_.get(), schedule_.get());
   summary_profile_.AddInfoString("Request Pool", schedule_->request_pool());
@@ -353,8 +358,10 @@ Status ImpalaServer::QueryExecState::ExecDdlRequest() {
     // Add child queries for computing table and column stats.
     child_queries_.push_back(
         ChildQuery(compute_stats_params.tbl_stats_query, this, parent_server_));
-    child_queries_.push_back(
-        ChildQuery(compute_stats_params.col_stats_query, this, parent_server_));
+    if (compute_stats_params.__isset.col_stats_query) {
+      child_queries_.push_back(
+          ChildQuery(compute_stats_params.col_stats_query, this, parent_server_));
+    }
     ExecChildQueriesAsync();
     return Status::OK;
   }
@@ -436,8 +443,8 @@ Status ImpalaServer::QueryExecState::Wait() {
 
   RETURN_IF_ERROR(WaitForChildQueries());
   if (coord_.get() != NULL) {
-    Expr::Open(output_exprs_, coord_->runtime_state());
     RETURN_IF_ERROR(coord_->Wait());
+    RETURN_IF_ERROR(Expr::Open(output_exprs_, coord_->runtime_state()));
     RETURN_IF_ERROR(UpdateCatalog());
   }
 
@@ -602,7 +609,7 @@ Status ImpalaServer::QueryExecState::FetchRowsInternal(const int32_t max_rows,
     }
     int64_t delta_bytes =
         fetched_rows->BytesSize(num_rows_fetched_from_cache, fetched_rows->size());
-    MemTracker* query_mem_tracker = coord_->runtime_state()->query_mem_tracker();
+    MemTracker* query_mem_tracker = coord_->query_mem_tracker();
     // Count the cached rows towards the mem limit.
     if (!query_mem_tracker->TryConsume(delta_bytes)) {
       return coord_->runtime_state()->SetMemLimitExceeded(
@@ -723,7 +730,7 @@ void ImpalaServer::QueryExecState::SetResultSet(const vector<string>& results) {
   for (int i = 0; i < results.size(); ++i) {
     (*request_result_set_.get())[i].__isset.colVals = true;
     (*request_result_set_.get())[i].colVals.resize(1);
-    (*request_result_set_.get())[i].colVals[0].__set_stringVal(results[i]);
+    (*request_result_set_.get())[i].colVals[0].__set_string_val(results[i]);
   }
 }
 
@@ -736,27 +743,43 @@ void ImpalaServer::QueryExecState::SetResultSet(const vector<string>& col1,
   for (int i = 0; i < col1.size(); ++i) {
     (*request_result_set_.get())[i].__isset.colVals = true;
     (*request_result_set_.get())[i].colVals.resize(2);
-    (*request_result_set_.get())[i].colVals[0].__set_stringVal(col1[i]);
-    (*request_result_set_.get())[i].colVals[1].__set_stringVal(col2[i]);
+    (*request_result_set_.get())[i].colVals[0].__set_string_val(col1[i]);
+    (*request_result_set_.get())[i].colVals[1].__set_string_val(col2[i]);
+  }
+}
+
+void ImpalaServer::QueryExecState::SetResultSet(const vector<string>& col1,
+    const vector<string>& col2, const vector<string>& col3, const vector<string>& col4) {
+  DCHECK_EQ(col1.size(), col2.size());
+  DCHECK_EQ(col1.size(), col3.size());
+  DCHECK_EQ(col1.size(), col4.size());
+
+  request_result_set_.reset(new vector<TResultRow>);
+  request_result_set_->resize(col1.size());
+  for (int i = 0; i < col1.size(); ++i) {
+    (*request_result_set_.get())[i].__isset.colVals = true;
+    (*request_result_set_.get())[i].colVals.resize(4);
+    (*request_result_set_.get())[i].colVals[0].__set_string_val(col1[i]);
+    (*request_result_set_.get())[i].colVals[1].__set_string_val(col2[i]);
+    (*request_result_set_.get())[i].colVals[2].__set_string_val(col3[i]);
+    (*request_result_set_.get())[i].colVals[3].__set_string_val(col4[i]);
   }
 }
 
 void ImpalaServer::QueryExecState::SetCreateTableAsSelectResultSet() {
   DCHECK(ddl_type() == TDdlType::CREATE_TABLE_AS_SELECT);
-  int total_num_rows_inserted = 0;
-  // There will only be rows inserted in the case a new table was created
-  // as part of this operation.
+  int64_t total_num_rows_inserted = 0;
+  // There will only be rows inserted in the case a new table was created as part of this
+  // operation.
   if (catalog_op_executor_->ddl_exec_response()->new_table_created) {
     DCHECK(coord_.get());
-    BOOST_FOREACH(const PartitionRowCount::value_type& p,
-        coord_->partition_row_counts()) {
-      total_num_rows_inserted += p.second;
+    BOOST_FOREACH(const PartitionStatusMap::value_type& p, coord_->per_partition_status()) {
+      total_num_rows_inserted += p.second.num_appended_rows;
     }
   }
-  stringstream ss;
-  ss << "Inserted " << total_num_rows_inserted << " row(s)";
-  VLOG_QUERY << ss.str();
-  vector<string> results(1, ss.str());
+  const string& summary_msg = Substitute("Inserted $0 row(s)", total_num_rows_inserted);
+  VLOG_QUERY << summary_msg;
+  vector<string> results(1, summary_msg);
   SetResultSet(results);
 }
 
@@ -778,14 +801,25 @@ void ImpalaServer::QueryExecState::MarkActive() {
 }
 
 Status ImpalaServer::QueryExecState::UpdateTableAndColumnStats() {
-  DCHECK(child_queries_.size() == 2);
+  DCHECK_GE(child_queries_.size(), 1);
+  DCHECK_LE(child_queries_.size(), 2);
   catalog_op_executor_.reset(new CatalogOpExecutor(exec_env_, frontend_));
+
+  // If there was no column stats query, pass in empty thrift structures to
+  // ExecComputeStats(). Otherwise pass in the column stats result.
+  TTableSchema col_stats_schema;
+  TRowSet col_stats_data;
+  if (child_queries_.size() > 1) {
+    col_stats_schema = child_queries_[1].result_schema();
+    col_stats_data = child_queries_[1].result_data();
+  }
+
   Status status = catalog_op_executor_->ExecComputeStats(
       exec_request_.catalog_op_request.ddl_params.compute_stats_params,
       child_queries_[0].result_schema(),
       child_queries_[0].result_data(),
-      child_queries_[1].result_schema(),
-      child_queries_[1].result_data());
+      col_stats_schema,
+      col_stats_data);
   {
     lock_guard<mutex> l(lock_);
     RETURN_IF_ERROR(UpdateQueryStatus(status));
@@ -839,7 +873,8 @@ void ImpalaServer::QueryExecState::ClearResultCache() {
   int64_t total_bytes = result_cache_->BytesSize();
   ImpaladMetrics::RESULTSET_CACHE_TOTAL_BYTES->Increment(-total_bytes);
   if (coord_ != NULL) {
-    coord_->runtime_state()->query_mem_tracker()->Release(total_bytes);
+    DCHECK_NOTNULL(coord_->query_mem_tracker());
+    coord_->query_mem_tracker()->Release(total_bytes);
   }
   result_cache_.reset(NULL);
 }

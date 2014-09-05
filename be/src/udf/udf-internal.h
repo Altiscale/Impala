@@ -21,6 +21,9 @@
 #include <string>
 #include <string.h>
 #include <vector>
+
+// Be very careful when adding Impala includes in this file. We don't want to pull
+// in unnecessary dependencies for the development libs.
 #include "udf/udf.h"
 
 namespace impala {
@@ -62,6 +65,8 @@ class FunctionContextImpl {
   bool debug() { return debug_; }
   bool closed() { return closed_; }
 
+  static const char* LLVM_FUNCTIONCONTEXT_NAME;
+
  private:
   friend class impala_udf::FunctionContext;
 
@@ -88,6 +93,7 @@ class FunctionContextImpl {
 
   // Allocations made and still owned by the user function.
   std::map<uint8_t*, int> allocations_;
+  // Allocations owned by Impala.
   std::vector<uint8_t*> local_allocations_;
 
   // The function state accessed via FunctionContext::Get/SetFunctionState()

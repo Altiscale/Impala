@@ -27,11 +27,13 @@
 #include "exec/hash-join-node.h"
 #include "exec/hdfs-scan-node.h"
 #include "exec/hbase-scan-node.h"
+#include "exec/data-source-scan-node.h"
 #include "exec/exchange-node.h"
-#include "exec/merge-node.h"
+#include "exec/union-node.h"
 #include "exec/cross-join-node.h"
 #include "exec/topn-node.h"
 #include "exec/select-node.h"
+#include "exec/sort-node.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/mem-pool.h"
@@ -207,7 +209,7 @@ Status ExecNode::CreateTreeHelper(
   } else {
     *root = node;
   }
-  for (int i = 0; i < num_children; i++) {
+  for (int i = 0; i < num_children; ++i) {
     ++*node_idx;
     RETURN_IF_ERROR(CreateTreeHelper(pool, tnodes, descs, node, node_idx, NULL));
     // we are expecting a child, but have used all nodes
@@ -239,6 +241,9 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
     case TPlanNodeType::HBASE_SCAN_NODE:
       *node = pool->Add(new HBaseScanNode(pool, tnode, descs));
       break;
+    case TPlanNodeType::DATA_SOURCE_NODE:
+      *node = pool->Add(new DataSourceScanNode(pool, tnode, descs));
+      break;
     case TPlanNodeType::AGGREGATION_NODE:
       *node = pool->Add(new AggregationNode(pool, tnode, descs));
       break;
@@ -258,14 +263,11 @@ Status ExecNode::CreateNode(ObjectPool* pool, const TPlanNode& tnode,
       if (tnode.sort_node.use_top_n) {
         *node = pool->Add(new TopNNode(pool, tnode, descs));
       } else {
-        // TODO: Need Sort Node
-        //  *node = pool->Add(new SortNode(pool, tnode, descs));
-        error_msg << "ORDER BY with no LIMIT not implemented";
-        return Status(error_msg.str());
+        *node = pool->Add(new SortNode(pool, tnode, descs));
       }
       break;
-    case TPlanNodeType::MERGE_NODE:
-      *node = pool->Add(new MergeNode(pool, tnode, descs));
+    case TPlanNodeType::UNION_NODE:
+      *node = pool->Add(new UnionNode(pool, tnode, descs));
       break;
     default:
       map<int, const char*>::const_iterator i =

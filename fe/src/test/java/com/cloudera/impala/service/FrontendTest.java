@@ -25,7 +25,7 @@ import com.cloudera.impala.testutil.ImpaladTestCatalog;
 import com.cloudera.impala.testutil.TestUtils;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpcode;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TQueryCtx;
 import com.cloudera.impala.thrift.TResultRow;
 import com.cloudera.impala.thrift.TResultSet;
 import com.google.common.collect.Lists;
@@ -47,16 +47,16 @@ public class FrontendTest {
   @Test
   public void TestCatalogNotReady() throws ImpalaException {
     Frontend fe = new Frontend(AuthorizationConfig.createAuthDisabledConfig());
-    TQueryContext queryCtxt = TestUtils.createQueryContext("default", "fake_user");
+    TQueryCtx queryCtx = TestUtils.createQueryContext("default", "fake_user");
 
     // Queries that do not touch catalog objects should succeed.
-    queryCtxt.request.setStmt("select 1");
-    fe.createExecRequest(queryCtxt, new StringBuilder());
+    queryCtx.request.setStmt("select 1");
+    fe.createExecRequest(queryCtx, new StringBuilder());
 
     // A query that touches a catalog object should fail.
-    queryCtxt.request.setStmt("show tables");
+    queryCtx.request.setStmt("show tables");
     try {
-      fe.createExecRequest(queryCtxt, new StringBuilder());
+      fe.createExecRequest(queryCtx, new StringBuilder());
       fail("Expected failure to due uninitialized catalog.");
     } catch (AnalysisException e) {
       assertEquals("This Impala daemon is not ready to accept user requests. " +
@@ -92,7 +92,7 @@ public class FrontendTest {
     assertEquals(2, resp.schema.columns.size());
     assertEquals(2, resp.rows.get(0).colVals.size());
     assertEquals(1, resp.rows.size());
-    assertEquals("default", resp.rows.get(0).colVals.get(0).stringVal.toLowerCase());
+    assertEquals("default", resp.rows.get(0).colVals.get(0).string_val.toLowerCase());
   }
 
   @Test
@@ -108,7 +108,7 @@ public class FrontendTest {
     assertEquals(5, resp.schema.columns.size());
     assertEquals(5, resp.rows.get(0).colVals.size());
     assertEquals(1, resp.rows.size());
-    assertEquals("alltypes", resp.rows.get(0).colVals.get(2).stringVal.toLowerCase());
+    assertEquals("alltypes", resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
   }
 
   @Test
@@ -129,9 +129,9 @@ public class FrontendTest {
     assertEquals(23, resp.rows.get(0).colVals.size());
     assertEquals(1, resp.rows.size());
     TResultRow row = resp.rows.get(0);
-    assertEquals("functional", row.colVals.get(1).stringVal.toLowerCase());
-    assertEquals("alltypes", row.colVals.get(2).stringVal.toLowerCase());
-    assertEquals("string_col", row.colVals.get(3).stringVal.toLowerCase());
+    assertEquals("functional", row.colVals.get(1).string_val.toLowerCase());
+    assertEquals("alltypes", row.colVals.get(2).string_val.toLowerCase());
+    assertEquals("string_col", row.colVals.get(3).string_val.toLowerCase());
   }
 
   @Test
@@ -157,7 +157,7 @@ public class FrontendTest {
     assertEquals(1, resp.schema.columns.size());
     assertEquals(1, resp.rows.get(0).colVals.size());
     assertEquals(1, resp.rows.size());
-    assertEquals("TABLE", resp.rows.get(0).getColVals().get(0).stringVal);
+    assertEquals("TABLE", resp.rows.get(0).getColVals().get(0).string_val);
   }
 
   @Test
@@ -175,7 +175,7 @@ public class FrontendTest {
 
     Set<String> fns = Sets.newHashSet();
     for (TResultRow row: resp.rows) {
-      String fn = row.colVals.get(2).stringVal.toLowerCase();
+      String fn = row.colVals.get(2).string_val.toLowerCase();
       fns.add(fn);
     }
     assertEquals(3, fns.size());

@@ -19,11 +19,12 @@
 #include <string>
 
 #include <boost/functional/hash.hpp>
+#include <math.h>
 
 #include "common/logging.h"
-#include "runtime/primitive-type.h"
 #include "runtime/string-value.inline.h"
 #include "runtime/timestamp-value.h"
+#include "runtime/types.h"
 #include "util/hash-util.h"
 
 namespace impala {
@@ -132,8 +133,22 @@ inline bool RawValue::Eq(const void* v1, const void* v2, const ColumnType& type)
     case TYPE_CHAR:
       return StringCompare(reinterpret_cast<const char*>(v1), type.len,
           reinterpret_cast<const char*>(v2), type.len, type.len) == 0;
+    case TYPE_DECIMAL:
+      switch (type.GetByteSize()) {
+        case 4:
+          return reinterpret_cast<const Decimal4Value*>(v1)->value()
+              == reinterpret_cast<const Decimal4Value*>(v2)->value();
+        case 8:
+          return reinterpret_cast<const Decimal8Value*>(v1)->value()
+              == reinterpret_cast<const Decimal8Value*>(v2)->value();
+        case 16:
+          return reinterpret_cast<const Decimal16Value*>(v1)->value()
+              == reinterpret_cast<const Decimal16Value*>(v2)->value();
+        default:
+          break;
+      }
     default:
-      DCHECK(false);
+      DCHECK(false) << type;
       return 0;
   };
 }
@@ -159,6 +174,7 @@ inline uint32_t RawValue::GetHashValue(const void* v, const ColumnType& type,
     case TYPE_DOUBLE: return HashUtil::Hash(v, 8, seed);
     case TYPE_TIMESTAMP: return HashUtil::Hash(v, 12, seed);
     case TYPE_CHAR: return HashUtil::Hash(v, type.len, seed);
+    case TYPE_DECIMAL: return HashUtil::Hash(v, type.GetByteSize(), seed);
     default:
       DCHECK(false);
       return 0;
@@ -184,6 +200,7 @@ inline uint32_t RawValue::GetHashValueFnv(const void* v, const ColumnType& type,
     case TYPE_DOUBLE: return HashUtil::FnvHash64to32(v, 8, seed);
     case TYPE_TIMESTAMP: return HashUtil::FnvHash64to32(v, 12, seed);
     case TYPE_CHAR: return HashUtil::FnvHash64to32(v, type.len, seed);
+    case TYPE_DECIMAL: return HashUtil::FnvHash64to32(v, type.GetByteSize(), seed);
     default:
       DCHECK(false);
       return 0;
@@ -227,10 +244,32 @@ inline void RawValue::PrintValue(const void* value, const ColumnType& type, int 
       *stream << *reinterpret_cast<const int64_t*>(value);
       break;
     case TYPE_FLOAT:
-      *stream << *reinterpret_cast<const float*>(value);
+      {
+        float val = *reinterpret_cast<const float*>(value);
+        if (LIKELY(std::isfinite(val))) {
+          *stream << val;
+        } else if (isinf(val)) {
+          // 'Infinity' is Java's text representation of inf. By staying close to Java, we
+          // allow Hive to read text tables containing non-finite values produced by
+          // Impala. (The same logic applies to 'NaN', below).
+          *stream << (val < 0 ? "-Infinity" : "Infinity");
+        } else if (isnan(val)) {
+          *stream << "NaN";
+        }
+      }
       break;
     case TYPE_DOUBLE:
-      *stream << *reinterpret_cast<const double*>(value);
+      {
+        double val = *reinterpret_cast<const double*>(value);
+        if (LIKELY(std::isfinite(val))) {
+          *stream << val;
+        } else if (isinf(val)) {
+          // See TYPE_FLOAT for rationale.
+          *stream << (val < 0 ? "-Infinity" : "Infinity");
+        } else if (isnan(val)) {
+          *stream << "NaN";
+        }
+      }
       break;
     case TYPE_STRING:
       string_val = reinterpret_cast<const StringValue*>(value);
@@ -241,6 +280,21 @@ inline void RawValue::PrintValue(const void* value, const ColumnType& type, int 
       break;
     case TYPE_CHAR:
       stream->write(static_cast<const char*>(value), type.len);
+      break;
+    case TYPE_DECIMAL:
+      switch (type.GetByteSize()) {
+        case 4:
+          *stream << reinterpret_cast<const Decimal4Value*>(value)->ToString(type);
+          break;
+        case 8:
+          *stream << reinterpret_cast<const Decimal8Value*>(value)->ToString(type);
+          break;
+        case 16:
+          *stream << reinterpret_cast<const Decimal16Value*>(value)->ToString(type);
+          break;
+        default:
+          DCHECK(false) << type;
+      }
       break;
     default:
       DCHECK(false);

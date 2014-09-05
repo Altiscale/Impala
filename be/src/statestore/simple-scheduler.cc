@@ -633,13 +633,15 @@ void SimpleScheduler::ComputeFragmentExecParams(const TQueryExecRequest& exec_re
     // set # of senders
     DCHECK(exec_request.fragments[i].output_sink.__isset.stream_sink);
     const TDataStreamSink& sink = exec_request.fragments[i].output_sink.stream_sink;
-    // we can only handle unpartitioned (= broadcast) and hash-partitioned
-    // output at the moment
+    // we can only handle unpartitioned (= broadcast), random-partitioned or
+    // hash-partitioned output at the moment
     DCHECK(sink.output_partition.type == TPartitionType::UNPARTITIONED
-           || sink.output_partition.type == TPartitionType::HASH_PARTITIONED);
+           || sink.output_partition.type == TPartitionType::HASH_PARTITIONED
+           || sink.output_partition.type == TPartitionType::RANDOM);
     PlanNodeId exch_id = sink.dest_node_id;
     // we might have multiple fragments sending to this exchange node
     // (distributed MERGE), which is why we need to add up the #senders
+    params.sender_id_base = dest_params.per_exch_num_senders[exch_id];
     dest_params.per_exch_num_senders[exch_id] += params.hosts.size();
 
     // create one TPlanFragmentDestination per destination host
@@ -663,6 +665,7 @@ void SimpleScheduler::ComputeFragmentHosts(const TQueryExecRequest& exec_request
   vector<TPlanNodeType::type> scan_node_types;
   scan_node_types.push_back(TPlanNodeType::HDFS_SCAN_NODE);
   scan_node_types.push_back(TPlanNodeType::HBASE_SCAN_NODE);
+  scan_node_types.push_back(TPlanNodeType::DATA_SOURCE_NODE);
 
   unordered_set<TNetworkAddress> unique_hosts;
   // compute hosts of producer fragment before those of consumer fragment(s),
@@ -673,6 +676,41 @@ void SimpleScheduler::ComputeFragmentHosts(const TQueryExecRequest& exec_request
     if (fragment.partition.type == TPartitionType::UNPARTITIONED) {
       // all single-node fragments run on the coordinator host
       params.hosts.push_back(coord);
+      continue;
+    }
+
+    // UnionNodes are special because they can consume multiple partitioned inputs,
+    // as well as execute multiple scans in the same fragment.
+    // Fragments containing a UnionNode are executed on the union of hosts of all
+    // scans in the fragment as well as the hosts of all its input fragments (s.t.
+    // a UnionNode with partitioned joins or grouping aggregates as children runs on
+    // at least as many hosts as the input to those children).
+    if (ContainsNode(fragment.plan, TPlanNodeType::UNION_NODE)) {
+      vector<TPlanNodeId> scan_nodes;
+      FindNodes(fragment.plan, scan_node_types, &scan_nodes);
+      vector<TPlanNodeId> exch_nodes;
+      FindNodes(fragment.plan,
+          vector<TPlanNodeType::type>(1, TPlanNodeType::EXCHANGE_NODE),
+          &exch_nodes);
+
+      // Add hosts of scan nodes.
+      vector<TNetworkAddress> scan_hosts;
+      for (int j = 0; j < scan_nodes.size(); ++j) {
+        GetScanHosts(scan_nodes[j], exec_request, params, &scan_hosts);
+      }
+      unordered_set<TNetworkAddress> hosts(scan_hosts.begin(), scan_hosts.end());
+
+      // Add hosts of input fragments.
+      for (int j = 0; j < exch_nodes.size(); ++j) {
+        int input_fragment_idx = FindSenderFragment(exch_nodes[j], i, exec_request);
+        const vector<TNetworkAddress>& input_fragment_hosts =
+            (*fragment_exec_params)[input_fragment_idx].hosts;
+        hosts.insert(input_fragment_hosts.begin(), input_fragment_hosts.end());
+      }
+      DCHECK(!hosts.empty()) << "no hosts for fragment " << i << " with a UnionNode";
+
+      // Set unique hosts in the fragment's params.
+      params.hosts.assign(hosts.begin(), hosts.end());
       continue;
     }
 
@@ -690,29 +728,16 @@ void SimpleScheduler::ComputeFragmentHosts(const TQueryExecRequest& exec_request
       continue;
     }
 
-    map<TPlanNodeId, vector<TScanRangeLocations> >::const_iterator entry =
-        exec_request.per_node_scan_ranges.find(leftmost_scan_id);
-    if (entry == exec_request.per_node_scan_ranges.end() || entry->second.empty()) {
-      // this scan node doesn't have any scan ranges; run it on the coordinator
-      // TODO: we'll need to revisit this strategy once we can partition joins
-      // (in which case this fragment might be executing a right outer join
-      // with a large build table)
-      params.hosts.push_back(coord);
-      continue;
-    }
-
-    // Get the list of impalad host from scan_range_assignment_
-    BOOST_FOREACH(const FragmentScanRangeAssignment::value_type& scan_range_assignment,
-        params.scan_range_assignment) {
-      params.hosts.push_back(scan_range_assignment.first);
-      unique_hosts.insert(scan_range_assignment.first);
-    }
+    // This fragment is executed on those hosts that have scan ranges
+    // for the leftmost scan.
+    GetScanHosts(leftmost_scan_id, exec_request, params, &params.hosts);
+    unique_hosts.insert(params.hosts.begin(), params.hosts.end());
   }
   schedule->SetUniqueHosts(unique_hosts);
 }
 
 PlanNodeId SimpleScheduler::FindLeftmostNode(
-    const TPlan& plan, const std::vector<TPlanNodeType::type>& types) {
+    const TPlan& plan, const vector<TPlanNodeType::type>& types) {
   // the first node with num_children == 0 is the leftmost node
   int node_idx = 0;
   while (node_idx < plan.nodes.size() && plan.nodes[node_idx].num_children != 0) {
@@ -729,6 +754,46 @@ PlanNodeId SimpleScheduler::FindLeftmostNode(
   return g_ImpalaInternalService_constants.INVALID_PLAN_NODE_ID;
 }
 
+bool SimpleScheduler::ContainsNode(const TPlan& plan, TPlanNodeType::type type) {
+  for (int i = 0; i < plan.nodes.size(); ++i) {
+    if (plan.nodes[i].node_type == type) return true;
+  }
+  return false;
+}
+
+void SimpleScheduler::FindNodes(const TPlan& plan,
+    const vector<TPlanNodeType::type>& types, vector<TPlanNodeId>* results) {
+  for (int i = 0; i < plan.nodes.size(); ++i) {
+    for (int j = 0; j < types.size(); ++j) {
+      if (plan.nodes[i].node_type == types[j]) {
+        results->push_back(plan.nodes[i].node_id);
+        break;
+      }
+    }
+  }
+}
+
+void SimpleScheduler::GetScanHosts(TPlanNodeId scan_id,
+    const TQueryExecRequest& exec_request, const FragmentExecParams& params,
+    vector<TNetworkAddress>* scan_hosts) {
+  map<TPlanNodeId, vector<TScanRangeLocations> >::const_iterator entry =
+      exec_request.per_node_scan_ranges.find(scan_id);
+  if (entry == exec_request.per_node_scan_ranges.end() || entry->second.empty()) {
+    // this scan node doesn't have any scan ranges; run it on the coordinator
+    // TODO: we'll need to revisit this strategy once we can partition joins
+    // (in which case this fragment might be executing a right outer join
+    // with a large build table)
+    scan_hosts->push_back(MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port));
+    return;
+  }
+
+  // Get the list of impalad host from scan_range_assignment_
+  BOOST_FOREACH(const FragmentScanRangeAssignment::value_type& scan_range_assignment,
+      params.scan_range_assignment) {
+    scan_hosts->push_back(scan_range_assignment.first);
+  }
+}
+
 int SimpleScheduler::FindLeftmostInputFragment(
     int fragment_idx, const TQueryExecRequest& exec_request) {
   // find the leftmost node, which we expect to be an exchage node
@@ -739,8 +804,12 @@ int SimpleScheduler::FindLeftmostInputFragment(
   if (exch_id == g_ImpalaInternalService_constants.INVALID_PLAN_NODE_ID) {
     return g_ImpalaInternalService_constants.INVALID_PLAN_NODE_ID;
   }
-
   // find the fragment that sends to this exchange node
+  return FindSenderFragment(exch_id, fragment_idx, exec_request);
+}
+
+int SimpleScheduler::FindSenderFragment(TPlanNodeId exch_id, int fragment_idx,
+    const TQueryExecRequest& exec_request) {
   for (int i = 0; i < exec_request.dest_fragment_idx.size(); ++i) {
     if (exec_request.dest_fragment_idx[i] != fragment_idx) continue;
     const TPlanFragment& input_fragment = exec_request.fragments[i + 1];
@@ -775,17 +844,14 @@ Status SimpleScheduler::GetRequestPool(const string& user,
 }
 
 Status SimpleScheduler::Schedule(Coordinator* coord, QuerySchedule* schedule) {
-  // TODO: Should this take impersonation into account?
-  const TQueryContext& query_ctxt = schedule->request().query_ctxt;
-  if (query_ctxt.session.connected_user.empty()) {
+  if (schedule->effective_user().empty()) {
     if (FLAGS_require_username) return Status(ERROR_USER_NOT_SPECIFIED);
     // Fall back to a 'default' user if not set so that queries can still run.
     VLOG(2) << "No user specified: using user=default";
   }
-  const string& user = query_ctxt.session.connected_user.empty() ?
-      DEFAULT_USER : query_ctxt.session.connected_user;
-  VLOG(3) << "user='" << user << "', session.connected_user='"
-          << query_ctxt.session.connected_user << "'";
+  const string& user =
+    schedule->effective_user().empty() ? DEFAULT_USER : schedule->effective_user();
+  VLOG(3) << "user='" << user << "'";
   string pool;
   RETURN_IF_ERROR(GetRequestPool(user, schedule->query_options(), &pool));
   schedule->set_request_pool(pool);
@@ -812,9 +878,10 @@ Status SimpleScheduler::Schedule(Coordinator* coord, QuerySchedule* schedule) {
         reservation_request, schedule->reservation());
     if (!status.ok()) {
       // Warn about missing table and/or column stats if necessary.
-      if(query_ctxt.__isset.tables_missing_stats &&
-          !query_ctxt.tables_missing_stats.empty()) {
-        status.AddErrorMsg(GetTablesMissingStatsWarning(query_ctxt.tables_missing_stats));
+      const TQueryCtx& query_ctx = schedule->request().query_ctx;
+      if(query_ctx.__isset.tables_missing_stats &&
+          !query_ctx.tables_missing_stats.empty()) {
+        status.AddErrorMsg(GetTablesMissingStatsWarning(query_ctx.tables_missing_stats));
       }
       return status;
     }

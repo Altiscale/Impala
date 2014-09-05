@@ -42,10 +42,10 @@ class Frontend {
       TUpdateCatalogCacheResponse *resp);
 
   // Call FE to get explain plan
-  Status GetExplainPlan(const TQueryContext& query_ctxt, std::string* explain_string);
+  Status GetExplainPlan(const TQueryCtx& query_ctx, std::string* explain_string);
 
   // Call FE to get TExecRequest.
-  Status GetExecRequest(const TQueryContext& query_ctxt, TExecRequest* result);
+  Status GetExecRequest(const TQueryCtx& query_ctx, TExecRequest* result);
 
   // Returns all matching table names, per Hive's "SHOW TABLES <pattern>". Each
   // table name returned is unqualified.
@@ -71,6 +71,12 @@ class Frontend {
   // results.
   Status GetDbNames(const std::string* pattern, const TSessionState* session,
       TGetDbsResult* table_names);
+
+  // Return all data sources matching the optional argument 'pattern'.
+  // If pattern is NULL, match all data source names otherwise match only those that
+  // match the pattern string. Patterns are "p1|p2|p3" where | denotes choice,
+  // and each pN may contain wildcards denoted by '*' which match all strings.
+  Status GetDataSrcMetadata(const std::string* pattern, TGetDataSrcsResult* result);
 
   // Call FE to get the table/column stats.
   Status GetStats(const TShowStatsParams& params, TResultSet* result);
@@ -118,6 +124,12 @@ class Frontend {
   // as_text parameter, to the output stringstream.
   Status RenderHadoopConfigs(bool as_text, std::stringstream* output);
 
+  // Returns (in the output parameter) the value for the given config. The returned Thrift
+  // struct will indicate if the value was null or not found by not setting its 'value'
+  // field.
+  Status GetHadoopConfig(const TGetHadoopConfigRequest& request,
+      TGetHadoopConfigResponse* response);
+
   // Loads a single file or set of files into a table or partition. Saves the RPC
   // response in the TLoadDataResp output parameter. Returns OK if the operation
   // completed successfully.
@@ -139,13 +151,15 @@ class Frontend {
   jobject fe_;  // instance of com.cloudera.impala.service.JniFrontend
   jmethodID create_exec_request_id_;  // JniFrontend.createExecRequest()
   jmethodID get_explain_plan_id_;  // JniFrontend.getExplainPlan()
-  jmethodID get_hadoop_config_id_;  // JniFrontend.getHadoopConfig()
+  jmethodID get_hadoop_config_id_;  // JniFrontend.getHadoopConfig(byte[])
+  jmethodID get_hadoop_configs_id_;  // JniFrontend.getHadoopConfig(bool)
   jmethodID check_config_id_; // JniFrontend.checkConfiguration()
   jmethodID update_catalog_cache_id_; // JniFrontend.updateCatalogCache()
   jmethodID get_table_names_id_; // JniFrontend.getTableNames
   jmethodID describe_table_id_; // JniFrontend.describeTable
   jmethodID show_create_table_id_; // JniFrontend.showCreateTable
   jmethodID get_db_names_id_; // JniFrontend.getDbNames
+  jmethodID get_data_src_metadata_id_; // JniFrontend.getDataSrcMetadata
   jmethodID get_stats_id_; // JniFrontend.getTableStats
   jmethodID get_functions_id_; // JniFrontend.getFunctions
   jmethodID get_catalog_object_id_; // JniFrontend.getCatalogObject

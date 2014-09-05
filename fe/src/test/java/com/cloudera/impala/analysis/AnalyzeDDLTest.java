@@ -20,10 +20,14 @@ import java.util.ArrayList;
 
 import junit.framework.Assert;
 
+import org.apache.hadoop.fs.Path;
 import org.junit.Test;
 
 import com.cloudera.impala.catalog.CatalogException;
 import com.cloudera.impala.catalog.ColumnType;
+import com.cloudera.impala.catalog.DataSource;
+import com.cloudera.impala.catalog.DataSourceTable;
+import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.AnalysisException;
 import com.google.common.collect.Lists;
 
@@ -88,8 +92,8 @@ public class AnalyzeDDLTest extends AnalyzerTest {
       AnalysisError(
           "alter table functional.insert_string_partitioned " + kw +
           " partition(s2=1234)",
-          "Target table not compatible.\nIncompatible types 'STRING' and 'SMALLINT' " +
-          "in column 's2'");
+          "Value of partition spec (column=s2) has incompatible type: 'SMALLINT'. " +
+          "Expected type: 'STRING'.");
 
       // Loss of precision
       AnalysisError(
@@ -109,6 +113,10 @@ public class AnalyzeDDLTest extends AnalyzerTest {
       AnalysisError("alter table functional.alltypes_view " + kw +
           " partition(year=2050, month=10)",
           "ALTER TABLE not allowed on a view: functional.alltypes_view");
+      AnalysisError("alter table functional.alltypes_datasource " + kw +
+          " partition(year=2050, month=10)",
+          "ALTER TABLE not allowed on a table produced by a data source: " +
+          "functional.alltypes_datasource");
     }
 
     // IF NOT EXISTS properly checks for partition existence
@@ -131,6 +139,15 @@ public class AnalyzeDDLTest extends AnalyzerTest {
           "Partition spec does not exist: (year=2050, month=10).");
     AnalyzesOk("alter table functional.alltypes drop if exists " +
           "partition(year=2050, month=10)");
+
+    // Caching ops
+    AnalyzesOk("alter table functional.alltypes add " +
+        "partition(year=2050, month=10) cached in 'testPool'");
+    AnalyzesOk("alter table functional.alltypes add " +
+        "partition(year=2050, month=10) uncached");
+    AnalysisError("alter table functional.alltypes add " +
+        "partition(year=2050, month=10) cached in 'badPool'",
+        "The specified cache pool does not exist: badPool");
   }
 
   @Test
@@ -174,6 +191,11 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError("alter table functional.alltypes_view " +
         "add columns (c1 string comment 'hi')",
         "ALTER TABLE not allowed on a view: functional.alltypes_view");
+    // Cannot ALTER TABLE produced by a data source.
+    AnalysisError("alter table functional.alltypes_datasource " +
+        "add columns (c1 string comment 'hi')",
+        "ALTER TABLE not allowed on a table produced by a data source: " +
+        "functional.alltypes_datasource");
 
     // Cannot ALTER TABLE ADD/REPLACE COLUMNS on an HBase table.
     AnalysisError("alter table functional_hbase.alltypes add columns (i int)",
@@ -204,6 +226,10 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // Cannot ALTER TABLE a view.
     AnalysisError("alter table functional.alltypes_view drop column int_col",
         "ALTER TABLE not allowed on a view: functional.alltypes_view");
+    // Cannot ALTER TABLE produced by a data source.
+    AnalysisError("alter table functional.alltypes_datasource drop column int_col",
+        "ALTER TABLE not allowed on a table produced by a data source: " +
+        "functional.alltypes_datasource");
 
     // Cannot ALTER TABLE DROP COLUMN on an HBase table.
     AnalysisError("alter table functional_hbase.alltypes drop column int_col",
@@ -245,6 +271,11 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError("alter table functional.alltypes_view " +
         "change column int_col int_col2 int",
         "ALTER TABLE not allowed on a view: functional.alltypes_view");
+    // Cannot ALTER TABLE produced by a data source.
+    AnalysisError("alter table functional.alltypes_datasource " +
+        "change column int_col int_col2 int",
+        "ALTER TABLE not allowed on a table produced by a data source: " +
+        "functional.alltypes_datasource");
 
     // Cannot ALTER TABLE CHANGE COLUMN on an HBase table.
     AnalysisError("alter table functional_hbase.alltypes CHANGE COLUMN int_col i int",
@@ -353,10 +384,63 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // Cannot ALTER TABLE a view.
     AnalysisError("alter table functional.alltypes_view set fileformat sequencefile",
         "ALTER TABLE not allowed on a view: functional.alltypes_view");
+    // Cannot ALTER TABLE produced by a data source.
+    AnalysisError("alter table functional.alltypes_datasource set fileformat parquet",
+        "ALTER TABLE not allowed on a table produced by a data source: " +
+        "functional.alltypes_datasource");
 
     // Cannot ALTER TABLE SET on an HBase table.
     AnalysisError("alter table functional_hbase.alltypes set tblproperties('a'='b')",
         "ALTER TABLE SET not currently supported on HBase tables.");
+  }
+
+  @Test
+  public void TestAlterTableSetCached() {
+    // Positive cases
+    AnalyzesOk("alter table functional.alltypesnopart set cached in 'testPool'");
+    AnalyzesOk("alter table functional.alltypes set cached in 'testPool'");
+    AnalyzesOk("alter table functional.alltypes partition(year=2010, month=12) " +
+        "set cached in 'testPool'");
+
+    // Attempt to alter a table that is not backed by HDFS.
+    AnalysisError("alter table functional_hbase.alltypesnopart set cached in 'testPool'",
+        "ALTER TABLE SET not currently supported on HBase tables.");
+    AnalysisError("alter table functional.view_view set cached in 'testPool'",
+        "ALTER TABLE not allowed on a view: functional.view_view");
+
+    AnalysisError("alter table functional.alltypes set cached in 'badPool'",
+        "The specified cache pool does not exist: badPool");
+    AnalysisError("alter table functional.alltypes partition(year=2010, month=12) " +
+        "set cached in 'badPool'", "The specified cache pool does not exist: badPool");
+
+    // Attempt to uncache a table that is not cached. Should be a no-op.
+    AnalyzesOk("alter table functional.alltypes set uncached");
+    AnalyzesOk("alter table functional.alltypes partition(year=2010, month=12) " +
+        "set uncached");
+
+    // Attempt to cache a table that is already cached. Should be a no-op.
+    AnalyzesOk("alter table functional.alltypestiny set cached in 'testPool'");
+    AnalyzesOk("alter table functional.alltypestiny partition(year=2009, month=1) " +
+        "set cached in 'testPool'");
+
+    // Change location of a cached table/partition
+    AnalysisError("alter table functional.alltypestiny set location '/tmp/tiny'",
+        "Target table is cached, please uncache before changing the location using: " +
+        "ALTER TABLE functional.alltypestiny SET UNCACHED");
+    AnalysisError("alter table functional.alltypestiny partition (year=2009,month=1) " +
+        "set location '/test-warehouse/new_location'",
+        "Target partition is cached, please uncache before changing the location " +
+        "using: ALTER TABLE functional.alltypestiny PARTITION (year=2009, month=1) " +
+        "SET UNCACHED");
+
+    // Table/db/partition do not exist
+    AnalysisError("alter table baddb.alltypestiny set cached in 'testPool'",
+        "Database does not exist: baddb");
+    AnalysisError("alter table functional.badtbl set cached in 'testPool'",
+        "Table does not exist: functional.badtbl");
+    AnalysisError("alter table functional.alltypestiny partition(year=9999, month=1) " +
+        "set cached in 'testPool'",
+        "Partition spec does not exist: (year=9999, month=1).");
   }
 
   @Test
@@ -389,6 +473,9 @@ public class AnalyzeDDLTest extends AnalyzerTest {
 
     // It should be okay to rename an HBase table.
     AnalyzesOk("alter table functional_hbase.alltypes rename to new_alltypes");
+
+    // It should be okay to rename a table produced by a data source.
+    AnalyzesOk("alter table functional.alltypes_datasource rename to new_datasrc_tbl");
   }
 
   @Test
@@ -565,6 +652,33 @@ public class AnalyzeDDLTest extends AnalyzerTest {
   }
 
   @Test
+  public void TestCreateDataSource() {
+    final String DATA_SOURCE_NAME = "TestDataSource1";
+    final DataSource DATA_SOURCE = new DataSource(DATA_SOURCE_NAME, new Path("/foo.jar"),
+        "foo.Bar", "V1");
+    catalog_.addDataSource(DATA_SOURCE);
+    AnalyzesOk("CREATE DATA SOURCE IF NOT EXISTS " + DATA_SOURCE_NAME +
+        " LOCATION '/foo.jar' CLASS 'foo.Bar' API_VERSION 'V1'");
+    AnalyzesOk("CREATE DATA SOURCE IF NOT EXISTS " + DATA_SOURCE_NAME.toLowerCase() +
+        " LOCATION '/foo.jar' CLASS 'foo.Bar' API_VERSION 'V1'");
+    AnalyzesOk("CREATE DATA SOURCE foo LOCATION '/' CLASS '' API_VERSION 'v1'");
+    AnalyzesOk("CREATE DATA SOURCE foo LOCATION '/foo.jar' CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    AnalyzesOk("CREATE DATA SOURCE foo LOCATION '/FOO.jar' CLASS 'COM.BAR.FOO' " +
+        "API_VERSION 'v1'");
+    AnalyzesOk("CREATE DATA SOURCE foo LOCATION \"/foo.jar\" CLASS \"com.bar.Foo\" " +
+        "API_VERSION \"V1\"");
+    AnalyzesOk("CREATE DATA SOURCE foo LOCATION '/x/foo@hi_^!#.jar' " +
+        "CLASS 'com.bar.Foo' API_VERSION 'V1'");
+
+    AnalysisError("CREATE DATA SOURCE " + DATA_SOURCE_NAME + " LOCATION '/foo.jar' " +
+        "CLASS 'foo.Bar' API_VERSION 'V1'",
+        "Data source already exists: " + DATA_SOURCE_NAME.toLowerCase());
+    AnalysisError("CREATE DATA SOURCE foo LOCATION '/foo.jar' " +
+        "CLASS 'foo.Bar' API_VERSION 'V2'", "Invalid API version: 'V2'");
+  }
+
+  @Test
   public void TestCreateDb() throws AnalysisException {
     AnalyzesOk("create database some_new_database");
     AnalysisError("create database functional", "Database already exists: functional");
@@ -572,6 +686,73 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     // Invalid database name,
     AnalysisError("create database `%^&`", "Invalid database name: %^&");
   }
+
+  @Test
+  public void TestCreateTableLikeFile() throws AnalysisException {
+    // check that we analyze all of the CREATE TABLE options
+    AnalyzesOk("create table if not exists newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/alltypestiny.parquet'");
+    AnalyzesOk("create table newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
+    AnalyzesOk("create table default.newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
+    AnalyzesOk("create table newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet' STORED AS PARQUET");
+    AnalyzesOk("create external table newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet' STORED AS PARQUET");
+    AnalyzesOk("create table if not exists functional.zipcode_incomes like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
+    AnalyzesOk("create table if not exists newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
+    AnalyzesOk("create table if not exists newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/decimal.parquet'");
+
+    // check we error in the same situations as standard create table
+    AnalysisError("create table functional.zipcode_incomes like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet'",
+        "Table already exists: functional.zipcode_incomes");
+    AnalysisError("create table database_DNE.newtbl_DNE like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet'",
+        "Database does not exist: database_DNE");
+
+    // check invalid paths
+    AnalysisError("create table if not exists functional.zipcode_incomes like parquet "
+        + "'/test-warehouse'",
+        "Cannot infer schema, path is not a file: hdfs://localhost:20500/test-warehouse");
+    AnalysisError("create table newtbl_DNE like parquet 'foobar'",
+        "URI path must be absolute: foobar");
+    AnalysisError("create table newtbl_DNE like parquet '/not/a/file/path'",
+        "Cannot infer schema, path is not a file: "
+        + "hdfs://localhost:20500/not/a/file/path");
+    AnalysisError("create table if not exists functional.zipcode_incomes like parquet "
+        + "'file://tmp/foobar'",
+        "URI location 'file://tmp/foobar' must point to an HDFS file system.");
+
+    // check valid paths with bad file contents
+    AnalysisError("create table database_DNE.newtbl_DNE like parquet "
+        + "'/test-warehouse/zipcode_incomes_rc/000000_0'",
+        "File is not a parquet file: "
+        + "hdfs://localhost:20500/test-warehouse/zipcode_incomes_rc/000000_0");
+
+    // this is a decimal file without annotations
+    AnalysisError("create table if not exists functional.zipcode_incomes like parquet "
+        + "'/test-warehouse/schemas/malformed_decimal_tiny.parquet'",
+        "Unsupported parquet type FIXED_LEN_BYTE_ARRAY for field c1");
+
+    // this has structures, maps, and arrays
+    AnalysisError("create table table_DNE like parquet "
+        + "'/test-warehouse/schemas/unsupported.parquet'",
+        "Unsupported parquet type for field strct");
+    AnalysisError("create table table_DNE like parquet "
+        + "'/test-warehouse/schemas/map.parquet'",
+        "Unsupported parquet type for field mp");
+    AnalysisError("create table table_DNE like parquet "
+        + "'/test-warehouse/schemas/array.parquet'",
+        "Unsupported parquet type for field lst");
+    AnalysisError("create table table_DNE like parquet "
+        + "'/test-warehouse/schemas/struct.parquet'",
+        "Unsupported parquet type for field strct");
+ }
 
   @Test
   public void TestCreateTableAsSelect() throws AnalysisException {
@@ -592,6 +773,12 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "as select count(*) as CNT from functional.alltypes");
     AnalyzesOk("create table functional.tbl as select a.* from functional.alltypes a " +
         "join functional.alltypes b on (a.int_col=b.int_col) limit 1000");
+
+    // Caching operations
+    AnalyzesOk("create table functional.newtbl cached in 'testPool'" +
+        " as select count(*) as CNT from functional.alltypes");
+    AnalyzesOk("create table functional.newtbl uncached" +
+        " as select count(*) as CNT from functional.alltypes");
 
     // Table already exists with and without IF NOT EXISTS
     AnalysisError("create table functional.alltypes as select 1",
@@ -622,6 +809,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("create table functional.new_table (i int)");
     AnalyzesOk("create table if not exists functional.alltypes (i int)");
     AnalyzesOk("create table if not exists functional.new_tbl like functional.alltypes");
+    AnalyzesOk("create table functional.like_view like functional.view_view");
     AnalyzesOk(
         "create table if not exists functional.alltypes like functional.alltypes");
     AnalysisError("create table functional.alltypes like functional.alltypes",
@@ -635,16 +823,16 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("create table functional.new_table (i int) row format delimited fields " +
         "terminated by '|'");
 
-    // TODO: add more tests: Reenable decimal and update tests.
-    //AnalyzesOk("create table new_table (i int) PARTITIONED BY (d decimal)");
-    //AnalyzesOk("create table new_table(d1 decimal, d2 decimal(10), d3 decimal(5, 2))");
-    AnalysisError("create table new_table (i int) PARTITIONED BY (d decimal)",
-        "Decimal is not yet implemented.");
+    AnalyzesOk("create table new_table (i int) PARTITIONED BY (d decimal)");
+    AnalyzesOk("create table new_table (i int) PARTITIONED BY (d decimal(3,1))");
+    AnalyzesOk("create table new_table(d1 decimal, d2 decimal(10), d3 decimal(5, 2))");
     AnalysisError("create table new_table(d1 decimal(1,10))",
         "Decimal scale (10) must be <= precision (1).");
     AnalysisError("create table new_table(d1 decimal(0,0))",
         "Decimal precision must be greater than 0.");
     AnalysisError("create table new_table(d1 decimal(49,0))",
+        "Decimal precision must be <= 38.");
+    AnalysisError("create table new_table (i int) PARTITIONED BY (d decimal(40,1))",
         "Decimal precision must be <= 38.");
 
     // Note: Backslashes need to be escaped twice - once for Java and once for Impala.
@@ -695,21 +883,14 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError("create table new_table (i int) PARTITIONED BY (d datetime)",
         "Type 'DATETIME' is not supported as partition-column type in column: d");
 
-    // Analysis of Avro schemas
-    AnalyzesOk("create table foo_avro (i int) with serdeproperties ('avro.schema.url'=" +
-        "'hdfs://schema.avsc') stored as avro");
-    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
-        "('avro.schema.url'='hdfs://schema.avsc')");
-    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
-        "('avro.schema.literal'='{\"name\": \"my_record\"}')");
-    AnalysisError("create table foo_avro (i int) stored as avro",
-        "No Avro schema provided for table: default.foo");
-    AnalysisError("create table foo_avro (i int) stored as avro tblproperties ('a'='b')",
-        "No Avro schema provided for table: default.foo");
-    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
-        "('avro.schema.url'='schema.avsc')", "avro.schema.url must be of form " +
-        "\"http://path/to/schema/file\" or \"hdfs://namenode:port/path/to/schema/file" +
-        "\", got schema.avsc");
+    // Caching ops
+    AnalyzesOk("create table cached_tbl(i int) partitioned by(j int) " +
+        "cached in 'testPool'");
+    AnalyzesOk("create table cached_tbl(i int) partitioned by(j int) uncached");
+    AnalyzesOk("create table cached_tbl(i int) partitioned by(j int) " +
+        "location '/test-warehouse/' cached in 'testPool'");
+    AnalyzesOk("create table cached_tbl(i int) partitioned by(j int) " +
+        "location '/test-warehouse/' uncached");
 
     // Invalid database name.
     AnalysisError("create table `???`.new_table (x int) PARTITIONED BY (y int)",
@@ -734,6 +915,124 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "'file://test-warehouse/new_table' must point to an HDFS file system.");
     AnalysisError("ALTER TABLE functional_seq_snap.alltypes SET LOCATION " +
         "'  '", "URI path cannot be empty.");
+
+    // Create table PRODUCED BY DATA SOURCE
+    final String DATA_SOURCE_NAME = "TestDataSource1";
+    catalog_.addDataSource(new DataSource(DATA_SOURCE_NAME, new Path("/foo.jar"),
+        "foo.Bar", "V1"));
+    AnalyzesOk("CREATE TABLE DataSrcTable1 (x int) PRODUCED BY DATA SOURCE " +
+        DATA_SOURCE_NAME);
+    AnalyzesOk("CREATE TABLE DataSrcTable1 (x int) PRODUCED BY DATA SOURCE " +
+        DATA_SOURCE_NAME.toLowerCase());
+    AnalyzesOk("CREATE TABLE DataSrcTable1 (x int) PRODUCED BY DATA SOURCE " +
+        DATA_SOURCE_NAME + "(\"\")");
+    AnalyzesOk("CREATE TABLE DataSrcTable1 (a tinyint, b smallint, c int, d bigint, " +
+        "e float, f double, g boolean, h string) PRODUCED BY DATA SOURCE " +
+        DATA_SOURCE_NAME);
+    AnalysisError("CREATE TABLE DataSrcTable1 (x int) PRODUCED BY DATA SOURCE " +
+        "not_a_data_src(\"\")", "Data source does not exist");
+    for (ColumnType columnType: ColumnType.getSupportedTypes()) {
+      PrimitiveType type = columnType.getPrimitiveType();
+      if (DataSourceTable.isSupportedPrimitiveType(type) || columnType.isNull()) continue;
+      String typeSpec = type.name();
+      if (type == PrimitiveType.CHAR || type == PrimitiveType.DECIMAL) {
+        typeSpec += "(10)";
+      }
+      AnalysisError("CREATE TABLE DataSrcTable1 (x " + typeSpec + ") PRODUCED " +
+          "BY DATA SOURCE " + DATA_SOURCE_NAME,
+          "Tables produced by an external data source do not support the column type: " +
+          type.name());
+    }
+  }
+
+  @Test
+  public void TestCreateAvroTest() {
+    // Analysis of Avro schemas
+    AnalyzesOk("create table foo_avro (i int) with serdeproperties ('avro.schema.url'=" +
+        "'hdfs://localhost:20500/test-warehouse/avro_schemas/functional/" +
+        "alltypes.json') stored as avro");
+    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.url'='hdfs://localhost:20500/test-warehouse/avro_schemas/" +
+        "functional/alltypes.json')");
+    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}]}')");
+
+    // No Avro schema specified for Avro format table.
+    AnalysisError("create table foo_avro (i int) stored as avro",
+        "Error loading Avro schema: No Avro schema provided in SERDEPROPERTIES or " +
+        "TBLPROPERTIES for table: default.foo_avro");
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties ('a'='b')",
+        "Error loading Avro schema: No Avro schema provided in SERDEPROPERTIES or " +
+        "TBLPROPERTIES for table: default.foo_avro");
+    // Invalid schema URL
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.url'='schema.avsc')", "Error loading Avro schema: " +
+        "avro.schema.url must be of form \"http://path/to/schema/file\" or " +
+        "\"hdfs://namenode:port/path/to/schema/file\", got schema.avsc");
+
+    // Decimal parsing
+    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\":\"value\",\"type\":{\"type\":\"bytes\", " +
+        "\"logicalType\":\"decimal\",\"precision\":5,\"scale\":2}}]}')");
+    // Scale not required (defaults to zero).
+    AnalyzesOk("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\":\"value\",\"type\":{\"type\":\"bytes\", " +
+        "\"logicalType\":\"decimal\",\"precision\":5}}]}')");
+    // Precision is always required
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\":\"value\",\"type\":{\"type\":\"bytes\", " +
+        "\"logicalType\":\"decimal\",\"scale\":5}}]}')",
+        "Error parsing Avro schema for table 'default.foo_avro': " +
+        "No 'precision' property specified for 'decimal' logicalType");
+    // Precision/Scale must be positive integers
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\":\"value\",\"type\":{\"type\":\"bytes\", " +
+        "\"logicalType\":\"decimal\",\"scale\":5, \"precision\":-20}}]}')",
+        "Error parsing Avro schema for table 'default.foo_avro': " +
+        "Invalid decimal 'precision' property value: -20");
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\":\"value\",\"type\":{\"type\":\"bytes\", " +
+        "\"logicalType\":\"decimal\",\"scale\":-1, \"precision\":20}}]}')",
+        "Error parsing Avro schema for table 'default.foo_avro': " +
+        "Invalid decimal 'scale' property value: -1");
+
+    // Invalid schema (bad JSON - missing opening bracket for "field" array)
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": {\"name\": \"string1\", \"type\": \"string\"}]}')",
+        "Error parsing Avro schema for table 'default.foo_avro': " +
+        "org.codehaus.jackson.JsonParseException: Unexpected close marker ']': "+
+        "expected '}'");
+
+    // Unsupported types
+    // Array
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}," +
+        "{\"name\": \"list1\", \"type\": {\"type\":\"array\", \"items\": \"int\"}}]}')",
+        "Error parsing Avro schema for table 'default.foo_avro': " +
+        "Unsupported type 'array' of column 'list1'");
+    // Map
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}," +
+        "{\"name\": \"map1\", \"type\": {\"type\":\"map\", \"values\": \"int\"}}]}')",
+        "Error parsing Avro schema for table 'default.foo_avro': " +
+        "Unsupported type 'map' of column 'map1'");
+
+    // Union
+    AnalysisError("create table foo_avro (i int) stored as avro tblproperties " +
+        "('avro.schema.literal'='{\"name\": \"my_record\", \"type\": \"record\", " +
+        "\"fields\": [{\"name\": \"string1\", \"type\": \"string\"}," +
+        "{\"name\": \"union1\", \"type\": [\"float\", \"boolean\"]}]}')",
+        "Error parsing Avro schema for table 'default.foo_avro': " +
+        "Unsupported type 'union' of column 'union1'");
   }
 
   @Test
@@ -859,8 +1158,16 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("create function foo() RETURNS int LOCATION " +
         "'/test-warehouse/hive-exec.jar' SYMBOL='a'");
 
-    /*
-     TODO Reenable tests.
+    // Test hive UDFs for unsupported types
+    AnalysisError("create function foo() RETURNS timestamp LOCATION '/a.jar'",
+        "Hive UDFs that use TIMESTAMP are not yet supported.");
+    AnalysisError("create function foo(timestamp) RETURNS int LOCATION '/a.jar'",
+        "Hive UDFs that use TIMESTAMP are not yet supported.");
+    AnalysisError("create function foo() RETURNS decimal LOCATION '/a.jar'",
+        "Hive UDFs that use DECIMAL are not yet supported.");
+    AnalysisError("create function foo(Decimal) RETURNS int LOCATION '/a.jar'",
+        "Hive UDFs that use DECIMAL are not yet supported.");
+
     AnalyzesOk("create function foo() RETURNS decimal" + udfSuffix);
     AnalyzesOk("create function foo() RETURNS decimal(38,10)" + udfSuffix);
     AnalyzesOk("create function foo(Decimal, decimal(10, 2)) RETURNS int" + udfSuffix);
@@ -868,9 +1175,6 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "Decimal precision must be <= 38.");
     AnalysisError("create function foo(Decimal(2, 3)) RETURNS int" + udfSuffix,
         "Decimal scale (3) must be <= precision (2).");
-        */
-    AnalysisError("create function foo() RETURNS decimal" + udfSuffix,
-        "Decimal is not yet implemented.");
 
     // Varargs
     AnalyzesOk("create function foo(INT...) RETURNS int" + udfSuffix);
@@ -963,7 +1267,7 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("create function identity(string) RETURNS int " +
         "LOCATION '/test-warehouse/libTestUdfs.so' " + "SYMBOL='Identity'");
     AnalyzesOk("create function all_types_fn(string, boolean, tinyint, " +
-        "smallint, int, bigint, float, double) returns int " +
+        "smallint, int, bigint, float, double, decimal) returns int " +
         "location '/test-warehouse/libTestUdfs.so' symbol='AllTypes'");
 
     // Try creating functions with illegal function names.
@@ -1032,10 +1336,6 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError(
         "drop function functional.TestFn()", "Function does not exist: testfn()");
 
-    addTestFunction("udf_test", "TestFn", new ArrayList<ColumnType>(), false);
-    AnalysisError(
-        "drop database udf_test", "Cannot drop non-empty database: udf_test");
-
     AnalysisError("create function f() returns int " + udfSuffix +
         "init_fn='a'", "Optional argument 'INIT_FN' should not be set");
     AnalysisError("create function f() returns int " + udfSuffix +
@@ -1101,7 +1401,6 @@ public class AnalyzeDDLTest extends AnalyzerTest {
         "INTERMEDIATE char(10)" + loc + "UPDATE_FN='AggUpdate'",
         "UDAs with an intermediate type, CHAR(10), that is different from the " +
         "return type, INT, are currently not supported.");
-    /*
     AnalysisError("create aggregate function foo(int) RETURNS int " +
         "INTERMEDIATE decimal(10)" + loc + "UPDATE_FN='AggUpdate'",
         "UDAs with an intermediate type, DECIMAL(10,0), that is different from the " +
@@ -1109,7 +1408,6 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalysisError("create aggregate function foo(int) RETURNS int " +
         "INTERMEDIATE decimal(40)" + loc + "UPDATE_FN='AggUpdate'",
         "Decimal precision must be <= 38.");
-        */
     //AnalyzesOk("create aggregate function foo(int) RETURNS int " +
     //    "INTERMEDIATE CHAR(10)" + loc + "UPDATE_FN='AggUpdate'");
     //AnalysisError("create aggregate function foo(int) RETURNS int " +
@@ -1222,6 +1520,9 @@ public class AnalyzeDDLTest extends AnalyzerTest {
     AnalyzesOk("show databases");
     AnalyzesOk("show databases like '*pattern'");
 
+    AnalyzesOk("show data sources");
+    AnalyzesOk("show data sources like '*pattern'");
+
     AnalyzesOk("show tables");
     AnalyzesOk("show tables like '*pattern'");
 
@@ -1250,5 +1551,20 @@ public class AnalyzeDDLTest extends AnalyzerTest {
           String.format("SHOW %s STATS not applicable to a view: " +
               "functional.alltypes_view", qual.toUpperCase()));
     }
+  }
+
+  @Test
+  public void TestShowPartitions() throws AnalysisException {
+    AnalyzesOk("show partitions functional.alltypes");
+    AnalysisError("show partitions baddb.alltypes",
+        "Database does not exist: baddb");
+    AnalysisError("show partitions functional.badtbl",
+        "Table does not exist: functional.badtbl");
+    AnalysisError("show partitions functional.alltypesnopart",
+        "Table is not partitioned: functional.alltypesnopart");
+    AnalysisError("show partitions functional.view_view",
+        "SHOW PARTITIONS not applicable to a view: functional.view_view");
+    AnalysisError("show partitions functional_hbase.alltypes",
+        "SHOW PARTITIONS must target an HDFS table: functional_hbase.alltypes");
   }
 }

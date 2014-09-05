@@ -20,6 +20,7 @@ set(LIBRARY_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/codegen")
 set(EXECUTABLE_OUTPUT_PATH "${BUILD_OUTPUT_ROOT_DIRECTORY}/codegen")
 
 add_library(CodeGen
+  codegen-anyval.cc
   llvm-codegen.cc
   subexpr-elimination.cc
 )
@@ -50,9 +51,11 @@ set(IR_DEPENDENT_FILES
   ../exec/aggregation-node-ir.cc
   ../exec/hash-join-node-ir.cc
   ../exec/hdfs-scanner-ir.cc
+  ../exprs/aggregate-functions.cc
   ../exprs/expr-ir.cc
   ../exprs/udf-builtins.cc
   ../runtime/string-value-ir.cc
+  ../udf/udf.cc
   ../util/hash-util-ir.cc
 )
 

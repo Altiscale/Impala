@@ -20,6 +20,7 @@
 #include <boost/uuid/uuid_generators.hpp>
 #include <boost/uuid/uuid_io.hpp>
 #include <boost/lexical_cast.hpp>
+#include <gutil/strings/substitute.h>
 #include <thrift/Thrift.h>
 
 #include "common/status.h"
@@ -32,6 +33,7 @@
 #include "util/uid-util.h"
 #include "util/network-util.h"
 #include "util/llama-util.h"
+#include "util/time.h"
 #include "gen-cpp/ResourceBrokerService.h"
 #include "gen-cpp/Llama_types.h"
 
@@ -40,9 +42,14 @@ using namespace impala;
 using namespace boost;
 using namespace boost::algorithm;
 using namespace boost::uuids;
+using namespace strings;
 
 using namespace ::apache::thrift::server;
 using namespace ::apache::thrift;
+
+DECLARE_int64(llama_registration_timeout_secs);
+DECLARE_int64(llama_registration_wait_secs);
+DECLARE_int64(llama_max_request_attempts);
 
 DECLARE_int32(resource_broker_cnxn_attempts);
 DECLARE_int32(resource_broker_cnxn_retry_interval_ms);
@@ -51,26 +58,11 @@ DECLARE_int32(resource_broker_recv_timeout);
 
 static const string LLAMA_KERBEROS_SERVICE_NAME = "llama";
 
-// TODO: Refactor the Llama restart and thrift connect/reconnect/reopen logic into
-// a common place.
-
 namespace impala {
 
 // String to search for in Llama error messages to detect that Llama has restarted,
 // and hence the resource broker must re-register.
-const string LLAMA_RESTART_SEARCH_STRING = "Unknown handle";
-
-// Number of seconds to wait between Llama registration attempts.
-const int64_t LLAMA_REGISTRATION_WAIT_SECS = 3;
-
-// Maximum number of seconds that a any query will wait for (re-)registration with the
-// Llama before failing the query with an error.
-const int64_t LLAMA_REGISTRATION_TIMEOUT_SECS = 30;
-
-// Maximum number of times a reserve/release against the Llama is retried
-// if the Llama restarted while processing the request. If this maximum number of
-// attempts is exceeded, then the originating query fails with an error.
-const int64_t LLAMA_MAX_REQUEST_ATTEMPTS = 5;
+const string LLAMA_RESTART_SEARCH_STRING = "unknown handle";
 
 class LlamaNotificationThriftIf : public llama::LlamaNotificationServiceIf {
  public:
@@ -94,9 +86,10 @@ class LlamaNotificationThriftIf : public llama::LlamaNotificationServiceIf {
   ResourceBroker* resource_broker_;
 };
 
-ResourceBroker::ResourceBroker(const TNetworkAddress& llama_address,
+ResourceBroker::ResourceBroker(const vector<TNetworkAddress>& llama_addresses,
     const TNetworkAddress& llama_callback_address, Metrics* metrics) :
-    llama_address_(llama_address),
+    llama_addresses_(llama_addresses),
+    active_llama_addr_idx_(-1),
     llama_callback_address_(llama_callback_address),
     metrics_(metrics),
     scheduler_(NULL),
@@ -106,9 +99,14 @@ ResourceBroker::ResourceBroker(const TNetworkAddress& llama_address,
         FLAGS_resource_broker_cnxn_retry_interval_ms,
         FLAGS_resource_broker_send_timeout,
         FLAGS_resource_broker_recv_timeout,
-        LLAMA_KERBEROS_SERVICE_NAME)),
-    is_mini_llama_(false) {
+        LLAMA_KERBEROS_SERVICE_NAME)) {
+  DCHECK_GT(llama_addresses_.size(), 0);
   DCHECK(metrics != NULL);
+  active_llama_metric_ = metrics->CreateAndRegisterPrimitiveMetric<string>(
+      "resource-broker.active-llama", "none");
+  active_llama_handle_metric_ = metrics->CreateAndRegisterPrimitiveMetric<string>(
+      "resource-broker.active-llama-handle", "none");
+
   reservation_rpc_time_metric_ =
       metrics->RegisterMetric(
           new StatsMetric<double>("resource-broker.reservation-request-rpc-time"));
@@ -153,6 +151,13 @@ ResourceBroker::ResourceBroker(const TNetworkAddress& llama_address,
       metrics->CreateAndRegisterPrimitiveMetric<int64_t>(
           "resource-broker.expansion-requests-timedout", 0);
 
+  allocated_memory_metric_ =
+      metrics->RegisterMetric(new Metrics::BytesMetric(
+          "resource-broker.memory-resources-in-use", 0L));
+
+  allocated_vcpus_metric_ =
+      metrics->CreateAndRegisterPrimitiveMetric<int64_t>(
+          "resource-broker.vcpu-resources-in-use", 0);
 
   requests_released_metric_ =
       metrics->CreateAndRegisterPrimitiveMetric<int64_t>(
@@ -171,12 +176,7 @@ Status ResourceBroker::Init() {
 
   // Generate client id for registration with Llama, and register with LLama.
   random_generator uuid_generator;
-  llama_client_id_= uuid_generator();
-  RETURN_IF_ERROR(RegisterAndRefreshLlama());
-  return Status::OK;
-}
-
-Status ResourceBroker::RegisterAndRefreshLlama() {
+  llama_client_id_ = uuid_generator();
   RETURN_IF_ERROR(RegisterWithLlama());
   RETURN_IF_ERROR(RefreshLlamaNodes());
   return Status::OK;
@@ -193,18 +193,22 @@ Status ResourceBroker::RegisterWithLlama() {
   lock_guard<mutex> l(llama_registration_lock_);
   if (llama_handle_ != current_llama_handle) return Status::OK;
 
-  bool needs_reopen = false;
+  active_llama_metric_->Update("none");
+  active_llama_handle_metric_->Update("none");
+
+  int llama_addr_idx = (active_llama_addr_idx_ + 1) % llama_addresses_.size();
   int64_t now = TimestampValue::local_time_micros().time_of_day().total_seconds();
-  while((now - start) < LLAMA_REGISTRATION_TIMEOUT_SECS) {
-    // Connect to the Llama.
-    Status status;
+  while (FLAGS_llama_registration_timeout_secs == -1 ||
+      (now - start) < FLAGS_llama_registration_timeout_secs) {
+    // Connect to the Llama at llama_address.
+    const TNetworkAddress& llama_address = llama_addresses_[llama_addr_idx];
+    // Client status will be ok if a Thrift connection could be successfully established
+    // for the returned client at some point in the past. Hence, there is no guarantee
+    // that the connection is still valid now and we must check for broken pipes, etc.
+    Status client_status;
     ClientConnection<llama::LlamaAMServiceClient> llama_client(llama_client_cache_.get(),
-        llama_address_, &status);
-    if (needs_reopen) {
-      status = llama_client.Reopen();
-      needs_reopen = false;
-    }
-    if (status.ok()) {
+        llama_address, &client_status);
+    if (client_status.ok()) {
       // Register this resource broker with Llama.
       llama::TLlamaAMRegisterRequest request;
       request.__set_version(llama::TLlamaServiceVersion::V1);
@@ -216,30 +220,56 @@ Status ResourceBroker::RegisterWithLlama() {
       callback_address << llama_callback_address_;
       request.__set_notification_callback_service(callback_address);
       llama::TLlamaAMRegisterResponse response;
-      LOG(INFO) << "Registering Resource Broker with Llama at " << llama_address_;
+      LOG(INFO) << "Registering Resource Broker with Llama at " << llama_address;
+      bool rpc_success = false;
       try {
         llama_client->Register(response, request);
+        rpc_success = true;
+      } catch (const TException& e) {
+        client_status = llama_client.Reopen();
+        if (client_status.ok()) {
+          llama_client->Register(response, request);
+          rpc_success = true;
+        }
+      }
+      if (rpc_success) {
+        // TODO: Is there a period where an inactive Llama may respond to RPCs?
+        // If so, then we need to keep cycling through Llamas here and not
+        // return an error.
         RETURN_IF_ERROR(LlamaStatusToImpalaStatus(
             response.status, "Failed to register Resource Broker with Llama."));
+        LOG(INFO) << "Received Llama client handle " << response.am_handle
+                  << ((response.am_handle == llama_handle_) ? " (same as old)" : "");
         llama_handle_ = response.am_handle;
-        LOG(INFO) << "Received Llama client handle " << llama_handle_;
         break;
-      } catch (const TException& e) {
-        needs_reopen = true;
       }
     }
-    LOG(INFO) << "Failed to connect to Llama at " << llama_address_ << ".\n"
-              << "Error: " << status.GetErrorMsg() << "\n"
-              << "Retrying to connect in "
-              << LLAMA_REGISTRATION_WAIT_SECS << "s.";
-    // Sleep even if we just need to Reopen() the client to stagger re-registrations
-    // of multiple Impalads with the Llama in case the Llama went down and came back up.
-    usleep(LLAMA_REGISTRATION_WAIT_SECS * 1000 * 1000);
+    // Cycle through the list of Llama addresses for Llama failover.
+    llama_addr_idx = (llama_addr_idx + 1) % llama_addresses_.size();
+    LOG(INFO) << "Failed to connect to Llama at " << llama_address << "." << endl
+              << "Error: " << client_status.GetErrorMsg() << endl
+              << "Retrying to connect to Llama at "
+              << llama_addresses_[llama_addr_idx] << " in "
+              << FLAGS_llama_registration_wait_secs << "s.";
+    // Sleep to give Llama time to recover/failover before the next attempt.
+    SleepForMs(FLAGS_llama_registration_wait_secs * 1000);
     now = TimestampValue::local_time_micros().time_of_day().total_seconds();
   }
-  if ((now - start) >= LLAMA_REGISTRATION_TIMEOUT_SECS) {
+  DCHECK(FLAGS_llama_registration_timeout_secs != -1);
+  if ((now - start) >= FLAGS_llama_registration_timeout_secs) {
     return Status("Failed to (re-)register Resource Broker with Llama.");
   }
+
+  if (llama_addr_idx != active_llama_addr_idx_) {
+    // TODO: We've switched to a different Llama (failover). Cancel all queries
+    // coordinated by this Impalad to free up physical resources that are not
+    // accounted for anymore by Yarn.
+  }
+
+  // If we reached this point, (re-)registration was successful.
+  active_llama_addr_idx_ = llama_addr_idx;
+  active_llama_metric_->Update(lexical_cast<string>(llama_addresses_[llama_addr_idx]));
+  active_llama_handle_metric_->Update(lexical_cast<string>(llama_handle_));
   return Status::OK;
 }
 
@@ -249,7 +279,9 @@ bool ResourceBroker::LlamaHasRestarted(const llama::TStatus& status) const {
   }
   // Check whether one of the error messages contains LLAMA_RESTART_SEARCH_STRING.
   for (int i = 0; i < status.error_msgs.size(); ++i) {
-    if (status.error_msgs[i].find(LLAMA_RESTART_SEARCH_STRING) != string::npos) {
+    string error_msg = status.error_msgs[i];
+    to_lower(error_msg);
+    if (error_msg.find(LLAMA_RESTART_SEARCH_STRING) != string::npos) {
       LOG(INFO) << "Assuming Llama restart from error message: " << status.error_msgs[i];
       return true;
     }
@@ -258,7 +290,10 @@ bool ResourceBroker::LlamaHasRestarted(const llama::TStatus& status) const {
 }
 
 void ResourceBroker::Close() {
-  llama_client_cache_->CloseConnections(llama_address_);
+  // Close connections to all Llama addresses, not just the active one.
+  BOOST_FOREACH(const TNetworkAddress& llama_address, llama_addresses_) {
+    llama_client_cache_->CloseConnections(llama_address);
+  }
   llama_callback_server_->Join();
 }
 
@@ -273,6 +308,10 @@ void ResourceBroker::CreateLlamaReservationRequest(
   dest.__set_queue(src.queue);
   dest.user = src.user;
   dest.resources = src.resources;
+  random_generator uuid_generator;
+  llama::TUniqueId request_id;
+  UUIDToTUniqueId(uuid_generator(), &request_id);
+  dest.__set_reservation_id(request_id);
 }
 
 // Creates a Llama release request from a resource broker release request.
@@ -283,49 +322,169 @@ void ResourceBroker::CreateLlamaReleaseRequest(const TResourceBrokerReleaseReque
   dest.reservation_id << src.reservation_id;
 }
 
-void ResourceBroker::ReservationFulfillment::GetResources(ResourceMap* resources,
-    TUniqueId* reservation_id) {
+template <typename LlamaReqType, typename LlamaRespType>
+Status ResourceBroker::LlamaRpc(LlamaReqType* request, LlamaRespType* response,
+    StatsMetric<double>* rpc_time_metric) {
+  int attempts = 0;
+  MonotonicStopWatch sw;
+  // Indicates whether to re-register with Llama before the next RPC attempt,
+  // e.g. because Llama has restarted or become unavailable.
+  bool register_with_llama = false;
+  while (attempts < FLAGS_llama_max_request_attempts) {
+    if (register_with_llama) {
+      RETURN_IF_ERROR(ReRegisterWithLlama(*request, response));
+      // Set the new Llama handle received from re-registering.
+      request->__set_am_handle(llama_handle_);
+      VLOG_RPC << "Retrying Llama RPC after re-registration: " << *request;
+      register_with_llama = false;
+    }
+    ++attempts;
+    Status rpc_status;
+    ClientConnection<llama::LlamaAMServiceClient> llama_client(llama_client_cache_.get(),
+        llama_addresses_[active_llama_addr_idx_], &rpc_status);
+    if (!rpc_status.ok()) {
+      register_with_llama = true;
+      continue;
+    }
+
+    sw.Start();
+    try {
+      SendLlamaRpc(&llama_client, *request, response);
+    } catch (const TException& e) {
+      VLOG_RPC << "Reopening Llama client due to: " << e.what();
+      rpc_status = llama_client.Reopen();
+      if (!rpc_status.ok()) {
+        register_with_llama = true;
+        continue;
+      }
+      VLOG_RPC << "Retrying Llama RPC: " << *request;
+      SendLlamaRpc(&llama_client, *request, response);
+    }
+    if (rpc_time_metric != NULL) {
+      rpc_time_metric->Update(sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
+    }
+
+    // Check whether Llama has been restarted. If so, re-register with it.
+    // Break out of the loop here upon success of the RPC.
+    if (!LlamaHasRestarted(response->status)) break;
+    register_with_llama = true;
+  }
+  if (attempts >= FLAGS_llama_max_request_attempts) {
+    return Status(Substitute(
+        "Request aborted after $0 attempts due to connectivity issues with Llama.",
+        FLAGS_llama_max_request_attempts));
+  }
+  return Status::OK;
+}
+
+template <typename LlamaReqType, typename LlamaRespType>
+void ResourceBroker::SendLlamaRpc(
+    ClientConnection<llama::LlamaAMServiceClient>* llama_client,
+    const LlamaReqType& request, LlamaRespType* response) {
+  DCHECK(false) << "SendLlamaRpc template function must be specialized.";
+}
+
+// Template specialization for the Llama GetNodes() RPC.
+template <>
+void ResourceBroker::SendLlamaRpc(
+    ClientConnection<llama::LlamaAMServiceClient>* llama_client,
+    const llama::TLlamaAMGetNodesRequest& request,
+    llama::TLlamaAMGetNodesResponse* response) {
+  DCHECK(response != NULL);
+  (*llama_client)->GetNodes(*response, request);
+}
+
+// Template specialization for the Llama Reserve() RPC.
+template <>
+void ResourceBroker::SendLlamaRpc(
+    ClientConnection<llama::LlamaAMServiceClient>* llama_client,
+    const llama::TLlamaAMReservationRequest& request,
+    llama::TLlamaAMReservationResponse* response) {
+  DCHECK(response != NULL);
+  (*llama_client)->Reserve(*response, request);
+}
+
+// Template specialization for the Llama Expand() RPC.
+template <>
+void ResourceBroker::SendLlamaRpc(
+    ClientConnection<llama::LlamaAMServiceClient>* llama_client,
+    const llama::TLlamaAMReservationExpansionRequest& request,
+    llama::TLlamaAMReservationExpansionResponse* response) {
+  DCHECK(response != NULL);
+  (*llama_client)->Expand(*response, request);
+}
+
+// Template specialization for the Llama Release() RPC.
+template <>
+void ResourceBroker::SendLlamaRpc(
+    ClientConnection<llama::LlamaAMServiceClient>* llama_client,
+    const llama::TLlamaAMReleaseRequest& request,
+    llama::TLlamaAMReleaseResponse* response) {
+  DCHECK(response != NULL);
+  (*llama_client)->Release(*response, request);
+}
+
+template <typename LlamaReqType, typename LlamaRespType>
+Status ResourceBroker::ReRegisterWithLlama(const LlamaReqType& request,
+    LlamaRespType* response) {
+  RETURN_IF_ERROR(RegisterWithLlama());
+  return RefreshLlamaNodes();
+}
+
+template <>
+Status ResourceBroker::ReRegisterWithLlama(const llama::TLlamaAMGetNodesRequest& request,
+    llama::TLlamaAMGetNodesResponse* response) {
+  return RegisterWithLlama();
+}
+
+void ResourceBroker::PendingRequest::GetResources(ResourceMap* resources) {
   resources->clear();
-  // TODO: Llama returns a dump of all resources that we need to manually
-  // group by reservation id. Can Llama do the grouping for us?
   BOOST_FOREACH(const llama::TAllocatedResource& resource, allocated_resources_) {
-    // Ignore resources that don't belong to the given reservation id.
-    if (resource.reservation_id != reservation_id_) continue;
     TNetworkAddress host = MakeNetworkAddress(resource.location);
     (*resources)[host] = resource;
     VLOG_QUERY << "Getting allocated resource for reservation id "
                << reservation_id_ << " and location " << host;
   }
-  (*reservation_id) << reservation_id_;
 }
 
-bool ResourceBroker::WaitForNotification(const llama::TUniqueId& request_id,
-    int64_t timeout, TUniqueId* reservation_id, ResourceMap* resources, bool* timed_out) {
-  shared_ptr<ReservationFulfillment> fulfillment;
-  {
-    lock_guard<mutex> l(requests_lock_);
-    // It's possible that the AM notification arrived before we called into this method
-    // and took the lock. If so, AMNotification() should have placed a
-    // ReservationFulfillment in the pending_requests_ map already.
-    FulfillmentMap::iterator it = pending_requests_.find(request_id);
-    if (it == pending_requests_.end()) {
-      // We got here first, so add the ReservationFulfillment object implicitly and set
-      // the promise field so that we get signalled when AMNotification() gets an update.
-      fulfillment.reset(new ReservationFulfillment());
-      pending_requests_.insert(make_pair(request_id, fulfillment));
-    } else {
-      fulfillment = it->second;
+void ResourceBroker::PendingRequest::SetResources(
+    const vector<llama::TAllocatedResource>& resources) {
+  // TODO: Llama returns a dump of all resources that we need to manually group by
+  // reservation id. Can Llama do the grouping for us?
+  BOOST_FOREACH(const llama::TAllocatedResource& resource, resources) {
+    // Ignore resources that don't belong to the given reservation id.
+    if (resource.reservation_id == request_id()) {
+      allocated_resources_.push_back(resource);
     }
   }
+}
 
-  // Need to give up requests_lock_ before waiting
-  bool request_granted = fulfillment->promise()->Get(timeout, timed_out);
-  fulfillment->GetResources(resources, reservation_id);
+bool ResourceBroker::WaitForNotification(int64_t timeout, ResourceMap* resources,
+    bool* timed_out, PendingRequest* pending_request) {
+  bool request_granted = pending_request->promise()->Get(timeout, timed_out);
 
   // Remove the promise from the pending-requests map.
   {
-    lock_guard<mutex> l(requests_lock_);
-    pending_requests_.erase(request_id);
+    lock_guard<mutex> l(pending_requests_lock_);
+    pending_requests_.erase(pending_request->request_id());
+  }
+
+  if (request_granted && !*timed_out) {
+    pending_request->GetResources(resources);
+    int64_t total_memory_mb = 0L;
+    int32_t total_vcpus = 0;
+    BOOST_FOREACH(const ResourceMap::value_type& resource, *resources) {
+      total_memory_mb += resource.second.memory_mb;
+      total_vcpus += resource.second.v_cpu_cores;
+    }
+    allocated_memory_metric_->Increment(total_memory_mb * 1024L * 1024L);
+    allocated_vcpus_metric_->Increment(total_vcpus);
+    {
+      lock_guard<mutex> l(allocated_requests_lock_);
+      allocated_requests_[pending_request->reservation_id()].push_back(AllocatedRequest(
+          pending_request->reservation_id(), total_memory_mb, total_vcpus,
+          pending_request->is_expansion()));
+    }
   }
 
   return request_granted;
@@ -340,38 +499,27 @@ Status ResourceBroker::Expand(const TResourceBrokerExpansionRequest& request,
   ll_request.version = llama::TLlamaServiceVersion::V1;
   ll_request.am_handle = llama_handle_;
   ll_request.expansion_of << request.reservation_id;
+  random_generator uuid_generator;
+  llama::TUniqueId request_id;
+  UUIDToTUniqueId(uuid_generator(), &request_id);
+  ll_request.__set_expansion_id(request_id);
   ll_request.resource = request.resource;
 
-  int attempts = 0;
+  PendingRequest* pending_request;
+  {
+    lock_guard<mutex> l(pending_requests_lock_);
+    pending_request =
+        new PendingRequest(ll_request.expansion_of, ll_request.expansion_id, true);
+    pending_requests_.insert(make_pair(pending_request->request_id(), pending_request));
+  }
+
   MonotonicStopWatch sw;
-  while (attempts < LLAMA_MAX_REQUEST_ATTEMPTS) {
-    ++attempts;
-    Status status;
-    ClientConnection<llama::LlamaAMServiceClient>
-        llama_client(llama_client_cache_.get(), llama_address_, &status);
-    RETURN_IF_ERROR(status);
-
-    sw.Start();
-    try {
-      llama_client->Expand(ll_response, ll_request);
-    } catch (TTransportException& e) {
-      VLOG_RPC << "Retrying Expand: " << e.what();
-      status = llama_client.Reopen();
-      if (!status.ok()) return status;
-      llama_client->Expand(ll_response, ll_request);
-    }
-
-    expansion_rpc_time_metric_->Update(sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
-
-    // Check whether Llama has been restarted. If so, re-register with it.
-    if (LlamaHasRestarted(ll_response.status)) {
-      RETURN_IF_ERROR(RegisterAndRefreshLlama());
-      // Set the new Llama handle received from re-registering.
-      ll_request.__set_am_handle(llama_handle_);
-      LOG(INFO) << "Retrying expansion request: " << request;
-      continue;
-    }
-    break;
+  sw.Start();
+  Status status = LlamaRpc(&ll_request, &ll_response, expansion_rpc_time_metric_);
+  // Check the status of the response.
+  if (!status.ok()) {
+    expansion_requests_failed_metric_->Increment(1);
+    return status;
   }
 
   Status request_status = LlamaStatusToImpalaStatus(ll_response.status);
@@ -380,30 +528,30 @@ Status ResourceBroker::Expand(const TResourceBrokerExpansionRequest& request,
     return request_status;
   }
 
-  TUniqueId reservation_id;
   bool timed_out = false;
-  bool request_granted = WaitForNotification(ll_response.reservation_id,
-      request.request_timeout, &reservation_id, &response->allocated_resources,
-      &timed_out);
+  bool request_granted = WaitForNotification(request.request_timeout,
+      &response->allocated_resources, &timed_out, pending_request);
 
-  if (!timed_out) {
-    expansion_response_time_metric_->Update(
-        sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
-  } else {
-    expansion_requests_timedout_metric_->Increment(1);
-    stringstream error_msg;
-    error_msg << "Resource expansion request exceeded timeout of "
-              << request.request_timeout << "ms.";
-    return Status(error_msg.str());
+  if (request_granted) {
+    // Only set the reservation ID for successful requests
+    response->__set_reservation_id(request.reservation_id);
   }
+
+  if (timed_out) {
+    expansion_requests_timedout_metric_->Increment(1);
+    return Status(Substitute("Resource expansion request exceeded timeout of $0",
+        PrettyPrinter::Print(request.request_timeout * 1000L * 1000L,
+        TCounterType::TIME_NS)));
+  }
+  expansion_response_time_metric_->Update(
+      sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
 
   if (!request_granted) {
     expansion_requests_rejected_metric_->Increment(1);
     return Status("Resource expansion request was rejected.");
   }
 
-  response->__set_reservation_id(reservation_id);
-  VLOG_QUERY << "Fulfilled expansion for id: " << ll_response.reservation_id;
+  VLOG_QUERY << "Fulfilled expansion for id: " << ll_response.expansion_id;
   expansion_requests_fulfilled_metric_->Increment(1);
   return Status::OK;
 }
@@ -413,128 +561,120 @@ Status ResourceBroker::Reserve(const TResourceBrokerReservationRequest& request,
   VLOG_QUERY << "Sending reservation request: " << request;
   reservation_requests_total_metric_->Increment(1);
 
-  llama::TLlamaAMReservationRequest llama_request;
-  llama::TLlamaAMReservationResponse llama_response;
-  CreateLlamaReservationRequest(request, llama_request);
+  llama::TLlamaAMReservationRequest ll_request;
+  llama::TLlamaAMReservationResponse ll_response;
+  CreateLlamaReservationRequest(request, ll_request);
 
-  int attempts = 0;
+  PendingRequest* pending_request;
+  {
+    lock_guard<mutex> l(pending_requests_lock_);
+    pending_request = new PendingRequest(ll_request.reservation_id,
+        ll_request.reservation_id, false);
+    pending_requests_.insert(make_pair(pending_request->request_id(), pending_request));
+  }
+
   MonotonicStopWatch sw;
-  while (attempts < LLAMA_MAX_REQUEST_ATTEMPTS) {
-    ++attempts;
-    Status status;
-    ClientConnection<llama::LlamaAMServiceClient> llama_client(llama_client_cache_.get(),
-        llama_address_, &status);
-    RETURN_IF_ERROR(status);
-
-    sw.Start();
-    try {
-      llama_client->Reserve(llama_response, llama_request);
-    } catch (const TException& e) {
-      VLOG_RPC << "Retrying Reserve: " << e.what();
-      status = llama_client.Reopen();
-      if (!status.ok()) continue;
-      llama_client->Reserve(llama_response, llama_request);
-    }
-    reservation_rpc_time_metric_->Update(sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
-
-    // Check whether Llama has been restarted. If so, re-register with it.
-    if (LlamaHasRestarted(llama_response.status)) {
-      RETURN_IF_ERROR(RegisterAndRefreshLlama());
-      // Set the new Llama handle received from re-registering.
-      llama_request.__set_am_handle(llama_handle_);
-      LOG(INFO) << "Retrying reservation request: " << request;
-      continue;
-    }
-    break;
-  }
-  if (attempts >= LLAMA_MAX_REQUEST_ATTEMPTS) {
-    reservation_requests_failed_metric_->Increment(1);
-    return Status("Reservation request aborted due to connectivity issues with Llama.");
-  }
-
+  sw.Start();
+  Status status = LlamaRpc(&ll_request, &ll_response, reservation_rpc_time_metric_);
   // Check the status of the response.
-  Status request_status = LlamaStatusToImpalaStatus(llama_response.status);
+  if (!status.ok()) {
+    reservation_requests_failed_metric_->Increment(1);
+    return status;
+  }
+  Status request_status = LlamaStatusToImpalaStatus(ll_response.status);
   if (!request_status.ok()) {
     reservation_requests_failed_metric_->Increment(1);
     return request_status;
   }
 
   VLOG_RPC << "Received reservation response from Llama, waiting for notification on: "
-           << llama_response.reservation_id;
+           << pending_request->request_id();
 
-  TUniqueId reservation_id;
   bool timed_out = false;
-  bool request_granted = WaitForNotification(llama_response.reservation_id,
-      request.request_timeout, &reservation_id, &response->allocated_resources,
-      &timed_out);
+  bool request_granted = WaitForNotification(request.request_timeout,
+      &response->allocated_resources, &timed_out, pending_request);
 
-  if (!timed_out) {
-    reservation_response_time_metric_->Update(
-        sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
-  } else {
-    // Set the reservation_id to release it from Llama.
-    response->__set_reservation_id(reservation_id);
-    reservation_requests_timedout_metric_->Increment(1);
-    stringstream error_msg;
-    error_msg << "Resource reservation request exceeded timeout of "
-              << request.request_timeout << "ms.";
-    return Status(error_msg.str());
+  if (request_granted || timed_out) {
+    // Set the reservation_id to make sure it eventually gets released - even if when
+    // timed out, since the response may arrive later.
+    response->__set_reservation_id(
+        CastTUniqueId<llama::TUniqueId, TUniqueId>(pending_request->reservation_id()));
   }
+
+  if (timed_out) {
+    reservation_requests_timedout_metric_->Increment(1);
+    return Status(Substitute("Resource expansion request exceeded timeout of $0",
+        PrettyPrinter::Print(request.request_timeout * 1000L * 1000L,
+        TCounterType::TIME_NS)));
+  }
+  reservation_response_time_metric_->Update(
+      sw.ElapsedTime() / (1000.0 * 1000.0 * 1000.0));
+
   if (!request_granted) {
     reservation_requests_rejected_metric_->Increment(1);
     return Status("Resource reservation request was rejected.");
   }
 
+  TUniqueId reservation_id;
+  reservation_id << pending_request->reservation_id();
   response->__set_reservation_id(reservation_id);
-
-  VLOG_QUERY << "Fulfilled reservation with id: " << llama_response.reservation_id;
+  VLOG_QUERY << "Fulfilled reservation with id: " << pending_request->reservation_id();
   reservation_requests_fulfilled_metric_->Increment(1);
   return Status::OK;
 }
 
+void ResourceBroker::ClearRequests(const TUniqueId& reservation_id,
+    bool include_reservation) {
+  int64_t total_memory_bytes = 0L;
+  int32_t total_vcpus = 0L;
+  llama::TUniqueId llama_id = CastTUniqueId<TUniqueId, llama::TUniqueId>(reservation_id);
+  {
+    lock_guard<mutex> l(allocated_requests_lock_);
+    AllocatedRequestMap::iterator it = allocated_requests_.find(llama_id);
+    if (it == allocated_requests_.end()) return;
+    vector<AllocatedRequest>::iterator request_it = it->second.begin();
+    while (request_it != it->second.end()) {
+      DCHECK(request_it->reservation_id() == llama_id);
+      if (!request_it->is_expansion() && !include_reservation) {
+        // Leave the original reservation
+        ++request_it;
+        continue;
+      }
+      total_memory_bytes += (request_it->memory_mb() * 1024L * 1024L);
+      total_vcpus += request_it->vcpus();
+      request_it = it->second.erase(request_it);
+    }
+  }
+
+  VLOG_QUERY << "Releasing "
+             << PrettyPrinter::Print(total_memory_bytes, TCounterType::BYTES)
+             << " and " << total_vcpus << " cores for " << llama_id;
+  allocated_memory_metric_->Increment(-total_memory_bytes);
+  allocated_vcpus_metric_->Increment(-total_vcpus);
+}
+
 Status ResourceBroker::Release(const TResourceBrokerReleaseRequest& request,
     TResourceBrokerReleaseResponse* response) {
-  VLOG_QUERY << "Releasing reservation with id " << request.reservation_id;
+  VLOG_QUERY << "Releasing all resources for reservation: " << request.reservation_id;
+
+  ClearRequests(request.reservation_id, true);
 
   llama::TLlamaAMReleaseRequest llama_request;
   llama::TLlamaAMReleaseResponse llama_response;
   CreateLlamaReleaseRequest(request, llama_request);
 
-  int attempts = 0;
-  while (attempts < LLAMA_MAX_REQUEST_ATTEMPTS) {
-    ++attempts;
-    Status status;
-    ClientConnection<llama::LlamaAMServiceClient> llama_client(llama_client_cache_.get(),
-        llama_address_, &status);
-    RETURN_IF_ERROR(status);
-    try {
-      llama_client->Release(llama_response, llama_request);
-    } catch (const TException& e) {
-      VLOG_RPC << "Retrying Release: " << e.what();
-      status = llama_client.Reopen();
-      if (!status.ok()) continue;
-      llama_client->Release(llama_response, llama_request);
-    }
-
-    // Check whether Llama has been restarted. If so, re-register with it.
-    if (LlamaHasRestarted(llama_response.status)) {
-      RETURN_IF_ERROR(RegisterAndRefreshLlama());
-      // Set the new Llama handle received from re-registering.
-      llama_request.__set_am_handle(llama_handle_);
-      LOG(INFO) << "Retrying release of reservation with id "
-                << request.reservation_id;
-      continue;
-    }
-    break;
-  }
-  if (attempts >= LLAMA_MAX_REQUEST_ATTEMPTS) {
-    return Status("Reservation release aborted due to connectivity issues with Llama.");
-  }
-
+  RETURN_IF_ERROR(LlamaRpc(
+          &llama_request, &llama_response,reservation_rpc_time_metric_));
   RETURN_IF_ERROR(LlamaStatusToImpalaStatus(llama_response.status));
   requests_released_metric_->Increment(1);
 
-  VLOG_QUERY << "Released reservation with id " << request.reservation_id;
+  {
+    lock_guard<mutex> l(allocated_requests_lock_);
+    llama::TUniqueId reservation_id =
+        CastTUniqueId<TUniqueId, llama::TUniqueId>(request.reservation_id);;
+    allocated_requests_.erase(reservation_id);
+  }
+
   return Status::OK;
 }
 
@@ -556,37 +696,31 @@ void ResourceBroker::AMNotification(const llama::TLlamaAMNotificationRequest& re
   if (request.heartbeat) return;
   VLOG_QUERY << "Received non-heartbeat AM notification";
 
-  lock_guard<mutex> l(requests_lock_);
+  lock_guard<mutex> l(pending_requests_lock_);
 
   // Process granted allocations.
   BOOST_FOREACH(const llama::TUniqueId& res_id, request.allocated_reservation_ids) {
     // TODO: Garbage collect fulfillments that live for a long time, since they probably
     // don't correspond to any query.
-    FulfillmentMap::iterator it = pending_requests_.find(res_id);
-    shared_ptr<ReservationFulfillment> fulfillment;
+    PendingRequestMap::iterator it = pending_requests_.find(res_id);
     if (it == pending_requests_.end()) {
-      fulfillment.reset(new ReservationFulfillment());
-      pending_requests_.insert(make_pair(res_id, fulfillment));
-    } else {
-      fulfillment = it->second;
+      VLOG_RPC << "Allocation for " << res_id << " arrived after timeout";
+      // TODO: Release these allocations
+      continue;
     }
     LOG(INFO) << "Received allocated resource for reservation id: " << res_id;
-    fulfillment->SetResources(request.allocated_resources, res_id);
-    fulfillment->promise()->Set(true);
+    it->second->SetResources(request.allocated_resources);
+    it->second->promise()->Set(true);
   }
 
   // Process rejected allocations.
   BOOST_FOREACH(const llama::TUniqueId& res_id, request.rejected_reservation_ids) {
-    FulfillmentMap::iterator it = pending_requests_.find(res_id);
-    shared_ptr<ReservationFulfillment> fulfillment;
+    PendingRequestMap::iterator it = pending_requests_.find(res_id);
     if (it == pending_requests_.end()) {
-      fulfillment.reset(new ReservationFulfillment());
-      pending_requests_.insert(make_pair(res_id, fulfillment));
-    } else {
-      fulfillment = it->second;
+      VLOG_RPC << "Rejection for " << res_id << " arrived after timeout";
+      continue;
     }
-
-    fulfillment->promise()->Set(false);
+    it->second->promise()->Set(false);
   }
 
   // TODO: We maybe want a thread pool for handling preemptions to avoid
@@ -625,49 +759,10 @@ Status ResourceBroker::RefreshLlamaNodes() {
   llama_request.__set_version(llama::TLlamaServiceVersion::V1);
   llama::TLlamaAMGetNodesResponse llama_response;
 
-  int attempts = 0;
-  while (attempts < LLAMA_MAX_REQUEST_ATTEMPTS) {
-    ++attempts;
-    Status status;
-    ClientConnection<llama::LlamaAMServiceClient> llama_client(llama_client_cache_.get(),
-        llama_address_, &status);
-    RETURN_IF_ERROR(status);
-    try {
-      llama_client->GetNodes(llama_response, llama_request);
-    } catch (const TException& e) {
-      VLOG_RPC << "Retrying GetNodes: " << e.what();
-      status = llama_client.Reopen();
-      if (!status.ok()) continue;
-      llama_client->GetNodes(llama_response, llama_request);
-    }
-    // Check whether Llama has been restarted. If so, re-register with it.
-    if (LlamaHasRestarted(llama_response.status)) {
-      RETURN_IF_ERROR(RegisterWithLlama());
-      // Set the new Llama handle received from re-registering.
-      llama_request.__set_am_handle(llama_handle_);
-      LOG(INFO) << "Retrying GetNodes";
-      continue;
-    }
-    break;
-  }
-  if (attempts >= LLAMA_MAX_REQUEST_ATTEMPTS) {
-    return Status("GetNodes request aborted due to connectivity issues with Llama.");
-  }
-
+  RETURN_IF_ERROR(LlamaRpc(&llama_request, &llama_response, NULL));
   RETURN_IF_ERROR(LlamaStatusToImpalaStatus(llama_response.status));
   llama_nodes_ = llama_response.nodes;
   LOG(INFO) << "Llama Nodes [" << join(llama_nodes_, ", ") << "]";
-
-  // The Llama is a Mini Llama if all nodes know to it are on 127.0.0.1.
-  is_mini_llama_ = true;
-  for (int i = 0; i < llama_nodes_.size(); ++i) {
-    TNetworkAddress hostport = MakeNetworkAddress(llama_nodes_[i]);
-    if (hostport.hostname != "127.0.0.1") {
-      is_mini_llama_ = false;
-      break;
-    }
-  }
-  LOG(INFO) << "Resource broker is using Mini LLama: " << is_mini_llama_;
   return Status::OK;
 }
 
@@ -690,8 +785,8 @@ void ResourceBroker::UnregisterQueryResourceMgr(const TUniqueId& query_id) {
   QueryResourceMgrsMap::iterator it = query_resource_mgrs_.find(query_id);
   DCHECK(it != query_resource_mgrs_.end())
       << "UnregisterQueryResourceMgr() without corresponding GetQueryResourceMgr()";
-  it->second.second->Shutdown();
   if (--it->second.first == 0) {
+    it->second.second->Shutdown();
     delete it->second.second;
     query_resource_mgrs_.erase(it);
   }

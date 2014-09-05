@@ -31,6 +31,7 @@ import math
 import json
 import os
 import random
+import re
 import shutil
 import subprocess
 import sys
@@ -245,11 +246,28 @@ def avro_schema(columns):
     # column_spec looks something like "col_name col_type COMMENT comment"
     # (comment may be omitted, we don't use it)
     name = column_spec.split()[0]
-    type = column_spec.split()[1]
-    assert type.upper() in HIVE_TO_AVRO_TYPE_MAP, "Cannot convert to Avro type: %s" % type
+
+    if "DECIMAL" in column_spec.upper():
+      if column_spec.split()[1].upper() == "DECIMAL":
+        # No scale and precision specified, use defaults
+        scale = 0
+        precision = 9
+      else:
+        # Parse out scale and precision from decimal type
+        m = re.search("DECIMAL\((?P<precision>.*),(?P<scale>.*)\)", column_spec.upper())
+        assert m, "Could not parse decimal column spec: " + column_spec
+        scale = int(m.group('scale'))
+        precision = int(m.group('precision'))
+      type = {"type": "bytes", "logicalType": "decimal", "precision": precision,
+              "scale": scale}
+    else:
+      hive_type = column_spec.split()[1]
+      type = HIVE_TO_AVRO_TYPE_MAP[hive_type.upper()]
+
     record["fields"].append(
       {'name': name,
-       'type': [HIVE_TO_AVRO_TYPE_MAP[type.upper()], "null"]}) # all columns nullable
+       'type': [type, "null"]}) # all columns nullable
+
   return json.dumps(record)
 
 def build_compression_codec_statement(codec, compression_type, file_format):
@@ -317,13 +335,14 @@ def build_load_statement(load_template, db_name, db_suffix, table_name):
                                          impala_home = os.environ['IMPALA_HOME'])
   return load_template
 
-def build_hbase_create_stmt(db_name, table_name):
+def build_hbase_create_stmt(db_name, table_name, column_families):
   hbase_table_name = "{db_name}_hbase.{table_name}".format(db_name=db_name,
                                                            table_name=table_name)
   create_stmt = list()
   create_stmt.append("disable '%s'" % hbase_table_name)
   create_stmt.append("drop '%s'" % hbase_table_name)
-  create_stmt.append("create '%s', 'd'" % hbase_table_name)
+  column_families = ','.join(["'{0}'".format(cf) for cf in column_families.splitlines()])
+  create_stmt.append("create '%s', %s" % (hbase_table_name, column_families))
   return create_stmt
 
 def build_db_suffix(file_format, codec, compression_type):
@@ -424,7 +443,7 @@ def generate_statements(output_name, test_vectors, sections,
       alter = section.get('ALTER')
       create = section['CREATE']
       create_hive = section['CREATE_HIVE']
-      insert = section['DEPENDENT_LOAD']
+      insert = eval_section(section['DEPENDENT_LOAD'])
       load = eval_section(section['LOAD'])
       # For some datasets we may want to use a different load strategy when running local
       # tests versus tests against large scale factors. The most common reason is to
@@ -461,7 +480,7 @@ def generate_statements(output_name, test_vectors, sections,
       # HBASE we need to create these tables with a supported insert format.
       create_file_format = file_format
       create_codec = codec
-      if not load and not insert:
+      if not (section['LOAD'] or section['LOAD_LOCAL'] or section['DEPENDENT_LOAD']):
         create_codec = 'none'
         create_file_format = file_format
         if file_format not in IMPALA_SUPPORTED_INSERT_FORMATS:
@@ -506,7 +525,10 @@ def generate_statements(output_name, test_vectors, sections,
           db_suffix, create_file_format, create_codec, data_path))
       # HBASE create table
       if file_format == 'hbase':
-        hbase_output.create.extend(build_hbase_create_stmt(db_name, table_name))
+        # If the HBASE_COLUMN_FAMILIES section does not exist, default to 'd'
+        column_families = section.get('HBASE_COLUMN_FAMILIES', 'd')
+        hbase_output.create.extend(build_hbase_create_stmt(db_name, table_name,
+            column_families))
 
       # The ALTER statement in hive does not accept fully qualified table names so
       # insert a use statement. The ALTER statement is skipped for HBASE as it's
@@ -515,7 +537,14 @@ def generate_statements(output_name, test_vectors, sections,
       # moment, it assumes we're only using ALTER for partitioning the table.
       if alter and file_format != "hbase":
         use_table = 'USE {db_name};\n'.format(db_name=db)
-        output.create.append(use_table + alter.format(table_name=table_name))
+        if output == hive_output and codec == 'lzo':
+          if not options.force_reload:
+            # If this is not a force reload use msck repair to add the partitions
+            # into the table. This is to work around a problem where the null
+            # partition cannot be explicitly created in Hive.
+            output.create.append(use_table + 'msck repair table %s;' % (table_name,))
+        else:
+          output.create.append(use_table + alter.format(table_name=table_name))
 
       # If the directory already exists in HDFS, assume that data files already exist
       # and skip loading the data. Otherwise, the data is generated using either an
@@ -558,7 +587,7 @@ def generate_statements(output_name, test_vectors, sections,
 def parse_schema_template_file(file_name):
   VALID_SECTION_NAMES = ['DATASET', 'BASE_TABLE_NAME', 'COLUMNS', 'PARTITION_COLUMNS',
                          'ROW_FORMAT', 'CREATE', 'CREATE_HIVE', 'DEPENDENT_LOAD', 'LOAD',
-                         'LOAD_LOCAL', 'ALTER']
+                         'LOAD_LOCAL', 'ALTER', 'HBASE_COLUMN_FAMILIES']
   return parse_test_file(file_name, VALID_SECTION_NAMES, skip_unknown_sections=False)
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@
 
 #include "common/status.h"
 #include "runtime/descriptors.h"
+#include "runtime/decimal-value.h"
 #include "runtime/lib-cache.h"
 #include "runtime/raw-value.h"
 #include "runtime/tuple.h"
@@ -62,6 +63,9 @@ struct ExprValue {
   std::string string_data;
   StringValue string_val;
   TimestampValue timestamp_val;
+  Decimal4Value decimal4_val;
+  Decimal8Value decimal8_val;
+  Decimal16Value decimal16_val;
 
   ExprValue()
     : bool_val(false),
@@ -285,6 +289,7 @@ class Expr {
   int GetNumChildren() const { return children_.size(); }
 
   const ColumnType& type() const { return type_; }
+  bool is_slotref() const { return is_slotref_; }
 
   const std::vector<Expr*>& children() const { return children_; }
 
@@ -378,6 +383,9 @@ class Expr {
   // Returns codegen function for the expr tree rooted at this expr.
   llvm::Function* codegen_fn() { return codegen_fn_; }
 
+  // Logs that this expr overflowed.
+  void LogOverflow();
+
   // Returns the scratch buffer size needed to call codegen_fn
   int scratch_buffer_size() { return scratch_buffer_size_; }
 
@@ -426,7 +434,11 @@ class Expr {
 
  protected:
   friend class AggFnEvaluator;
+  friend class CastExpr;
   friend class ComputeFunctions;
+  friend class DecimalFunctions;
+  friend class DecimalLliteral;
+  friend class DecimalOperators;
   friend class MathFunctions;
   friend class StringFunctions;
   friend class TimestampFunctions;
@@ -448,6 +460,9 @@ class Expr {
   // Does not do anything on the this expr.
   // Return OK if successful, otherwise return error status.
   Status PrepareChildren(RuntimeState* state, const RowDescriptor& row_desc);
+
+  // RuntimeState, set in Prepare(), that can be used to log errors.
+  RuntimeState* state_;
 
   // Cache entry for the library implementing this function.
   LibCache::LibCacheEntry* cache_entry_;
@@ -486,6 +501,9 @@ class Expr {
 
   // Set to true after Open() has been called.
   bool opened_;
+
+  // Set to true if a warning message for this expr overflowing has been logged.
+  bool overflow_logged_;
 
   // Returns an llvm::Function* with signature:
   // <subclass of AnyVal> ComputeFn(int8_t* context, TupleRow* row)
@@ -597,6 +615,7 @@ class SlotRef : public Expr {
   virtual std::string DebugString() const;
   virtual bool IsConstant() const { return false; }
   virtual int GetSlotIds(std::vector<SlotId>* slot_ids) const;
+  const SlotId& slot_id() const { return slot_id_; }
 
   virtual llvm::Function* Codegen(LlvmCodeGen* codegen);
 

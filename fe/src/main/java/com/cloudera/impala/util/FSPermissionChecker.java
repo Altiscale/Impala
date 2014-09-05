@@ -29,55 +29,80 @@ import org.apache.hadoop.security.UserGroupInformation;
 import com.google.common.base.Preconditions;
 
 /**
- * Singleton class that checks whether the current user has permission
- * to access FileSystem Paths.
- * This file is a modified version of class:
- * org.apache.hadoop.hdfs.server.namenode.FSPermissionChecker
- * that was simplified for Impala's use case and modified to meet our
- * coding standards.
+ * Singleton class that can check whether the current user has permission to access paths
+ * in a FileSystem.
  */
-public class FSPermissionChecker {
-  private final static FSPermissionChecker instance_;
-  private final String user_;
+public class FsPermissionChecker {
+  private final static FsPermissionChecker instance_;
+  protected final String user_;
   private final Set<String> groups_ = new HashSet<String>();
 
   static {
     try {
-      instance_ = new FSPermissionChecker();
+      instance_ = new FsPermissionChecker();
     } catch (IOException e) {
       throw new RuntimeException(
-          "Error initializing the FSPermissionChecker: " + e.getMessage(), e);
+          "Error initializing FsPermissionChecker: " + e.getMessage(), e);
     }
   }
 
-  private FSPermissionChecker() throws IOException {
+  private FsPermissionChecker() throws IOException {
     UserGroupInformation ugi = UserGroupInformation.getCurrentUser();
     groups_.addAll(Arrays.asList(ugi.getGroupNames()));
     user_ = ugi.getShortUserName();
   }
 
   /**
-   * Checks whether the current user has permission to access the given Path at the
-   * specified access level.
+   * Allows checking different access permissions of a file without repeatedly accessing
+   * the underlying filesystem by caching the results of a status call at construction.
    */
-  public boolean hasAccess(FileSystem fs, Path path, FsAction access)
-      throws IOException {
-    Preconditions.checkNotNull(path);
-    Preconditions.checkNotNull(access);
-    FileStatus fileStatus = fs.getFileStatus(path);
-    FsPermission mode = fileStatus.getPermission();
-    if (user_.equals(fileStatus.getOwner())) { //user class
-      if (mode.getUserAction().implies(access)) { return true; }
-    } else if (groups_.contains(fileStatus.getGroup())) { //group class
-      if (mode.getGroupAction().implies(access)) { return true; }
-    } else { //other class
-      if (mode.getOtherAction().implies(access)) { return true; }
+  public class Permissions {
+    private final FileStatus fileStatus_;
+    private final FsPermission permissions_;
+
+    protected Permissions(FileStatus fileStatus) {
+      Preconditions.checkNotNull(fileStatus);
+      fileStatus_ = fileStatus;
+      permissions_ = fileStatus.getPermission();
     }
-    return false;
+
+    /**
+     * Returns true if the current user can perform the given action given these
+     * permissions.
+     */
+    public boolean checkPermissions(FsAction action) {
+      // Check user, group and then 'other' permissions in turn.
+      if (FsPermissionChecker.this.user_.equals(fileStatus_.getOwner())) {
+        // If the user matches, we must return their access rights whether or not the user
+        // is allowed to access without checking the group. This is counter-intuitive if
+        // the user cannot access the file, but the group permissions would allow it, but
+        // is consistent with UNIX behaviour.
+        return permissions_.getUserAction().implies(action);
+      }
+
+      if (FsPermissionChecker.this.groups_.contains(fileStatus_.getGroup())) {
+        return permissions_.getGroupAction().implies(action);
+      }
+      return permissions_.getOtherAction().implies(action);
+    }
+
+    public boolean canRead() { return checkPermissions(FsAction.READ); }
+    public boolean canWrite() { return checkPermissions(FsAction.WRITE); }
+    public boolean canReadAndWrite() { return canRead() && canWrite(); }
   }
 
-  /*
-   * Returns an instance of the FSPermissionChecker.
+  /**
+   * Returns a Permissions object that can answer all access permission queries for the
+   * given path.
    */
-  public static FSPermissionChecker getInstance() { return instance_; }
+  public Permissions getPermissions(FileSystem fs, Path path) throws IOException {
+    Preconditions.checkNotNull(fs);
+    Preconditions.checkNotNull(path);
+    return new Permissions(fs.getFileStatus(path));
+  }
+
+  /**
+   * Returns the FsPermissionChecker singleton.
+   */
+  public static FsPermissionChecker getInstance() { return instance_; }
 }

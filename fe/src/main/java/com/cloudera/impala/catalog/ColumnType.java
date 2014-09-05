@@ -14,9 +14,15 @@
 
 package com.cloudera.impala.catalog;
 
+import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.List;
 
+import org.apache.hadoop.hive.metastore.api.FieldSchema;
+
+import com.cloudera.impala.analysis.CreateTableStmt;
+import com.cloudera.impala.analysis.SqlParser;
+import com.cloudera.impala.analysis.SqlScanner;
 import com.cloudera.impala.analysis.TypesUtil;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TColumnType;
@@ -58,6 +64,7 @@ public class ColumnType {
 
   // Hive, mysql, sql server standard.
   public static final int MAX_PRECISION = 38;
+  public static final int MAX_SCALE = MAX_PRECISION;
 
   // Static constant types for simple types that don't require additional information.
   public static final ColumnType INVALID = new ColumnType(PrimitiveType.INVALID_TYPE);
@@ -84,7 +91,7 @@ public class ColumnType {
   private static ArrayList<ColumnType> supportedTypes;
 
   static {
-    fixedSizeNumericTypes = Lists.newArrayList();
+    fixedSizeNumericTypes = Lists.newArrayListWithExpectedSize(6);
     fixedSizeNumericTypes.add(TINYINT);
     fixedSizeNumericTypes.add(SMALLINT);
     fixedSizeNumericTypes.add(INT);
@@ -92,13 +99,13 @@ public class ColumnType {
     fixedSizeNumericTypes.add(FLOAT);
     fixedSizeNumericTypes.add(DOUBLE);
 
-    integerTypes = Lists.newArrayList();
+    integerTypes = Lists.newArrayListWithExpectedSize(4);
     integerTypes.add(TINYINT);
     integerTypes.add(SMALLINT);
     integerTypes.add(INT);
     integerTypes.add(BIGINT);
 
-    numericTypes = Lists.newArrayList();
+    numericTypes = Lists.newArrayListWithExpectedSize(7);
     numericTypes.add(TINYINT);
     numericTypes.add(SMALLINT);
     numericTypes.add(INT);
@@ -107,7 +114,7 @@ public class ColumnType {
     numericTypes.add(DOUBLE);
     numericTypes.add(DECIMAL);
 
-    supportedTypes = Lists.newArrayList();
+    supportedTypes = Lists.newArrayListWithExpectedSize(11);
     supportedTypes.add(NULL);
     supportedTypes.add(BOOLEAN);
     supportedTypes.add(TINYINT);
@@ -162,7 +169,7 @@ public class ColumnType {
 
   public static ColumnType createDecimalType(int precision, int scale) {
     Preconditions.checkState(precision >= 0); // Enforced by parser
-    Preconditions.checkState(scale >= 0); // Encforced by parser.
+    Preconditions.checkState(scale >= 0); // Enforced by parser.
     ColumnType type = new ColumnType(PrimitiveType.DECIMAL);
     type.precision_ = precision;
     type.scale_ = scale;
@@ -266,7 +273,7 @@ public class ColumnType {
 
   public boolean isIntegerType() {
     return type_ == PrimitiveType.TINYINT || type_ == PrimitiveType.SMALLINT
-      || type_ == PrimitiveType.INT || type_ == PrimitiveType.BIGINT;
+        || type_ == PrimitiveType.INT || type_ == PrimitiveType.BIGINT;
   }
 
   public boolean isFixedLengthType() {
@@ -325,11 +332,23 @@ public class ColumnType {
       case TINYINT: return createDecimalType(3);
       case SMALLINT: return createDecimalType(5);
       case INT: return createDecimalType(10);
-      case BIGINT: return createDecimalType(20);
+      case BIGINT: return createDecimalType(19);
       case FLOAT: return createDecimalTypeInternal(MAX_PRECISION, 9);
       case DOUBLE: return createDecimalTypeInternal(MAX_PRECISION, 17);
     }
     return ColumnType.INVALID;
+  }
+
+  /* Returns true if this decimal type is a supertype of the other decimal type.
+   * e.g. (10,3) is a super type of (3,3) but (5,4) is not a supertype of (3,0).
+   * To be a super type of another decimal, the number of digits before and after
+   * the decimal point must be greater or equal.
+   */
+  public boolean isSupertypeOf(ColumnType o) {
+    Preconditions.checkState(isDecimal());
+    Preconditions.checkState(o.isDecimal());
+    if (isWildcardDecimal()) return true;
+    return scale_ >= o.scale_ && precision_ - scale_ >= o.precision_ - o.scale_;
   }
 
   /**
@@ -342,19 +361,32 @@ public class ColumnType {
     if (!t1.isValid() || !t2.isValid()) return INVALID;
     if (t1.equals(t2)) return t1;
 
-
     if (t1.isDecimal() || t2.isDecimal()) {
       if (t1.isNull()) return t2;
       if (t2.isNull()) return t1;
 
+      // In the case of decimal and float/double, return the floating point type.
+      // Floating point types can contain values larger than the maximum decimal
+      // so it is a safer compatible type.
+      // TODO: revisit, the function comment is clear that this should return the type
+      // which results in no loss of precision. This would mean there is no compatible
+      // type between decimals and floating point types. However, we can't return
+      // INVALID since this path is also used when checking if an explicit cast is
+      // legal.
+      if (t1.isFloatingPointType()) return t1;
+      if (t2.isFloatingPointType()) return t2;
+
       // Allow casts between decimal and numeric types by converting
       // numeric types to the containing decimal type.
-      t1 = t1.getMinResolutionDecimal();
-      t2 = t2.getMinResolutionDecimal();
-      if (t1.isInvalid() || t2.isInvalid()) return ColumnType.INVALID;
-      Preconditions.checkState(t1.isDecimal());
-      Preconditions.checkState(t2.isDecimal());
-      return TypesUtil.getDecimalAssignmentCompatibleType(t1, t2);
+      ColumnType t1Decimal = t1.getMinResolutionDecimal();
+      ColumnType t2Decimal = t2.getMinResolutionDecimal();
+      if (t1Decimal.isInvalid() || t2Decimal.isInvalid()) return ColumnType.INVALID;
+      Preconditions.checkState(t1Decimal.isDecimal());
+      Preconditions.checkState(t2Decimal.isDecimal());
+
+      if (t1Decimal.isSupertypeOf(t2Decimal)) return t1;
+      if (t2Decimal.isSupertypeOf(t1Decimal)) return t2;
+      return TypesUtil.getDecimalAssignmentCompatibleType(t1Decimal, t2Decimal);
     }
 
     PrimitiveType smallerType =
@@ -372,7 +404,8 @@ public class ColumnType {
    * t1 to t2 results in no loss of precision).
    */
   public static boolean isImplicitlyCastable(ColumnType t1, ColumnType t2) {
-    return getAssignmentCompatibleType(t1, t2).matchesType(t2);
+    return getAssignmentCompatibleType(t1, t2).matchesType(t2) ||
+           getAssignmentCompatibleType(t2, t1).matchesType(t2);
   }
 
   /**
@@ -412,8 +445,9 @@ public class ColumnType {
   }
 
   public void analyze() throws AnalysisException {
-    if (isAnalyzed_) return;
     Preconditions.checkState(type_ != PrimitiveType.INVALID_TYPE);
+
+    if (isAnalyzed_) return;
     if (type_ == PrimitiveType.CHAR) {
       if (len_ <= 0) {
         throw new AnalysisException("Char size must be > 0. Size was set to: " +
@@ -431,7 +465,6 @@ public class ColumnType {
         throw new AnalysisException("Decimal scale (" + scale_+ ") must be <= " +
             "precision (" + precision_ + ").");
       }
-      throw new AnalysisException("Decimal is not yet implemented.");
     }
     isAnalyzed_ = true;
   }
@@ -443,6 +476,7 @@ public class ColumnType {
     if (type_ == PrimitiveType.CHAR) {
       return "CHAR(" + len_ + ")";
     } else  if (type_ == PrimitiveType.DECIMAL) {
+      if (isWildcardDecimal()) return "DECIMAL(*,*)";
       return "DECIMAL(" + precision_ + "," + scale_ + ")";
     }
     return type_.toString();
@@ -492,6 +526,40 @@ public class ColumnType {
     } else {
       return createType(type);
     }
+  }
+
+  /*
+   * Gets the ColumnType from the given FieldSchema by using Impala's SqlParser.
+   * Returns null if the FieldSchema could not be parsed.
+   * The type can either be:
+   *   - Supported by Impala, in which case the type is returned.
+   *   - A type Impala understands but is not yet implemented (e.g. date), the type is
+   *     returned but type.IsSupported() returns false.
+   *   - A type Impala can't understand at all in which case null is returned.
+   */
+  public static ColumnType parseColumnType(FieldSchema fs) {
+    // Wrap the type string in a CREATE TABLE stmt and use Impala's Parser
+    // to get the ColumnType.
+    // Pick a table name that can't be used.
+    String stmt = String.format("CREATE TABLE $DUMMY ($DUMMY %s)", fs.getType());
+    SqlScanner input = new SqlScanner(new StringReader(stmt));
+    SqlParser parser = new SqlParser(input);
+    CreateTableStmt createTableStmt;
+    try {
+      Object o = parser.parse().value;
+      if (!(o instanceof CreateTableStmt)) {
+        // Should never get here.
+        throw new IllegalStateException("Couldn't parse create table stmt.");
+      }
+      createTableStmt = (CreateTableStmt) o;
+      if (createTableStmt.getColumnDescs().isEmpty()) {
+        // Should never get here.
+        throw new IllegalStateException("Invalid create table stmt.");
+      }
+    } catch (Exception e) {
+      return null;
+    }
+    return createTableStmt.getColumnDescs().get(0).getColType();
   }
 
   /**

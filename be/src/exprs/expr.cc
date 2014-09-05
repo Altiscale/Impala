@@ -16,12 +16,12 @@
 
 #include <thrift/protocol/TDebugProtocol.h>
 
+#include "codegen/codegen-anyval.h"
 #include "codegen/llvm-codegen.h"
 #include "common/object-pool.h"
 #include "common/status.h"
 #include "exprs/expr.h"
 #include "exprs/aggregate-functions.h"
-#include "exprs/anyval-util.h"
 #include "exprs/arithmetic-expr.h"
 #include "exprs/binary-predicate.h"
 #include "exprs/bool-literal.h"
@@ -31,6 +31,9 @@
 #include "exprs/compound-predicate.h"
 #include "exprs/conditional-functions.h"
 #include "exprs/date-literal.h"
+#include "exprs/decimal-functions.h"
+#include "exprs/decimal-literal.h"
+#include "exprs/decimal-operators.h"
 #include "exprs/float-literal.h"
 #include "exprs/function-call.h"
 #include "exprs/hive-udf-call.h"
@@ -74,7 +77,8 @@ bool ParseString(const string& str, T* val) {
 }
 
 Expr::Expr(const ColumnType& type, bool is_slotref)
-    : cache_entry_(NULL),
+    : state_(NULL),
+      cache_entry_(NULL),
       is_udf_call_(false),
       compute_fn_(NULL),
       is_slotref_(is_slotref),
@@ -83,12 +87,14 @@ Expr::Expr(const ColumnType& type, bool is_slotref)
       codegen_fn_(NULL),
       adapter_fn_used_(false),
       scratch_buffer_size_(0),
-      opened_(false) ,
+      opened_(false),
+      overflow_logged_(false),
       jitted_compute_fn_(NULL) {
 }
 
 Expr::Expr(const TExprNode& node, bool is_slotref)
-    : cache_entry_(NULL),
+    : state_(NULL),
+      cache_entry_(NULL),
       is_udf_call_(false),
       compute_fn_(NULL),
       is_slotref_(is_slotref),
@@ -97,6 +103,8 @@ Expr::Expr(const TExprNode& node, bool is_slotref)
       codegen_fn_(NULL),
       adapter_fn_used_(false),
       scratch_buffer_size_(0),
+      opened_(false),
+      overflow_logged_(false),
       jitted_compute_fn_(NULL) {
   if (node.__isset.fn) fn_ = node.fn;
 }
@@ -112,6 +120,18 @@ void Expr::Close(RuntimeState* state) {
   if (cache_entry_ != NULL) {
     LibCache::instance()->DecrementUseCount(cache_entry_);
     cache_entry_ = NULL;
+  }
+}
+
+void Expr::LogOverflow() {
+  if (!overflow_logged_) {
+    // TODO: this is a stop gap until we move to the UDF interface that has
+    // better mechanisms for doing this.
+    // TODO: is there a way to tell the user the expr in a reasonable way?
+    // Plumb the ToSql() from the FE?
+    DCHECK(state_ != NULL);
+    overflow_logged_ = true;
+    state_->LogError("Expression overflowed, returning NULL");
   }
 }
 
@@ -293,6 +313,12 @@ Status Expr::CreateExpr(ObjectPool* pool, const TExprNode& texpr_node, Expr** ex
       }
       *expr = pool->Add(new DateLiteral(texpr_node));
       return Status::OK;
+    case TExprNodeType::DECIMAL_LITERAL:
+      if (!texpr_node.__isset.decimal_literal) {
+        return Status("Decimal literal not set in thrift node");
+      }
+      *expr = pool->Add(new DecimalLiteral(texpr_node));
+      return Status::OK;
     case TExprNodeType::FLOAT_LITERAL:
       if (!texpr_node.__isset.float_literal) {
         return Status("Float literal not set in thrift node");
@@ -427,8 +453,8 @@ int Expr::ComputeResultsLayout(const vector<Expr*>& exprs, vector<int>* offsets,
 void Expr::GetValue(TupleRow* row, bool as_ascii, TColumnValue* col_val) {
   void* value = GetValue(row);
   if (as_ascii) {
-    RawValue::PrintValue(value, type(), output_scale_, &col_val->stringVal);
-    col_val->__isset.stringVal = true;
+    RawValue::PrintValue(value, type(), output_scale_, &col_val->string_val);
+    col_val->__isset.string_val = true;
     return;
   }
   if (value == NULL) return;
@@ -437,42 +463,54 @@ void Expr::GetValue(TupleRow* row, bool as_ascii, TColumnValue* col_val) {
   string tmp;
   switch (type_.type) {
     case TYPE_BOOLEAN:
-      col_val->boolVal = *reinterpret_cast<bool*>(value);
-      col_val->__isset.boolVal = true;
+      col_val->__set_bool_val(*reinterpret_cast<bool*>(value));
       break;
     case TYPE_TINYINT:
-      col_val->intVal = *reinterpret_cast<int8_t*>(value);
-      col_val->__isset.intVal = true;
+      col_val->__set_byte_val(*reinterpret_cast<int8_t*>(value));
       break;
     case TYPE_SMALLINT:
-      col_val->intVal = *reinterpret_cast<int16_t*>(value);
-      col_val->__isset.intVal = true;
+      col_val->__set_short_val(*reinterpret_cast<int16_t*>(value));
       break;
     case TYPE_INT:
-      col_val->intVal = *reinterpret_cast<int32_t*>(value);
-      col_val->__isset.intVal = true;
+      col_val->__set_int_val(*reinterpret_cast<int32_t*>(value));
       break;
     case TYPE_BIGINT:
-      col_val->longVal = *reinterpret_cast<int64_t*>(value);
-      col_val->__isset.longVal = true;
+      col_val->__set_long_val(*reinterpret_cast<int64_t*>(value));
       break;
     case TYPE_FLOAT:
-      col_val->doubleVal = *reinterpret_cast<float*>(value);
-      col_val->__isset.doubleVal = true;
+      col_val->__set_double_val(*reinterpret_cast<float*>(value));
       break;
     case TYPE_DOUBLE:
-      col_val->doubleVal = *reinterpret_cast<double*>(value);
-      col_val->__isset.doubleVal = true;
+      col_val->__set_double_val(*reinterpret_cast<double*>(value));
+      break;
+    case TYPE_DECIMAL:
+      switch (type_.GetByteSize()) {
+        case 4:
+          col_val->string_val =
+              reinterpret_cast<Decimal4Value*>(value)->ToString(type_);
+          break;
+        case 8:
+          col_val->string_val =
+              reinterpret_cast<Decimal8Value*>(value)->ToString(type_);
+          break;
+        case 16:
+          col_val->string_val =
+              reinterpret_cast<Decimal16Value*>(value)->ToString(type_);
+          break;
+        default:
+          DCHECK(false) << "Bad Type: " << type_;
+      }
+      col_val->__isset.string_val = true;
       break;
     case TYPE_STRING:
       string_val = reinterpret_cast<StringValue*>(value);
       tmp.assign(static_cast<char*>(string_val->ptr), string_val->len);
-      col_val->stringVal.swap(tmp);
-      col_val->__isset.stringVal = true;
+      col_val->string_val.swap(tmp);
+      col_val->__isset.string_val = true;
       break;
     case TYPE_TIMESTAMP:
-      RawValue::PrintValue(value, type(), output_scale_, &col_val->stringVal);
-      col_val->__isset.stringVal = true;
+      RawValue::PrintValue(value, type(), output_scale_, &col_val->string_val);
+      col_val->__isset.string_val = true;
       break;
     default:
       DCHECK(false) << "bad GetValue() type: " << type_.DebugString();
@@ -519,7 +557,7 @@ bool Expr::codegend_fn_thread_safe() const {
 }
 
 Status Expr::Prepare(RuntimeState* state, const RowDescriptor& row_desc) {
-  if (type() == TYPE_DECIMAL) return Status("DECIMAL is not yet implemented.");
+  state_ = state;
   RETURN_IF_ERROR(PrepareChildren(state, row_desc));
   if (is_udf_call_) return Status::OK;
 
@@ -785,7 +823,8 @@ void Expr::SetComputeFn(void* jitted_function, int scratch_size) {
 }
 
 bool Expr::IsJittable(LlvmCodeGen* codegen) const {
-  if (type().type == TYPE_TIMESTAMP || type().type == TYPE_CHAR) return false;
+  if (type().type == TYPE_TIMESTAMP || type().type == TYPE_CHAR ||
+      type().type == TYPE_DECIMAL) return false;
   for (int i = 0; i < GetNumChildren(); ++i) {
     if (!children()[i]->IsJittable(codegen)) return false;
   }
@@ -969,7 +1008,7 @@ Status Expr::GetWrapperIrComputeFunction(LlvmCodeGen* codegen, Function** fn) {
 
 Function* Expr::CreateIrFunctionPrototype(LlvmCodeGen* codegen, const string& name,
                                           Value* (*args)[2]) {
-  Type* return_type = CodegenAnyVal::GetType(codegen, type());
+  Type* return_type = CodegenAnyVal::GetLoweredType(codegen, type());
   LlvmCodeGen::FnPrototype prototype(codegen, name, return_type);
   // TODO: Placeholder for ExprContext argument
   prototype.AddArgument(LlvmCodeGen::NamedVariable("context", codegen->ptr_type()));
@@ -987,6 +1026,8 @@ void Expr::InitBuiltinsDummy() {
   AggregateFunctions::InitNull(NULL, NULL);
   ComputeFunctions::Add_char_char(NULL, NULL);
   ConditionalFunctions::IsNull(NULL, NULL);
+  DecimalFunctions::Precision(NULL, NULL);
+  DecimalOperators::Cast_decimal_decimal(NULL, NULL);
   MathFunctions::Pi(NULL, NULL);
   StringFunctions::Length(NULL, NULL);
   TimestampFunctions::Year(NULL, NULL);
@@ -1059,6 +1100,26 @@ AnyVal* Expr::GetConstVal() {
         tv->ToTimestampVal(&v);
       }
       constant_val_.reset(new TimestampVal(v));
+      break;
+    }
+    case TYPE_DECIMAL: {
+      DecimalVal v = DecimalVal::null();
+      if (val != NULL) {
+        switch (type_.GetByteSize()) {
+          case 4:
+            v = DecimalVal(reinterpret_cast<Decimal4Value*>(val)->value());
+            break;
+          case 8:
+            v = DecimalVal(reinterpret_cast<Decimal8Value*>(val)->value());
+            break;
+          case 16:
+            v = DecimalVal(reinterpret_cast<Decimal16Value*>(val)->value());
+            break;
+          default:
+            DCHECK(false) << type_.GetByteSize();
+        }
+      }
+      constant_val_.reset(new DecimalVal(v));
       break;
     }
     default:

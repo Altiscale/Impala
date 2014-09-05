@@ -30,7 +30,7 @@
 #include "statestore/query-resource-mgr.h"
 #include "runtime/exec-env.h"
 #include "runtime/descriptors.h"  // for PlanNodeId
-#include "runtime/disk-io-mgr.h"  // for DiskIoMgr::ReaderContext
+#include "runtime/disk-io-mgr.h"  // for DiskIoMgr::RequestContext
 #include "runtime/mem-pool.h"
 #include "runtime/mem-tracker.h"
 #include "runtime/thread-resource-mgr.h"
@@ -41,6 +41,7 @@
 
 namespace impala {
 
+class Bitmap;
 class DescriptorTbl;
 class ObjectPool;
 class Status;
@@ -53,8 +54,8 @@ class DataStreamRecvr;
 // Counts how many rows an INSERT query has added to a particular partition
 // (partitions are identified by their partition keys: k1=v1/k2=v2
 // etc. Unpartitioned tables have a single 'default' partition which is
-// identified by the empty string.
-typedef std::map<std::string, int64_t> PartitionRowCount;
+// identified by ROOT_PARTITION_KEY.
+typedef std::map<std::string, TInsertPartitionStatus> PartitionStatusMap;
 
 // Stats per partition for insert queries. They key is the same as for PartitionRowCount
 typedef std::map<std::string, TInsertStats> PartitionInsertStats;
@@ -68,11 +69,11 @@ typedef std::map<std::string, std::string> FileMoveMap;
 // query and shared across all execution nodes of that query.
 class RuntimeState {
  public:
-  RuntimeState(const TUniqueId& query_id, const TUniqueId& fragment_instance_id,
-      const TQueryContext& query_ctxt, const std::string& cgroup, ExecEnv* exec_env);
+  RuntimeState(const TPlanFragmentInstanceCtx& fragment_instance_ctx,
+      const std::string& cgroup, ExecEnv* exec_env);
 
   // RuntimeState for executing expr in fe-support.
-  RuntimeState(const TQueryContext& query_ctxt);
+  RuntimeState(const TQueryCtx& query_ctx);
 
   // Empty d'tor to avoid issues with scoped_ptr.
   ~RuntimeState();
@@ -90,26 +91,39 @@ class RuntimeState {
   const DescriptorTbl& desc_tbl() const { return *desc_tbl_; }
   void set_desc_tbl(DescriptorTbl* desc_tbl) { desc_tbl_ = desc_tbl; }
   const TQueryOptions& query_options() const {
-    return query_ctxt_.request.query_options;
+    return query_ctx().request.query_options;
   }
-  int batch_size() const { return query_ctxt_.request.query_options.batch_size; }
+  int batch_size() const { return query_ctx().request.query_options.batch_size; }
   bool abort_on_error() const {
-    return query_ctxt_.request.query_options.abort_on_error;
+    return query_ctx().request.query_options.abort_on_error;
   }
   bool abort_on_default_limit_exceeded() const {
-    return query_ctxt_.request.query_options.abort_on_default_limit_exceeded;
+    return query_ctx().request.query_options.abort_on_default_limit_exceeded;
   }
-  int max_errors() const { return query_ctxt_.request.query_options.max_errors; }
-  const TQueryContext& query_ctxt() const { return query_ctxt_; }
-  const std::string& connected_user() const { return query_ctxt_.session.connected_user; }
+  int max_errors() const { return query_options().max_errors; }
+  const TQueryCtx& query_ctx() const { return fragment_instance_ctx_.query_ctx; }
+  const TPlanFragmentInstanceCtx& fragment_ctx() const { return fragment_instance_ctx_; }
+  const std::string& effective_user() const {
+    if (query_ctx().session.__isset.delegated_user &&
+        !query_ctx().session.delegated_user.empty()) {
+      return do_as_user();
+    }
+    return connected_user();
+  }
+  const std::string& do_as_user() const { return query_ctx().session.delegated_user; }
+  const std::string& connected_user() const {
+    return query_ctx().session.connected_user;
+  }
   const TimestampValue* now() const { return now_.get(); }
   void set_now(const TimestampValue* now);
   const std::vector<std::string>& error_log() const { return error_log_; }
   const std::vector<std::pair<std::string, int> >& file_errors() const {
     return file_errors_;
   }
-  const TUniqueId& query_id() const { return query_id_; }
-  const TUniqueId& fragment_instance_id() const { return fragment_instance_id_; }
+  const TUniqueId& query_id() const { return query_ctx().query_id; }
+  const TUniqueId& fragment_instance_id() const {
+    return fragment_instance_ctx_.fragment_instance_id;
+  }
   const std::string& cgroup() const { return cgroup_; }
   ExecEnv* exec_env() { return exec_env_; }
   DataStreamMgr* stream_mgr() { return exec_env_->stream_mgr(); }
@@ -126,17 +140,43 @@ class RuntimeState {
   ThreadResourceMgr::ResourcePool* resource_pool() { return resource_pool_; }
 
   FileMoveMap* hdfs_files_to_move() { return &hdfs_files_to_move_; }
-  PartitionRowCount* num_appended_rows() { return &num_appended_rows_; }
-  PartitionInsertStats* insert_stats() { return &insert_stats_; }
-  std::vector<DiskIoMgr::ReaderContext*>* reader_contexts() { return &reader_contexts_; }
+  std::vector<DiskIoMgr::RequestContext*>* reader_contexts() { return &reader_contexts_; }
+
+  void set_fragment_root_id(PlanNodeId id) {
+    DCHECK_EQ(root_node_id_, -1) << "Should not set this twice.";
+    root_node_id_ = id;
+  }
+
+  // The seed value to use when hashing tuples.
+  // See comment on root_node_id_.
+  uint32_t fragment_hash_seed() const { return root_node_id_; }
+
+  // Size to use when building bitmap filters. This is a prime number which reduces
+  // collisions and the resulting bitmap is just under 4Kb.
+  // Having all bitmaps be the same size allows us to combine (i.e. AND) bitmaps.
+  uint32_t slot_filter_bitmap_size() const { return 32213; }
+
+  // Adds a bitmap filter on slot 'slot'. If hash(slot) % bitmap.Size() is false, this
+  // value can be filtered out. Multiple bitmap filters can be added to a single slot.
+  // Thread safe.
+  void AddBitmapFilter(SlotId slot, const Bitmap* bitmap);
+
+  // Returns bitmap filter on 'slot'. Returns NULL if there are no bitmap filters on this
+  // slot.
+  // It is not safe to concurrently call AddBitmapFilter() and GetBitmapFilter().
+  // All calls to AddBitmapFilter() should happen before.
+  const Bitmap* GetBitmapFilter(SlotId slot) {
+    if (slot_bitmap_filters_.find(slot) == slot_bitmap_filters_.end()) return NULL;
+    return slot_bitmap_filters_[slot];
+  }
+
+  PartitionStatusMap* per_partition_status() { return &per_partition_status_; }
 
   // Returns runtime state profile
   RuntimeProfile* runtime_profile() { return &profile_; }
 
   // Returns true if codegen is enabled for this query.
-  bool codegen_enabled() const {
-    return !query_ctxt_.request.query_options.disable_codegen;
-  }
+  bool codegen_enabled() const { return !query_options().disable_codegen; }
 
   // Returns CodeGen object.  Returns NULL if the codegen object has not been
   // created. If codegen is enabled for the query, the codegen object will be
@@ -157,12 +197,6 @@ class RuntimeState {
 
   MemPool* udf_pool() { return udf_pool_.get(); };
 
-  // Create and return a stream receiver for fragment_instance_id_
-  // from the data stream manager. The receiver is added to data_stream_recvrs_pool_.
-  DataStreamRecvr* CreateRecvr(
-      const RowDescriptor& row_desc, PlanNodeId dest_node_id, int num_senders,
-      int buffer_size, RuntimeProfile* profile);
-
   // Appends error to the error_log_ if there is space. Returns true if there was space
   // and the error was logged.
   bool LogError(const std::string& error);
@@ -173,7 +207,7 @@ class RuntimeState {
   // Returns true if the error log has not reached max_errors_.
   bool LogHasSpace() {
     boost::lock_guard<boost::mutex> l(error_log_lock_);
-    return error_log_.size() < query_ctxt_.request.query_options.max_errors;
+    return error_log_.size() < query_options().max_errors;
   }
 
   // Report that num_errors occurred while parsing file_name.
@@ -234,19 +268,12 @@ class RuntimeState {
 
  private:
   // Set per-fragment state.
-  Status Init(const TUniqueId& fragment_instance_id, ExecEnv* exec_env);
+  Status Init(ExecEnv* exec_env);
 
   static const int DEFAULT_BATCH_SIZE = 1024;
 
   DescriptorTbl* desc_tbl_;
   boost::scoped_ptr<ObjectPool> obj_pool_;
-
-  // Data stream receivers created by a plan fragment are gathered here to make sure
-  // they are destroyed before obj_pool_ (class members are destroyed in reverse order).
-  // Receivers depend on the descriptor table and we need to guarantee that their control
-  // blocks are removed from the data stream manager before the objects in the
-  // descriptor table are destroyed.
-  boost::scoped_ptr<ObjectPool> data_stream_recvrs_pool_;
 
   // Lock protecting error_log_ and unreported_error_idx_
   boost::mutex error_log_lock_;
@@ -263,16 +290,13 @@ class RuntimeState {
   // Stores the number of parse errors per file.
   std::vector<std::pair<std::string, int> > file_errors_;
 
-  // Query-global parameters used for preparing exprs as now(), user(), etc. that should
-  // return a consistent result regardless which impalad is evaluating the expr.
-  TQueryContext query_ctxt_;
+  // Context of this fragment instance, including its unique id, the total number
+  // of fragment instances, the query context, the coordinator address, etc.
+  TPlanFragmentInstanceCtx fragment_instance_ctx_;
 
   // Query-global timestamp, e.g., for implementing now(). Set from query_globals_.
   // Use pointer to avoid inclusion of timestampvalue.h and avoid clang issues.
   boost::scoped_ptr<TimestampValue> now_;
-
-  TUniqueId query_id_;
-  TUniqueId fragment_instance_id_;
 
   // The Impala-internal cgroup into which execution threads are assigned.
   // If empty, no RM is enabled.
@@ -288,11 +312,8 @@ class RuntimeState {
   // Mapping a filename to a blank destination causes it to be deleted.
   FileMoveMap hdfs_files_to_move_;
 
-  // Records the total number of appended rows per created Hdfs partition
-  PartitionRowCount num_appended_rows_;
-
-  // Insert stats per partition.
-  PartitionInsertStats insert_stats_;
+  // Records summary statistics for the results of inserts into Hdfs partitions.
+  PartitionStatusMap per_partition_status_;
 
   RuntimeProfile profile_;
 
@@ -334,7 +355,23 @@ class RuntimeState {
   QueryResourceMgr* query_resource_mgr_;
 
   // Reader contexts that need to be closed when the fragment is closed.
-  std::vector<DiskIoMgr::ReaderContext*> reader_contexts_;
+  std::vector<DiskIoMgr::RequestContext*> reader_contexts_;
+
+  // This is the node id of the root node for this plan fragment. This is used as the
+  // hash seed and has two useful properties:
+  // 1) It is the same for all exec nodes in a fragment, so the resulting hash values
+  // can be shared (i.e. for slot_bitmap_filters_).
+  // 2) It is different between different fragments, so we do not run into hash
+  // collisions after data partitioning (across fragments). See IMPALA-219 for more
+  // details.
+  PlanNodeId root_node_id_;
+
+  // Lock protecting slot_bitmap_filters_
+  boost::mutex bitmap_lock_;
+
+  // Bitmap filter on the hash for 'SlotId'. If bitmap[hash(slot]] is unset, this
+  // value can be filtered out. These filters are generated during the query execution.
+  boost::unordered_map<SlotId, Bitmap*> slot_bitmap_filters_;
 
   // prohibit copies
   RuntimeState(const RuntimeState&);

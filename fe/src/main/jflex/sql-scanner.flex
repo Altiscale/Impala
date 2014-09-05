@@ -16,6 +16,7 @@ package com.cloudera.impala.analysis;
 
 import java_cup.runtime.Symbol;
 import java.lang.Integer;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
@@ -54,6 +55,7 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("all", new Integer(SqlParserSymbols.KW_ALL));
     keywordMap.put("alter", new Integer(SqlParserSymbols.KW_ALTER));
     keywordMap.put("and", new Integer(SqlParserSymbols.KW_AND));
+    keywordMap.put("api_version", new Integer(SqlParserSymbols.KW_API_VERSION));
     keywordMap.put("as", new Integer(SqlParserSymbols.KW_AS));
     keywordMap.put("asc", new Integer(SqlParserSymbols.KW_ASC));
     keywordMap.put("avro", new Integer(SqlParserSymbols.KW_AVRO));
@@ -62,10 +64,12 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("binary", new Integer(SqlParserSymbols.KW_BINARY));
     keywordMap.put("boolean", new Integer(SqlParserSymbols.KW_BOOLEAN));
     keywordMap.put("by", new Integer(SqlParserSymbols.KW_BY));
+    keywordMap.put("cached", new Integer(SqlParserSymbols.KW_CACHED));
     keywordMap.put("case", new Integer(SqlParserSymbols.KW_CASE));
     keywordMap.put("cast", new Integer(SqlParserSymbols.KW_CAST));
     keywordMap.put("change", new Integer(SqlParserSymbols.KW_CHANGE));
     keywordMap.put("char", new Integer(SqlParserSymbols.KW_CHAR));
+    keywordMap.put("class", new Integer(SqlParserSymbols.KW_CLASS));
     keywordMap.put("close_fn", new Integer(SqlParserSymbols.KW_CLOSE_FN));
     keywordMap.put("column", new Integer(SqlParserSymbols.KW_COLUMN));
     keywordMap.put("columns", new Integer(SqlParserSymbols.KW_COLUMNS));
@@ -143,7 +147,9 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("parquetfile", new Integer(SqlParserSymbols.KW_PARQUETFILE));
     keywordMap.put("partition", new Integer(SqlParserSymbols.KW_PARTITION));
     keywordMap.put("partitioned", new Integer(SqlParserSymbols.KW_PARTITIONED));
+    keywordMap.put("partitions", new Integer(SqlParserSymbols.KW_PARTITIONS));
     keywordMap.put("prepare_fn", new Integer(SqlParserSymbols.KW_PREPARE_FN));
+    keywordMap.put("produced", new Integer(SqlParserSymbols.KW_PRODUCED));
     keywordMap.put("rcfile", new Integer(SqlParserSymbols.KW_RCFILE));
     keywordMap.put("real", new Integer(SqlParserSymbols.KW_DOUBLE));
     keywordMap.put("refresh", new Integer(SqlParserSymbols.KW_REFRESH));
@@ -179,6 +185,7 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     keywordMap.put("tinyint", new Integer(SqlParserSymbols.KW_TINYINT));
     keywordMap.put("to", new Integer(SqlParserSymbols.KW_TO));
     keywordMap.put("true", new Integer(SqlParserSymbols.KW_TRUE));
+    keywordMap.put("uncached", new Integer(SqlParserSymbols.KW_UNCACHED));
     keywordMap.put("union", new Integer(SqlParserSymbols.KW_UNION));
     keywordMap.put("update_fn", new Integer(SqlParserSymbols.KW_UPDATE_FN));
     keywordMap.put("use", new Integer(SqlParserSymbols.KW_USE));
@@ -208,8 +215,8 @@ import com.cloudera.impala.analysis.SqlParserSymbols;
     tokenIdMap.put(new Integer(SqlParserSymbols.RPAREN), ")");
     tokenIdMap.put(new Integer(SqlParserSymbols.LBRACKET), "[");
     tokenIdMap.put(new Integer(SqlParserSymbols.RBRACKET), "]");
-    tokenIdMap.put(new Integer(SqlParserSymbols.FLOATINGPOINT_LITERAL),
-        "FLOATING POINT LITERAL");
+    tokenIdMap.put(new Integer(SqlParserSymbols.DECIMAL_LITERAL),
+        "DECIMAL LITERAL");
     tokenIdMap.put(new Integer(SqlParserSymbols.INTEGER_LITERAL), "INTEGER LITERAL");
     tokenIdMap.put(new Integer(SqlParserSymbols.NOT), "!");
     tokenIdMap.put(new Integer(SqlParserSymbols.LESSTHAN), "<");
@@ -261,7 +268,7 @@ FLit1 = [0-9]+ \. [0-9]*
 FLit2 = \. [0-9]+
 FLit3 = [0-9]+
 Exponent = [eE] [+-]? [0-9]+
-DoubleLiteral = ({FLit1}|{FLit2}|{FLit3}) {Exponent}?
+DecimalLiteral = ({FLit1}|{FLit2}|{FLit3}) {Exponent}?
 
 IdentifierOrKw = [:digit:]*[:jletter:][:jletterdigit:]* | "&&" | "||"
 QuotedIdentifier = \`(\\.|[^\\\`])*\`
@@ -310,18 +317,14 @@ EndOfLineComment = "--" {NonTerminator}* {LineTerminator}?
   return newToken(SqlParserSymbols.INTEGER_LITERAL, val);
 }
 
-{DoubleLiteral} {
-  Double val = null;
+{DecimalLiteral} {
+  BigDecimal val = null;
   try {
-    val = new Double(yytext());
+    val = new BigDecimal(yytext());
   } catch (NumberFormatException e) {
     return newToken(SqlParserSymbols.NUMERIC_OVERFLOW, yytext());
   }
-  // conversion succeeded but literal is infinity or not a number
-  if (val.isInfinite() || val.isNaN()) {
-   return newToken(SqlParserSymbols.NUMERIC_OVERFLOW, yytext());
-  }
-  return newToken(SqlParserSymbols.FLOATINGPOINT_LITERAL, val);
+  return newToken(SqlParserSymbols.DECIMAL_LITERAL, val);
 }
 
 {QuotedIdentifier} {

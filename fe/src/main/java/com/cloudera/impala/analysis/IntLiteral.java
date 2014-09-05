@@ -114,10 +114,8 @@ public class IntLiteral extends LiteralExpr {
     if (targetType.isIntegerType()) {
       this.type_ = targetType;
       return this;
-    } else if (targetType.isFloatingPointType()) {
-      return new FloatLiteral(new Double(value_.longValue()), targetType);
-    } else if (targetType.isDecimal()) {
-      return new CastExpr(targetType, this, true);
+    } else if (targetType.isFloatingPointType() || targetType.isDecimal()) {
+      return new DecimalLiteral(value_, targetType);
     }
     Preconditions.checkState(false, "Unhandled case");
     return this;

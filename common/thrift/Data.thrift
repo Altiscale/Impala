@@ -35,22 +35,45 @@ struct TRowBatch {
   // TODO: figure out how we can avoid copying the data during TRowBatch construction
   4: string tuple_data
 
-  // Indicates whether tuple_data is snappy-compressed
-  5: bool is_compressed
+  // Indicates the type of compression used
+  5: required CatalogObjects.THdfsCompression compression_type
+
+  // Indicates the uncompressed size
+  6:i32 uncompressed_size
 }
 
 // this is a union over all possible return types
 struct TColumnValue {
-  // TODO: use <type>_val instead of camelcase
-  1: optional bool boolVal
-  2: optional i32 intVal
-  3: optional i64 longVal
-  4: optional double doubleVal
-  5: optional string stringVal
+  1: optional bool bool_val
+  6: optional byte byte_val
+  7: optional i16 short_val
+  2: optional i32 int_val
+  3: optional i64 long_val
+  4: optional double double_val
+  5: optional string string_val
+  8: optional binary binary_val
 }
 
 struct TResultRow {
   1: list<TColumnValue> colVals
+}
+
+// A union over all possible return types for a column of data
+// Currently only used by ExternalDataSource types
+struct TColumnData {
+  // One element in the list for every row in the column indicating if there is
+  // a value in the vals list or a null.
+  1: required list<bool> is_null;
+
+  // Only one is set, only non-null values are set.
+  2: optional list<bool> bool_vals;
+  3: optional list<byte> byte_vals;
+  4: optional list<i16> short_vals;
+  5: optional list<i32> int_vals;
+  6: optional list<i64> long_vals;
+  7: optional list<double> double_vals;
+  8: optional list<string> string_vals;
+  9: optional list<binary> binary_vals;
 }
 
 struct TResultSetMetadata {

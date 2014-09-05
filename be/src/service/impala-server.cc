@@ -47,6 +47,7 @@
 #include "runtime/exec-env.h"
 #include "runtime/lib-cache.h"
 #include "runtime/timestamp-value.h"
+#include "runtime/tmp-file-mgr.h"
 #include "service/fragment-exec-state.h"
 #include "service/query-exec-state.h"
 #include "statestore/simple-scheduler.h"
@@ -59,6 +60,7 @@
 #include "util/network-util.h"
 #include "util/parse-util.h"
 #include "util/string-parser.h"
+#include "util/uid-util.h"
 
 #include "gen-cpp/Types_types.h"
 #include "gen-cpp/ImpalaService.h"
@@ -201,13 +203,21 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
   // Initialize default config
   InitializeConfigVariables();
 
-  frontend_.reset(new Frontend());
-
-  Status status = frontend_->ValidateSettings();
+  Status status = exec_env_->frontend()->ValidateSettings();
   if (!status.ok()) {
     LOG(ERROR) << status.GetErrorMsg();
     if (FLAGS_abort_on_config_error) {
       LOG(ERROR) << "Aborting Impala Server startup due to improper configuration";
+      exit(1);
+    }
+  }
+
+  status = TmpFileMgr::Init();
+  if (!status.ok()) {
+    LOG(ERROR) << status.GetErrorMsg();
+    if (FLAGS_abort_on_config_error) {
+      LOG(ERROR) << "Aborting Impala Server startup due to improperly "
+                  << "configured scratch directories.";
       exit(1);
     }
   }
@@ -225,7 +235,7 @@ ImpalaServer::ImpalaServer(ExecEnv* exec_env)
 
   if (!FLAGS_authorized_proxy_user_config.empty()) {
     // Parse the proxy user configuration using the format:
-    // <proxy user>=<comma separated list of users they are allowed to impersonate>
+    // <proxy user>=<comma separated list of users they are allowed to delegate>
     // See FLAGS_authorized_proxy_user_config for more details.
     vector<string> proxy_user_config;
     split(proxy_user_config, FLAGS_authorized_proxy_user_config, is_any_of(";"),
@@ -320,16 +330,13 @@ Status ImpalaServer::LogAuditRecord(const ImpalaServer::QueryExecState& exec_sta
   writer.String("status");
   writer.String(exec_state.query_status().GetErrorMsg().c_str());
   writer.String("user");
-  // If do_as_user() is empty, the "user" field should be set to the connected user
-  // and "impersonator" field should be Null. Otherwise, the "user" should be set to
-  // the current do_as_user() and "impersonator" should be the connected user.
+  writer.String(exec_state.effective_user().c_str());
+  writer.String("impersonator");
   if (exec_state.do_as_user().empty()) {
-    writer.String(exec_state.connected_user().c_str());
-    writer.String("impersonator");
+    // If there is no do_as_user() is empty, the "impersonator" field should be Null.
     writer.Null();
   } else {
-    writer.String(exec_state.do_as_user().c_str());
-    writer.String("impersonator");
+    // Otherwise, the delegator is the current connected user.
     writer.String(exec_state.connected_user().c_str());
   }
   writer.String("statement_type");
@@ -443,6 +450,22 @@ Status ImpalaServer::GetRuntimeProfileStr(const TUniqueId& query_id,
   return Status::OK;
 }
 
+Status ImpalaServer::GetExecSummary(const TUniqueId& query_id, TExecSummary* result) {
+  // TODO: this is only populated when the query is done currently so only look
+  // in the log. We'll have to make it thread safe for in flight queries.
+  {
+    lock_guard<mutex> l(query_log_lock_);
+    QueryLogIndex::const_iterator query_record = query_log_index_.find(query_id);
+    if (query_record == query_log_index_.end()) {
+      stringstream ss;
+      ss << "Query id " << PrintId(query_id) << " not found.";
+      return Status(ss.str());
+    }
+    *result = query_record->second->exec_summary;
+  }
+  return Status::OK;
+}
+
 void ImpalaServer::LogFileFlushThread() {
   while (true) {
     sleep(5);
@@ -486,6 +509,9 @@ void ImpalaServer::ArchiveQuery(const QueryExecState& query) {
 
   if (FLAGS_query_log_size == 0) return;
   QueryStateRecord record(query, true, encoded_profile_str);
+  if (query.coord() != NULL) {
+    record.exec_summary = query.coord()->exec_summary();
+  }
   {
     lock_guard<mutex> l(query_log_lock_);
     // Add record to the beginning of the log, and to the lookup index.
@@ -501,13 +527,13 @@ void ImpalaServer::ArchiveQuery(const QueryExecState& query) {
 
 ImpalaServer::~ImpalaServer() {}
 
-Status ImpalaServer::Execute(TQueryContext* query_ctxt,
+Status ImpalaServer::Execute(TQueryCtx* query_ctx,
     shared_ptr<SessionState> session_state,
     shared_ptr<QueryExecState>* exec_state) {
-  PrepareQueryContext(query_ctxt);
+  PrepareQueryContext(query_ctx);
   bool registered_exec_state;
   ImpaladMetrics::IMPALA_SERVER_NUM_QUERIES->Increment(1L);
-  Status status = ExecuteInternal(*query_ctxt, session_state, &registered_exec_state,
+  Status status = ExecuteInternal(*query_ctx, session_state, &registered_exec_state,
       exec_state);
   if (!status.ok() && registered_exec_state) {
     UnregisterQuery((*exec_state)->query_id(), &status);
@@ -516,7 +542,7 @@ Status ImpalaServer::Execute(TQueryContext* query_ctxt,
 }
 
 Status ImpalaServer::ExecuteInternal(
-    const TQueryContext& query_ctxt,
+    const TQueryCtx& query_ctx,
     shared_ptr<SessionState> session_state,
     bool* registered_exec_state,
     shared_ptr<QueryExecState>* exec_state) {
@@ -526,7 +552,7 @@ Status ImpalaServer::ExecuteInternal(
   }
   *registered_exec_state = false;
 
-  exec_state->reset(new QueryExecState(query_ctxt, exec_env_, frontend_.get(),
+  exec_state->reset(new QueryExecState(query_ctx, exec_env_, exec_env_->frontend(),
       this, session_state));
 
   (*exec_state)->query_events()->MarkEvent("Start execution");
@@ -553,7 +579,7 @@ Status ImpalaServer::ExecuteInternal(
     *registered_exec_state = true;
 
     RETURN_IF_ERROR((*exec_state)->UpdateQueryStatus(
-        frontend_->GetExecRequest(query_ctxt, &result)));
+        exec_env_->frontend()->GetExecRequest(query_ctx, &result)));
     (*exec_state)->query_events()->MarkEvent("Planning finished");
     if (result.__isset.result_set_metadata) {
       (*exec_state)->set_result_metadata(result.result_set_metadata);
@@ -585,9 +611,18 @@ Status ImpalaServer::ExecuteInternal(
   return Status::OK;
 }
 
-void ImpalaServer::PrepareQueryContext(TQueryContext* query_ctxt) {
-  query_ctxt->__set_pid(getpid());
-  query_ctxt->__set_now_string(TimestampValue::local_time_micros().DebugString());
+void ImpalaServer::PrepareQueryContext(TQueryCtx* query_ctx) {
+  query_ctx->__set_pid(getpid());
+  query_ctx->__set_now_string(TimestampValue::local_time_micros().DebugString());
+  query_ctx->__set_coord_address(MakeNetworkAddress(FLAGS_hostname, FLAGS_be_port));
+
+  // Creating a random_generator every time is not free, but
+  // benchmarks show it to be slightly cheaper than contending for a
+  // single generator under a lock (since random_generator is not
+  // thread-safe).
+  random_generator uuid_generator;
+  uuid query_uuid = uuid_generator();
+  UUIDToTUniqueId(query_uuid, &query_ctx->query_id);
 }
 
 Status ImpalaServer::RegisterQuery(shared_ptr<SessionState> session_state,
@@ -656,9 +691,10 @@ bool ImpalaServer::UnregisterQuery(const TUniqueId& query_id, const Status* caus
     exec_state->session()->inflight_queries.erase(query_id);
   }
 
-  ArchiveQuery(*exec_state);
-
   if (exec_state->coord() != NULL) {
+    const string exec_summary = exec_state->coord()->PrintExecSummary();
+    exec_state->summary_profile()->AddInfoString("ExecSummary", exec_summary);
+
     const unordered_set<TNetworkAddress>& unique_hosts =
         exec_state->schedule()->unique_hosts();
     if (!unique_hosts.empty()) {
@@ -676,6 +712,8 @@ bool ImpalaServer::UnregisterQuery(const TUniqueId& query_id, const Status* caus
     }
   }
 
+
+  ArchiveQuery(*exec_state);
   return true;
 }
 
@@ -699,12 +737,12 @@ void ImpalaServer::Wait(shared_ptr<QueryExecState> exec_state) {
 
 Status ImpalaServer::UpdateCatalogMetrics() {
   TGetDbsResult db_names;
-  RETURN_IF_ERROR(frontend_->GetDbNames(NULL, NULL, &db_names));
+  RETURN_IF_ERROR(exec_env_->frontend()->GetDbNames(NULL, NULL, &db_names));
   ImpaladMetrics::CATALOG_NUM_DBS->Update(db_names.dbs.size());
   ImpaladMetrics::CATALOG_NUM_TABLES->Update(0L);
   BOOST_FOREACH(const string& db, db_names.dbs) {
     TGetTablesResult table_names;
-    RETURN_IF_ERROR(frontend_->GetTableNames(db, NULL, NULL, &table_names));
+    RETURN_IF_ERROR(exec_env_->frontend()->GetTableNames(db, NULL, NULL, &table_names));
     ImpaladMetrics::CATALOG_NUM_TABLES->Increment(table_names.tables.size());
   }
 
@@ -954,6 +992,10 @@ Status ImpalaServer::SetQueryOptions(const string& key, const string& value,
         query_options->__set_disable_cached_reads(
             iequals(value, "true") || iequals(value, "1"));
         break;
+      case TImpalaQueryOptions::DISABLE_OUTERMOST_TOPN:
+        query_options->__set_disable_outermost_topn(
+            iequals(value, "true") || iequals(value, "1"));
+        break;
       default:
         // We hit this DCHECK(false) if we forgot to add the corresponding entry here
         // when we add a new query option.
@@ -978,8 +1020,10 @@ inline shared_ptr<ImpalaServer::FragmentExecState> ImpalaServer::GetFragmentExec
 
 void ImpalaServer::ExecPlanFragment(
     TExecPlanFragmentResult& return_val, const TExecPlanFragmentParams& params) {
-  VLOG_QUERY << "ExecPlanFragment() instance_id=" << params.params.fragment_instance_id
-             << " coord=" << params.coord << " backend#=" << params.backend_num;
+  VLOG_QUERY << "ExecPlanFragment() instance_id="
+             << params.fragment_instance_ctx.fragment_instance_id
+             << " coord=" << params.fragment_instance_ctx.query_ctx.coord_address
+             << " backend#=" << params.fragment_instance_ctx.backend_num;
   StartPlanFragmentExecution(params).SetTStatus(&return_val);
 }
 
@@ -1034,12 +1078,14 @@ void ImpalaServer::TransmitData(
   VLOG_ROW << "TransmitData(): instance_id=" << params.dest_fragment_instance_id
            << " node_id=" << params.dest_node_id
            << " #rows=" << params.row_batch.num_rows
+           << "sender_id=" << params.sender_id
            << " eos=" << (params.eos ? "true" : "false");
   // TODO: fix Thrift so we can simply take ownership of thrift_batch instead
   // of having to copy its data
   if (params.row_batch.num_rows > 0) {
     Status status = exec_env_->stream_mgr()->AddData(
-        params.dest_fragment_instance_id, params.dest_node_id, params.row_batch);
+        params.dest_fragment_instance_id, params.dest_node_id, params.row_batch,
+        params.sender_id);
     status.SetTStatus(&return_val);
     if (!status.ok()) {
       // should we close the channel here as well?
@@ -1049,7 +1095,8 @@ void ImpalaServer::TransmitData(
 
   if (params.eos) {
     exec_env_->stream_mgr()->CloseSender(
-        params.dest_fragment_instance_id, params.dest_node_id).SetTStatus(&return_val);
+        params.dest_fragment_instance_id, params.dest_node_id,
+        params.sender_id).SetTStatus(&return_val);
   }
 }
 
@@ -1059,11 +1106,8 @@ Status ImpalaServer::StartPlanFragmentExecution(
     return Status("missing sink in plan fragment");
   }
 
-  const TPlanFragmentExecParams& params = exec_params.params;
   shared_ptr<FragmentExecState> exec_state(
-      new FragmentExecState(
-        params.query_id, exec_params.backend_num, params.fragment_instance_id,
-        exec_env_, exec_params.coord));
+      new FragmentExecState(exec_params.fragment_instance_ctx, exec_env_));
   // Call Prepare() now, before registering the exec state, to avoid calling
   // exec_state->Cancel().
   // We might get an async cancellation, and the executor requires that Cancel() not
@@ -1073,7 +1117,8 @@ Status ImpalaServer::StartPlanFragmentExecution(
   {
     lock_guard<mutex> l(fragment_exec_state_map_lock_);
     // register exec_state before starting exec thread
-    fragment_exec_state_map_.insert(make_pair(params.fragment_instance_id, exec_state));
+    fragment_exec_state_map_.insert(
+        make_pair(exec_params.fragment_instance_ctx.fragment_instance_id, exec_state));
   }
 
   // execute plan fragment in new thread
@@ -1227,6 +1272,9 @@ void ImpalaServer::TQueryOptionsToMap(const TQueryOptions& query_option,
       case TImpalaQueryOptions::DISABLE_CACHED_READS:
         val << query_option.disable_cached_reads;
         break;
+      case TImpalaQueryOptions::DISABLE_OUTERMOST_TOPN:
+        val << query_option.disable_outermost_topn;
+        break;
       default:
         // We hit this DCHECK(false) if we forgot to add the corresponding entry here
         // when we add a new query option.
@@ -1244,9 +1292,9 @@ void ImpalaServer::SessionState::ToThrift(const TUniqueId& session_id,
   state->session_type = session_type;
   state->database = database;
   state->connected_user = connected_user;
-  // The do_as_user will only be set if impersonation is enabled and the
-  // proxy user is authorized to impersonate as this user.
-  if (!do_as_user.empty()) state->__set_impersonated_user(do_as_user);
+  // The do_as_user will only be set if delegation is enabled and the
+  // proxy user is authorized to delegate as this user.
+  if (!do_as_user.empty()) state->__set_delegated_user(do_as_user);
   state->network_address = network_address;
 }
 
@@ -1269,16 +1317,16 @@ void ImpalaServer::CancelFromThreadPool(uint32_t thread_id,
 
 Status ImpalaServer::AuthorizeProxyUser(const string& user, const string& do_as_user) {
   if (user.empty()) {
-    return Status("Unable to impersonate using empty proxy username.");
+    return Status("Unable to delegate using empty proxy username.");
   } else if (user.empty()) {
-    return Status("Unable to impersonate using empty doAs username.");
+    return Status("Unable to delegate using empty doAs username.");
   }
 
   stringstream error_msg;
-  error_msg << "User '" << user << "' is not authorized to impersonate '"
+  error_msg << "User '" << user << "' is not authorized to delegate to '"
             << do_as_user << "'.";
   if (authorized_proxy_user_config_.size() == 0) {
-    error_msg << " User impersonation is disabled.";
+    error_msg << " User delegation is disabled.";
     return Status(error_msg.str());
   }
 
@@ -1291,7 +1339,7 @@ Status ImpalaServer::AuthorizeProxyUser(const string& user, const string& do_as_
       end_idx == string::npos || end_idx == 0 ? user : user.substr(0, end_idx));
 
   // Check if the proxy user exists. If he/she does, then check if they are allowed
-  // to impersonate the do_as_user.
+  // to delegate to the do_as_user.
   ProxyUserMap::const_iterator proxy_user =
       authorized_proxy_user_config_.find(short_user);
   if (proxy_user != authorized_proxy_user_config_.end()) {
@@ -1332,20 +1380,24 @@ void ImpalaServer::CatalogUpdateCallback(
         new_catalog_version = catalog_object.catalog_version;
       }
 
-      // Refresh the lib cache entries of any added functions
+      // Refresh the lib cache entries of any added functions and data sources
       if (catalog_object.type == TCatalogObjectType::FUNCTION) {
         DCHECK(catalog_object.__isset.fn);
         LibCache::instance()->SetNeedsRefresh(catalog_object.fn.hdfs_location);
+      }
+      if (catalog_object.type == TCatalogObjectType::DATA_SOURCE) {
+        DCHECK(catalog_object.__isset.data_source);
+        LibCache::instance()->SetNeedsRefresh(catalog_object.data_source.hdfs_location);
       }
 
       update_req.updated_objects.push_back(catalog_object);
     }
 
-    // We need to look up the dropped functions and remove them from the library
-    // cache. The data sent from the catalog service does not contain all the
-    // function metadata so we'll ask our local frontend for it. We need to do
-    // this before updating the catalog.
-    vector<TCatalogObject> dropped_functions;
+    // We need to look up the dropped functions and data sources and remove them
+    // from the library cache. The data sent from the catalog service does not
+    // contain all the function metadata so we'll ask our local frontend for it. We
+    // need to do this before updating the catalog.
+    vector<TCatalogObject> dropped_objects;
 
     // Process all Catalog deletions (dropped objects). We only know the keys (object
     // names) so must parse each key to determine the TCatalogObject.
@@ -1359,14 +1411,19 @@ void ImpalaServer::CatalogUpdateCallback(
         continue;
       }
       update_req.removed_objects.push_back(catalog_object);
-      if (catalog_object.type == TCatalogObjectType::FUNCTION) {
-        TCatalogObject dropped_function;
-        if (frontend_->GetCatalogObject(catalog_object, &dropped_function).ok()) {
-          // This function may have been dropped and re-created. To avoid removing the
-          // re-created function's entry from the cache verify the existing function has a
+      if (catalog_object.type == TCatalogObjectType::FUNCTION ||
+          catalog_object.type == TCatalogObjectType::DATA_SOURCE) {
+        TCatalogObject dropped_object;
+        if (exec_env_->frontend()->GetCatalogObject(
+                catalog_object, &dropped_object).ok()) {
+          // This object may have been dropped and re-created. To avoid removing the
+          // re-created object's entry from the cache verify the existing object has a
           // catalog version <= the catalog version included in this statestore heartbeat.
-          if (dropped_function.catalog_version <= new_catalog_version) {
-            dropped_functions.push_back(dropped_function);
+          if (dropped_object.catalog_version <= new_catalog_version) {
+            if (catalog_object.type == TCatalogObjectType::FUNCTION ||
+                catalog_object.type == TCatalogObjectType::DATA_SOURCE) {
+              dropped_objects.push_back(dropped_object);
+            }
           }
         }
         // Nothing to do in error case.
@@ -1375,7 +1432,7 @@ void ImpalaServer::CatalogUpdateCallback(
 
     // Call the FE to apply the changes to the Impalad Catalog.
     TUpdateCatalogCacheResponse resp;
-    Status s = frontend_->UpdateCatalogCache(update_req, &resp);
+    Status s = exec_env_->frontend()->UpdateCatalogCache(update_req, &resp);
     if (!s.ok()) {
       LOG(ERROR) << "There was an error processing the impalad catalog update. Requesting"
                  << " a full topic update to recover: " << s.GetErrorMsg();
@@ -1384,7 +1441,8 @@ void ImpalaServer::CatalogUpdateCallback(
       update.topic_name = CatalogServer::IMPALA_CATALOG_TOPIC;
       update.__set_from_version(0L);
       ImpaladMetrics::CATALOG_READY->Update(false);
-      // Dropped all cached lib files (this behaves as if all functions are dropped).
+      // Dropped all cached lib files (this behaves as if all functions and data
+      // sources are dropped).
       LibCache::instance()->DropCache();
     } else {
       {
@@ -1395,10 +1453,16 @@ void ImpalaServer::CatalogUpdateCallback(
       }
       ImpaladMetrics::CATALOG_READY->Update(new_catalog_version > 0);
       UpdateCatalogMetrics();
-      // Remove all dropped functions from the library cache.
+      // Remove all dropped objects from the library cache.
       // TODO: is this expensive? We'd like to process heartbeats promptly.
-      for (int i = 0; i < dropped_functions.size(); ++i) {
-        LibCache::instance()->RemoveEntry(dropped_functions[i].fn.hdfs_location);
+      BOOST_FOREACH(TCatalogObject& object, dropped_objects) {
+        if (object.type == TCatalogObjectType::FUNCTION) {
+          LibCache::instance()->RemoveEntry(object.fn.hdfs_location);
+        } else if (object.type == TCatalogObjectType::DATA_SOURCE) {
+          LibCache::instance()->RemoveEntry(object.data_source.hdfs_location);
+        } else {
+          DCHECK(false);
+        }
       }
     }
   }
@@ -1432,7 +1496,7 @@ Status ImpalaServer::ProcessCatalogUpdateResult(
     }
      // Apply the changes to the local catalog cache.
     TUpdateCatalogCacheResponse resp;
-    Status status = frontend_->UpdateCatalogCache(update_req, &resp);
+    Status status = exec_env_->frontend()->UpdateCatalogCache(update_req, &resp);
     if (!status.ok()) LOG(ERROR) << status.GetErrorMsg();
     return status;
   } else {
@@ -1569,7 +1633,7 @@ ImpalaServer::QueryStateRecord::QueryStateRecord(const QueryExecState& exec_stat
 
   stmt = exec_state.sql_stmt();
   stmt_type = request.stmt_type;
-  user = exec_state.connected_user();
+  effective_user = exec_state.effective_user();
   default_db = exec_state.default_db();
   start_time = exec_state.start_time();
   end_time = exec_state.end_time();

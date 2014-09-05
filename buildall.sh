@@ -163,6 +163,11 @@ fi
 # option to clean everything first
 if [ $CLEAN_ACTION -eq 1 ]
 then
+  # clean the external data source project
+  cd ${IMPALA_HOME}/ext-data-source
+  rm -rf api/generated-sources/*
+  mvn clean
+
   # clean fe
   # don't use git clean because we need to retain Eclipse conf files
   cd $IMPALA_FE_DIR
@@ -213,15 +218,14 @@ then
   (cd $IMPALA_LZO; cmake .; make)
 fi
 
-# Get Hadoop dependencies onto the classpath
-cd $IMPALA_FE_DIR
-mvn dependency:copy-dependencies
+# build the external data source API
+cd ${IMPALA_HOME}/ext-data-source
+mvn install -DskipTests
 
-# build frontend
-# Package first since any test failure will prevent the package phase from completing.
-# We need to do this before loading data so that hive can see the parquet input/output
-# classes.
-mvn -X package -DskipTests=true
+# build frontend and copy dependencies
+cd ${IMPALA_FE_DIR}
+mvn dependency:copy-dependencies
+mvn package -DskipTests=true
 
 # Build the shell tarball
 echo "Creating shell tarball"

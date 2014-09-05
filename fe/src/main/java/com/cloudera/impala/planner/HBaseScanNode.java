@@ -101,6 +101,9 @@ public class HBaseScanNode extends ScanNode {
   // HBase config; Common across all object instance.
   private static Configuration hbaseConf_ = HBaseConfiguration.create();
 
+  // List of scan-range locations. Populated in init().
+  private List<TScanRangeLocations> scanRanges_;
+
   public HBaseScanNode(PlanNodeId id, TupleDescriptor desc) {
     super(id, desc, "SCAN HBASE");
     desc_ = desc;
@@ -123,6 +126,8 @@ public class HBaseScanNode extends ScanNode {
     analyzer.materializeSlots(conjuncts_);
     computeMemLayout(analyzer);
     computeStats(analyzer);
+
+    computeScanRangeLocations();
   }
 
   /**
@@ -146,13 +151,13 @@ public class HBaseScanNode extends ScanNode {
         Preconditions.checkState(
             rowRange.getLowerBound().getType().equals(ColumnType.STRING));
         TColumnValue val = FeSupport.EvalConstExpr(rowRange.getLowerBound(),
-            analyzer.getQueryContext());
-        if (!val.isSetStringVal()) {
+            analyzer.getQueryCtx());
+        if (!val.isSetString_val()) {
           // lower bound is null.
           isEmpty_ = true;
           return;
         } else {
-          startKey_ = convertToBytes(val.getStringVal(),
+          startKey_ = convertToBytes(val.getString_val(),
               !rowRange.getLowerBoundInclusive());
         }
       }
@@ -161,13 +166,13 @@ public class HBaseScanNode extends ScanNode {
         Preconditions.checkState(
             rowRange.getUpperBound().getType().equals(ColumnType.STRING));
         TColumnValue val = FeSupport.EvalConstExpr(rowRange.getUpperBound(),
-            analyzer.getQueryContext());
-        if (!val.isSetStringVal()) {
+            analyzer.getQueryCtx());
+        if (!val.isSetString_val()) {
           // upper bound is null.
           isEmpty_ = true;
           return;
         } else {
-          stopKey_ = convertToBytes(val.getStringVal(),
+          stopKey_ = convertToBytes(val.getString_val(),
               rowRange.getUpperBoundInclusive());
         }
       }
@@ -229,43 +234,36 @@ public class HBaseScanNode extends ScanNode {
   }
 
   // We convert predicates of the form <slotref> op <constant> where slotref is of
-  // type string to HBase filters.
-  // We remove the corresponding predicate from the conjuncts_, but we also explicitly
-  // materialize the referenced slots, otherwise our hbase scans don't return correct data.
+  // type string to HBase filters. All these predicates are also evaluated at
+  // the HBaseScanNode. To properly filter out NULL values HBaseScanNode treats all
+  // predicates as disjunctive, thereby requiring re-evaluation when there are multiple
+  // attributes. We explicitly materialize the referenced slots, otherwise our hbase
+  // scans don't return correct data.
   // TODO: expand this to generate nested filter lists for arbitrary conjunctions
   // and disjunctions.
   private void createHBaseFilters(Analyzer analyzer) {
-    for (SlotDescriptor slot: desc_.getSlots()) {
-      // TODO: Currently we can only push down predicates on string columns.
-      if (slot.getType().getPrimitiveType() != PrimitiveType.STRING) continue;
-      // List of predicates that cannot be pushed down as an HBase Filter.
-      List<Expr> remainingPreds = new ArrayList<Expr>();
-      for (Expr e: conjuncts_) {
-        if (!(e instanceof BinaryPredicate)) {
-          remainingPreds.add(e);
-          continue;
-        }
-        BinaryPredicate bp = (BinaryPredicate) e;
+    for (Expr e: conjuncts_) {
+      // We only consider binary predicates
+      if (!(e instanceof BinaryPredicate)) continue;
+      BinaryPredicate bp = (BinaryPredicate) e;
+      CompareFilter.CompareOp hbaseOp = impalaOpToHBaseOp(bp.getOp());
+      // Ignore unsupported ops
+      if (hbaseOp == null) continue;
+
+      for (SlotDescriptor slot: desc_.getSlots()) {
+        // Only push down predicates on string columns
+        if (slot.getType().getPrimitiveType() != PrimitiveType.STRING) continue;
+
         Expr bindingExpr = bp.getSlotBinding(slot.getId());
-        if (bindingExpr == null || !(bindingExpr instanceof StringLiteral)) {
-          remainingPreds.add(e);
-          continue;
-        }
-        CompareFilter.CompareOp hbaseOp = impalaOpToHBaseOp(bp.getOp());
-        // Currently unsupported op, leave it as a predicate.
-        if (hbaseOp == null) {
-          remainingPreds.add(e);
-          continue;
-        }
+        if (bindingExpr == null || !(bindingExpr instanceof StringLiteral)) continue;
+
         StringLiteral literal = (StringLiteral) bindingExpr;
         HBaseColumn col = (HBaseColumn) slot.getColumn();
         filters_.add(new THBaseFilter(
             col.getColumnFamily(), col.getColumnQualifier(),
             (byte) hbaseOp.ordinal(), literal.getValue()));
-
         analyzer.materializeSlots(Lists.newArrayList(e));
       }
-      conjuncts_ = remainingPreds;
     }
   }
 
@@ -286,12 +284,11 @@ public class HBaseScanNode extends ScanNode {
    * relevant region, and the created TScanRange will contain all the relevant regions
    * of that region server.
    */
-  @Override
-  public List<TScanRangeLocations> getScanRangeLocations(long maxScanRangeLength) {
-    List<TScanRangeLocations> result = Lists.newArrayList();
+  private void computeScanRangeLocations() {
+    scanRanges_ = Lists.newArrayList();
 
     // For empty scan node, return an empty list.
-    if (isEmpty_) return result;
+    if (isEmpty_) return;
 
     // Retrieve relevant HBase regions and their region servers
     HBaseTable tbl = (HBaseTable) desc_.getTable();
@@ -343,7 +340,7 @@ public class HBaseScanNode extends ScanNode {
           TScanRangeLocations scanRangeLocation = new TScanRangeLocations();
           scanRangeLocation.addToLocations(
               new TScanRangeLocation(addressToTNetworkAddress(locEntry.getKey())));
-          result.add(scanRangeLocation);
+          scanRanges_.add(scanRangeLocation);
 
           TScanRange scanRange = new TScanRange();
           scanRange.setHbase_key_range(keyRange);
@@ -352,7 +349,12 @@ public class HBaseScanNode extends ScanNode {
         prevEndKey = curRegEndKey;
       }
     }
-    return result;
+  }
+
+  @Override
+  public List<TScanRangeLocations> getScanRangeLocations() {
+    Preconditions.checkNotNull(scanRanges_, "Need to call init() first.");
+    return scanRanges_;
   }
 
   /**

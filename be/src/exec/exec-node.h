@@ -65,6 +65,8 @@ class ExecNode {
   // Performs any preparatory work prior to calling GetNext().
   // Caller must not be holding any io buffers. This will cause deadlock.
   // If overridden in subclass, must first call superclass's Open().
+  // If a parent exec node adds slot filters (see RuntimeState::AddBitmapFilter()),
+  // they need to be added before calling Open() on the child that will consume them.
   virtual Status Open(RuntimeState* state);
 
   // Retrieves rows and returns them via row_batch. Sets eos to true
@@ -93,6 +95,8 @@ class ExecNode {
   // closed (is_closed()), then close themselves, then call the base Close().
   // Nodes that are using tuples returned by a child may call Close() on their children
   // before their own Close() if the child node has returned eos.
+  // It is only safe to call Close() on the child node while the parent node is still
+  // returning rows if the parent node fully materializes the child's input.
   virtual void Close(RuntimeState* state);
 
   // Creates exec node tree from list of nodes contained in plan via depth-first

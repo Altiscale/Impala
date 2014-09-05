@@ -24,7 +24,7 @@ import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.ImpaladCatalog;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.thrift.TAccessEvent;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TQueryCtx;
 import com.google.common.base.Preconditions;
 
 /**
@@ -33,14 +33,14 @@ import com.google.common.base.Preconditions;
 public class AnalysisContext {
   private final static Logger LOG = LoggerFactory.getLogger(AnalysisContext.class);
   private final ImpaladCatalog catalog_;
-  private final TQueryContext queryCtxt_;
+  private final TQueryCtx queryCtx_;
 
   // Set in analyze()
   private AnalysisResult analysisResult_;
 
-  public AnalysisContext(ImpaladCatalog catalog, TQueryContext queryCtxt) {
+  public AnalysisContext(ImpaladCatalog catalog, TQueryCtx queryCtx) {
     catalog_ = catalog;
-    queryCtxt_ = queryCtxt;
+    queryCtx_ = queryCtx;
   }
 
   static public class AnalysisResult {
@@ -57,6 +57,7 @@ public class AnalysisContext {
       return stmt_ instanceof DropTableOrViewStmt;
     }
     public boolean isDropFunctionStmt() { return stmt_ instanceof DropFunctionStmt; }
+    public boolean isDropDataSrcStmt() { return stmt_ instanceof DropDataSrcStmt; }
     public boolean isCreateTableLikeStmt() {
       return stmt_ instanceof CreateTableLikeStmt;
     }
@@ -68,10 +69,12 @@ public class AnalysisContext {
     public boolean isCreateDbStmt() { return stmt_ instanceof CreateDbStmt; }
     public boolean isCreateUdfStmt() { return stmt_ instanceof CreateUdfStmt; }
     public boolean isCreateUdaStmt() { return stmt_ instanceof CreateUdaStmt; }
+    public boolean isCreateDataSrcStmt() { return stmt_ instanceof CreateDataSrcStmt; }
     public boolean isLoadDataStmt() { return stmt_ instanceof LoadDataStmt; }
     public boolean isUseStmt() { return stmt_ instanceof UseStmt; }
     public boolean isShowTablesStmt() { return stmt_ instanceof ShowTablesStmt; }
     public boolean isShowDbsStmt() { return stmt_ instanceof ShowDbsStmt; }
+    public boolean isShowDataSrcsStmt() { return stmt_ instanceof ShowDataSrcsStmt; }
     public boolean isShowStatsStmt() { return stmt_ instanceof ShowStatsStmt; }
     public boolean isShowFunctionsStmt() { return stmt_ instanceof ShowFunctionsStmt; }
     public boolean isShowCreateTableStmt() {
@@ -82,13 +85,14 @@ public class AnalysisContext {
     public boolean isExplainStmt() { return stmt_.isExplain(); }
 
     public boolean isCatalogOp() {
-      return isUseStmt() || isShowTablesStmt() || isShowDbsStmt() || isShowStatsStmt() ||
-          isShowCreateTableStmt() || isDescribeStmt() || isCreateTableLikeStmt() ||
-          isCreateTableStmt() || isCreateViewStmt() || isCreateDbStmt() ||
-          isDropDbStmt() || isDropTableOrViewStmt() || isResetMetadataStmt() ||
-          isAlterTableStmt() || isAlterViewStmt() || isComputeStatsStmt() ||
-          isCreateUdfStmt() || isCreateUdaStmt() || isShowFunctionsStmt() ||
-          isDropFunctionStmt() || isCreateTableAsSelectStmt();
+      return isUseStmt() || isShowTablesStmt() || isShowDbsStmt() ||
+          isShowDataSrcsStmt() || isShowStatsStmt() || isShowCreateTableStmt() ||
+          isDescribeStmt() || isCreateTableLikeStmt() || isCreateTableStmt() ||
+          isCreateViewStmt() || isCreateDbStmt() || isDropDbStmt() ||
+          isDropTableOrViewStmt() || isResetMetadataStmt() || isAlterTableStmt() ||
+          isAlterViewStmt() || isComputeStatsStmt() || isCreateUdfStmt() ||
+          isCreateUdaStmt() || isShowFunctionsStmt() || isDropFunctionStmt() ||
+          isCreateTableAsSelectStmt() || isCreateDataSrcStmt() || isDropDataSrcStmt();
     }
 
     public boolean isDmlStmt() {
@@ -194,6 +198,11 @@ public class AnalysisContext {
       return (ShowDbsStmt) stmt_;
     }
 
+    public ShowDataSrcsStmt getShowDataSrcsStmt() {
+      Preconditions.checkState(isShowDataSrcsStmt());
+      return (ShowDataSrcsStmt) stmt_;
+    }
+
     public ShowStatsStmt getShowStatsStmt() {
       Preconditions.checkState(isShowStatsStmt());
       return (ShowStatsStmt) stmt_;
@@ -233,7 +242,7 @@ public class AnalysisContext {
   public void analyze(String stmt) throws AnalysisException,
       AuthorizationException {
     analysisResult_ = new AnalysisResult();
-    analysisResult_.analyzer_ = new Analyzer(catalog_, queryCtxt_);
+    analysisResult_.analyzer_ = new Analyzer(catalog_, queryCtx_);
 
     SqlScanner input = new SqlScanner(new StringReader(stmt));
     SqlParser parser = new SqlParser(input);

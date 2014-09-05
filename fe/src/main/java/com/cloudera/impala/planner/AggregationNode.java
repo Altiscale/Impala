@@ -202,7 +202,8 @@ public class AggregationNode extends PlanNode {
     }
   }
 
-  private String getDisplayNameDetail() {
+  @Override
+  protected String getDisplayLabelDetail() {
     if (aggInfo_.isMerge() || needsFinalize_) {
       if (aggInfo_.isMerge() && needsFinalize_) {
         return "MERGE FINALIZE";
@@ -219,8 +220,8 @@ public class AggregationNode extends PlanNode {
   protected String getNodeExplainString(String prefix, String detailPrefix,
       TExplainLevel detailLevel) {
     StringBuilder output = new StringBuilder();
-    String nameDetail = getDisplayNameDetail();
-    output.append(String.format("%s%s:%s", prefix, id_.toString(), displayName_));
+    String nameDetail = getDisplayLabelDetail();
+    output.append(String.format("%s%s", prefix, getDisplayLabel()));
     if (nameDetail != null) output.append(" [" + nameDetail + "]");
     output.append("\n");
 
@@ -262,13 +263,7 @@ public class AggregationNode extends PlanNode {
     if (cardinality_ != -1) {
       perHostCardinality = Math.min(perHostCardinality, cardinality_);
     }
-    // take HAVING predicate into account
-    perHostCardinality =
-        Math.round((double) perHostCardinality * computeSelectivity());
     perHostMemCost_ += Math.max(perHostCardinality * avgRowSize_ *
         Planner.HASH_TBL_SPACE_OVERHEAD, MIN_HASH_TBL_MEM);
   }
-
-  @Override
-  public AggregationNode clone(PlanNodeId id) { return new AggregationNode(id, this); }
 }

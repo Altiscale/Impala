@@ -28,14 +28,16 @@ import org.slf4j.LoggerFactory;
 import com.cloudera.impala.analysis.Expr;
 import com.cloudera.impala.analysis.TableName;
 import com.cloudera.impala.common.InternalException;
+import com.cloudera.impala.thrift.TCacheJarParams;
+import com.cloudera.impala.thrift.TCacheJarResult;
 import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TCatalogObjectType;
 import com.cloudera.impala.thrift.TColumnValue;
-import com.cloudera.impala.thrift.TExpr;
+import com.cloudera.impala.thrift.TExprBatch;
 import com.cloudera.impala.thrift.TPrioritizeLoadRequest;
 import com.cloudera.impala.thrift.TPrioritizeLoadResponse;
-import com.cloudera.impala.thrift.TFunction;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TQueryCtx;
+import com.cloudera.impala.thrift.TResultRow;
 import com.cloudera.impala.thrift.TStatus;
 import com.cloudera.impala.thrift.TSymbolLookupParams;
 import com.cloudera.impala.thrift.TSymbolLookupResult;
@@ -59,12 +61,15 @@ public class FeSupport {
   // when running FE tests.
   public native static void NativeFeTestInit();
 
-  // Returns a serialized TColumnValue.
-  public native static byte[] NativeEvalConstExpr(byte[] thriftExpr,
+  // Returns a serialized TResultRow
+  public native static byte[] NativeEvalConstExprs(byte[] thriftExprBatch,
       byte[] thriftQueryGlobals);
 
   // Returns a serialized TSymbolLookupResult
   public native static byte[] NativeLookupSymbol(byte[] thriftSymbolLookup);
+
+  // Returns a serialized TCacheJarResult
+  public native static byte[] NativeCacheJar(byte[] thriftCacheJar);
 
   // Does an RPCs to the Catalog Server to prioritize the metadata loading of a
   // one or more catalog objects. To keep our kerberos configuration consolidated,
@@ -72,20 +77,57 @@ public class FeSupport {
   // using Java Thrift bindings.
   public native static byte[] NativePrioritizeLoad(byte[] thriftReq);
 
-  public static TColumnValue EvalConstExpr(Expr expr, TQueryContext queryCtxt)
-      throws InternalException {
-    Preconditions.checkState(expr.isConstant());
-    TExpr thriftExpr = expr.treeToThrift();
+  /**
+   * Locally caches the jar at the specified HDFS location.
+   *
+   * @param hdfsLocation The path to the jar in HDFS
+   * @return The result of the call to cache the jar, includes a status and the local
+   *         path of the cached jar if the operation was successful.
+   */
+  public static TCacheJarResult CacheJar(String hdfsLocation) throws InternalException {
+    Preconditions.checkNotNull(hdfsLocation);
+    TCacheJarParams params = new TCacheJarParams(hdfsLocation);
     TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
     byte[] result;
     try {
-      result = EvalConstExpr(serializer.serialize(thriftExpr),
-          serializer.serialize(queryCtxt));
+      result = CacheJar(serializer.serialize(params));
       Preconditions.checkNotNull(result);
       TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
-      TColumnValue val = new TColumnValue();
+      TCacheJarResult thriftResult = new TCacheJarResult();
+      deserializer.deserialize(thriftResult, result);
+      return thriftResult;
+    } catch (TException e) {
+      // this should never happen
+      throw new InternalException(
+          "Couldn't cache jar at HDFS location " + hdfsLocation, e);
+    }
+  }
+
+  private static byte[] CacheJar(byte[] thriftParams) {
+    try {
+      return NativeCacheJar(thriftParams);
+    } catch (UnsatisfiedLinkError e) {
+      loadLibrary();
+    }
+    return NativeCacheJar(thriftParams);
+  }
+
+  public static TColumnValue EvalConstExpr(Expr expr, TQueryCtx queryCtx)
+      throws InternalException {
+    Preconditions.checkState(expr.isConstant());
+    TExprBatch exprBatch = new TExprBatch();
+    exprBatch.addToExprs(expr.treeToThrift());
+    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
+    byte[] result;
+    try {
+      result = EvalConstExprs(serializer.serialize(exprBatch),
+          serializer.serialize(queryCtx));
+      Preconditions.checkNotNull(result);
+      TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
+      TResultRow val = new TResultRow();
       deserializer.deserialize(val, result);
-      return val;
+      Preconditions.checkState(val.getColValsSize() == 1);
+      return val.getColVals().get(0);
     } catch (TException e) {
       // this should never happen
       throw new InternalException("couldn't execute expr " + expr.toSql(), e);
@@ -117,22 +159,56 @@ public class FeSupport {
     }
   }
 
-  private static byte[] EvalConstExpr(byte[] thriftExpr, byte[] thriftQueryContext) {
+  private static byte[] EvalConstExprs(byte[] thriftExprBatch,
+      byte[] thriftQueryContext) {
     try {
-      return NativeEvalConstExpr(thriftExpr, thriftQueryContext);
+      return NativeEvalConstExprs(thriftExprBatch, thriftQueryContext);
     } catch (UnsatisfiedLinkError e) {
-      // We should only get here in FE tests that dont run the BE.
       loadLibrary();
     }
-    return NativeEvalConstExpr(thriftExpr, thriftQueryContext);
+    return NativeEvalConstExprs(thriftExprBatch, thriftQueryContext);
   }
 
-  public static boolean EvalPredicate(Expr pred, TQueryContext queryCtxt)
+  public static boolean EvalPredicate(Expr pred, TQueryCtx queryCtx)
       throws InternalException {
     Preconditions.checkState(pred.getType().isBoolean());
-    TColumnValue val = EvalConstExpr(pred, queryCtxt);
+    TColumnValue val = EvalConstExpr(pred, queryCtx);
     // Return false if pred evaluated to false or NULL. True otherwise.
-    return val.isSetBoolVal() && val.boolVal;
+    return val.isBool_val() && val.bool_val;
+  }
+
+  /**
+   * Evaluate a batch of predicates in the BE. The results are stored in a
+   * TResultRow object, where each TColumnValue in it stores the result of
+   * a predicate evaluation.
+   *
+   * TODO: This function is currently used for improving the performance of
+   * partition pruning (see IMPALA-887), hence it only supports boolean
+   * exprs. In the future, we can extend it to support arbitrary constant exprs.
+   */
+  public static TResultRow EvalPredicateBatch(ArrayList<Expr> exprs,
+      TQueryCtx queryCtx) throws InternalException {
+    TSerializer serializer = new TSerializer(new TBinaryProtocol.Factory());
+    TExprBatch exprBatch = new TExprBatch();
+    for (Expr expr: exprs) {
+      // Make sure we only process boolean exprs.
+      Preconditions.checkState(expr.getType().isBoolean());
+      Preconditions.checkState(expr.isConstant());
+      exprBatch.addToExprs(expr.treeToThrift());
+    }
+    byte[] result;
+    try {
+      result = EvalConstExprs(serializer.serialize(exprBatch),
+          serializer.serialize(queryCtx));
+      Preconditions.checkNotNull(result);
+      TDeserializer deserializer = new TDeserializer(new TBinaryProtocol.Factory());
+      TResultRow val = new TResultRow();
+      deserializer.deserialize(val, result);
+      return val;
+    } catch (TException e) {
+      // this should never happen
+      throw new InternalException("couldn't execute a batch of exprs.", e);
+    }
   }
 
   private static byte[] PrioritizeLoad(byte[] thriftReq) {

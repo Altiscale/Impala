@@ -25,6 +25,7 @@ import com.cloudera.impala.catalog.ScalarFunction;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.common.Reference;
+import com.cloudera.impala.extdatasource.thrift.TComparisonOp;
 import com.cloudera.impala.thrift.TExprNode;
 import com.cloudera.impala.thrift.TExprNodeType;
 import com.google.common.base.Objects;
@@ -39,24 +40,39 @@ public class BinaryPredicate extends Predicate {
   private final static Logger LOG = LoggerFactory.getLogger(BinaryPredicate.class);
 
   public enum Operator {
-    EQ("=", "eq"),
-    NE("!=", "ne"),
-    LE("<=", "le"),
-    GE(">=", "ge"),
-    LT("<", "lt"),
-    GT(">", "gt");
+    EQ("=", "eq", TComparisonOp.EQ),
+    NE("!=", "ne", TComparisonOp.NE),
+    LE("<=", "le", TComparisonOp.LE),
+    GE(">=", "ge", TComparisonOp.GE),
+    LT("<", "lt", TComparisonOp.LT),
+    GT(">", "gt", TComparisonOp.GT);
 
-    private final String description;
-    private final String name;
+    private final String description_;
+    private final String name_;
+    private final TComparisonOp thriftOp_;
 
-    private Operator(String description, String name) {
-      this.description = description;
-      this.name = name;
+    private Operator(String description, String name, TComparisonOp thriftOp) {
+      this.description_ = description;
+      this.name_ = name;
+      this.thriftOp_ = thriftOp;
     }
 
     @Override
-    public String toString() { return description; }
-    public String getName() { return name; }
+    public String toString() { return description_; }
+    public String getName() { return name_; }
+    public TComparisonOp getThriftOp() { return thriftOp_; }
+
+    public Operator converse() {
+      switch (this) {
+        case EQ: return EQ;
+        case NE: return NE;
+        case LE: return GE;
+        case GE: return LE;
+        case LT: return GT;
+        case GT: return LT;
+        default: throw new IllegalStateException("Invalid operator");
+      }
+    }
   }
 
   public static void initBuiltins(Db db) {
@@ -100,8 +116,10 @@ public class BinaryPredicate extends Predicate {
     Preconditions.checkState(children_.size() == 2);
     // This check is important because we often clone and/or evaluate predicates,
     // and it's easy to get the casting logic wrong, e.g., cloned predicates
-    // with expr substitutions need to be re-analyzed *after* unsetIsAnalyzed().
-    Preconditions.checkState(getChild(0).getType().matchesType(getChild(1).getType()));
+    // with expr substitutions need to be re-analyzed with reanalyze().
+    Preconditions.checkState(getChild(0).getType().matchesType(getChild(1).getType()),
+        "child 0 type: " + getChild(0).getType() +
+        " child 1 type: " + getChild(1).getType());
     msg.node_type = TExprNodeType.BINARY_PRED;
   }
 
@@ -119,6 +137,7 @@ public class BinaryPredicate extends Predicate {
     if (isAnalyzed_) return;
     super.analyze(analyzer);
 
+    convertNumericLiteralsFromDecimal(analyzer);
     fn_ = getBuiltinFunction(analyzer, op_.getName(), collectChildReturnTypes(),
         CompareMode.IS_SUPERTYPE_OF);
     if (fn_ == null) {
@@ -178,5 +197,45 @@ public class BinaryPredicate extends Predicate {
     SlotRef rhs = getChild(1).unwrapSlotRef(true);
     if (rhs == null) return null;
     return new Pair<SlotId, SlotId>(lhs.getSlotId(), rhs.getSlotId());
+  }
+
+  /**
+   * If predicate is of the form "<SlotRef> op <Expr>" or "<Expr> op <SlotRef>",
+   * returns the SlotRef, otherwise returns null.
+   */
+  @Override
+  public SlotRef getBoundSlot() {
+    SlotRef slotRef = getChild(0).unwrapSlotRef(true);
+    if (slotRef != null) return slotRef;
+    return getChild(1).unwrapSlotRef(true);
+  }
+
+  /**
+   * Negates a BinaryPredicate.
+   */
+  @Override
+  public Expr negate() {
+    Operator newOp = null;
+    switch (op_) {
+      case EQ:
+        newOp = Operator.NE;
+        break;
+      case NE:
+        newOp = Operator.EQ;
+        break;
+      case LT:
+        newOp = Operator.GE;
+        break;
+      case LE:
+        newOp = Operator.GT;
+        break;
+      case GE:
+        newOp = Operator.LT;
+        break;
+      case GT:
+        newOp = Operator.LE;
+        break;
+    }
+    return new BinaryPredicate(newOp, getChild(0), getChild(1));
   }
 }

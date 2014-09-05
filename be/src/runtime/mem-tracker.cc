@@ -15,12 +15,14 @@
 #include "runtime/mem-tracker.h"
 
 #include <boost/algorithm/string/join.hpp>
+#include <google/malloc_extension.h>
 #include <gutil/strings/substitute.h>
 
 #include "runtime/exec-env.h"
 #include "resourcebroker/resource-broker.h"
 #include "statestore/query-resource-mgr.h"
 #include "util/debug-util.h"
+#include "util/mem-info.h"
 #include "util/uid-util.h"
 
 using namespace boost;
@@ -33,6 +35,8 @@ const string MemTracker::COUNTER_NAME = "PeakMemoryUsage";
 MemTracker::RequestTrackersMap MemTracker::request_to_mem_trackers_;
 MemTracker::PoolTrackersMap MemTracker::pool_to_mem_trackers_;
 mutex MemTracker::static_mem_trackers_lock_;
+
+AtomicInt<int64_t> MemTracker::released_memory_since_gc_;
 
 // Name for request pool MemTrackers. '$0' is replaced with the pool name.
 const string REQUEST_POOL_MEM_TRACKER_LABEL_FORMAT = "RequestPool=$0";
@@ -142,6 +146,17 @@ MemTracker* MemTracker::GetRequestPoolMemTracker(const string& pool_name,
 shared_ptr<MemTracker> MemTracker::GetQueryMemTracker(
     const TUniqueId& id, int64_t byte_limit, MemTracker* parent,
     QueryResourceMgr* res_mgr) {
+  if (byte_limit != -1) {
+    if (byte_limit > MemInfo::physical_mem()) {
+      LOG(WARNING) << "Memory limit "
+                   << PrettyPrinter::Print(byte_limit, TCounterType::BYTES)
+                   << " exceeds physical memory of "
+                   << PrettyPrinter::Print(MemInfo::physical_mem(), TCounterType::BYTES);
+    }
+    VLOG_QUERY << "Using query memory limit: "
+               << PrettyPrinter::Print(byte_limit, TCounterType::BYTES);
+  }
+
   lock_guard<mutex> l(static_mem_trackers_lock_);
   RequestTrackersMap::iterator it = request_to_mem_trackers_.find(id);
   if (it != request_to_mem_trackers_.end()) {
@@ -254,6 +269,15 @@ bool MemTracker::GcMemory(int64_t max_consumption) {
     bytes_freed_by_last_gc_metric_->Update(pre_gc_consumption - consumption());
   }
   return consumption() > max_consumption;
+}
+
+void MemTracker::GcTcmalloc() {
+#ifndef ADDRESS_SANITIZER
+  released_memory_since_gc_ = 0;
+  MallocExtension::instance()->ReleaseFreeMemory();
+#else
+  // Nothing to do if not using tcmalloc.
+#endif
 }
 
 bool MemTracker::ExpandLimit(int64_t bytes) {

@@ -14,6 +14,7 @@
 
 package com.cloudera.impala.analysis;
 
+import java.math.BigDecimal;
 import java.math.BigInteger;
 
 import com.cloudera.impala.catalog.AuthorizationException;
@@ -23,7 +24,8 @@ import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.NotImplementedException;
 import com.cloudera.impala.service.FeSupport;
 import com.cloudera.impala.thrift.TColumnValue;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TExprNode;
+import com.cloudera.impala.thrift.TQueryCtx;
 import com.google.common.base.Preconditions;
 
 /**
@@ -37,36 +39,81 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
     isAnalyzed_ = true;
   }
 
+  /**
+   * Returns an analyzed literal of 'type'.
+   */
   public static LiteralExpr create(String value, ColumnType type)
       throws AnalysisException, AuthorizationException {
     Preconditions.checkArgument(type.isValid());
+    LiteralExpr e = null;
     switch (type.getPrimitiveType()) {
       case NULL_TYPE:
-        return new NullLiteral();
+        e = new NullLiteral();
+        break;
       case BOOLEAN:
-        return new BoolLiteral(value);
+        e = new BoolLiteral(value);
+        break;
       case TINYINT:
       case SMALLINT:
       case INT:
       case BIGINT:
-        return new IntLiteral(value);
+        e = new IntLiteral(value);
+        break;
       case FLOAT:
       case DOUBLE:
-        return new FloatLiteral(value);
-      case STRING:
-        return new StringLiteral(value);
       case DECIMAL:
+        e = new DecimalLiteral(value, type);
+        break;
+      case STRING:
+        e = new StringLiteral(value);
+        break;
       case DATE:
       case DATETIME:
       case TIMESTAMP:
-        // TODO: we support DECIMAL and TIMESTAMP but no way to specify it in
-        // SQL.
+        // TODO: we support TIMESTAMP but no way to specify it in SQL.
         throw new AnalysisException(
-            "DATE/DATETIME/TIMESTAMP/DECIMAL literals not supported: " + value);
+            "DATE/DATETIME/TIMESTAMP literals not supported: " + value);
       default:
         Preconditions.checkState(false);
     }
-    return null;
+    e.analyze(null);
+    // Need to cast since we cannot infer the type from the value. e.g. value
+    // can be parsed as tinyint but we need a bigint.
+    return (LiteralExpr) e.uncheckedCastTo(type);
+  }
+
+  /**
+   * Returns an analyzed literal from the thrift object.
+   */
+  public static LiteralExpr fromThrift(TExprNode exprNode, ColumnType colType) {
+    try {
+      switch (exprNode.node_type) {
+        case FLOAT_LITERAL:
+          return LiteralExpr.create(
+              Double.toString(exprNode.float_literal.value), colType);
+        case DECIMAL_LITERAL:
+          byte[] bytes = exprNode.decimal_literal.getValue();
+          BigDecimal val = new BigDecimal(new BigInteger(bytes));
+          // We store the decimal as the unscaled bytes. Need to adjust for the scale.
+          val = val.movePointLeft(colType.decimalScale());
+          return new DecimalLiteral(val, colType);
+        case INT_LITERAL:
+          return LiteralExpr.create(
+              Long.toString(exprNode.int_literal.value), colType);
+        case STRING_LITERAL:
+          return LiteralExpr.create(exprNode.string_literal.value, colType);
+        case BOOL_LITERAL:
+          return LiteralExpr.create(
+              Boolean.toString(exprNode.bool_literal.value), colType);
+        case NULL_LITERAL:
+          return new NullLiteral();
+        default:
+          throw new UnsupportedOperationException("Unsupported partition key type: " +
+              exprNode.node_type);
+      }
+    } catch (Exception e) {
+      throw new IllegalStateException("Error creating LiteralExpr: ", e);
+    }
   }
 
   // Returns the string representation of the literal's value. Used when passing
@@ -86,15 +133,15 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
    * Evaluates the given constant expr and returns its result as a LiteralExpr.
    * Assumes expr has been analyzed. Returns constExpr if is it already a LiteralExpr.
    */
-  public static LiteralExpr create(Expr constExpr, TQueryContext queryCtxt)
-      throws AnalysisException {
+  public static LiteralExpr create(Expr constExpr, TQueryCtx queryCtx)
+      throws AnalysisException, AuthorizationException {
     Preconditions.checkState(constExpr.isConstant());
     Preconditions.checkState(constExpr.getType().isValid());
     if (constExpr instanceof LiteralExpr) return (LiteralExpr) constExpr;
 
     TColumnValue val = null;
     try {
-      val = FeSupport.EvalConstExpr(constExpr, queryCtxt);
+      val = FeSupport.EvalConstExpr(constExpr, queryCtx);
     } catch (InternalException e) {
       throw new AnalysisException(String.format("Failed to evaluate expr '%s'",
           constExpr.toSql()), e);
@@ -106,31 +153,54 @@ public abstract class LiteralExpr extends Expr implements Comparable<LiteralExpr
         result = new NullLiteral();
         break;
       case BOOLEAN:
-        if (val.isSetBoolVal()) result = new BoolLiteral(val.boolVal);
+        if (val.isBool_val()) result = new BoolLiteral(val.bool_val);
         break;
       case TINYINT:
+        if (val.isSetByte_val()) {
+          result = new IntLiteral(BigInteger.valueOf(val.byte_val));
+        }
+        break;
       case SMALLINT:
+        if (val.isSetShort_val()) {
+          result = new IntLiteral(BigInteger.valueOf(val.short_val));
+        }
+        break;
       case INT:
+        if (val.isSetInt_val()) result = new IntLiteral(BigInteger.valueOf(val.int_val));
+        break;
       case BIGINT:
-        if (val.isSetIntVal()) result = new IntLiteral(BigInteger.valueOf(val.intVal));
-        if (val.isSetLongVal()) result = new IntLiteral(BigInteger.valueOf(val.longVal));
+        if (val.isSetLong_val()) {
+          result = new IntLiteral(BigInteger.valueOf(val.long_val));
+        }
         break;
       case FLOAT:
       case DOUBLE:
-        if (val.isSetDoubleVal()) result = new FloatLiteral(val.doubleVal);
+        if (val.isSetDouble_val()) {
+          result =
+              new DecimalLiteral(new BigDecimal(val.double_val), constExpr.getType());
+        }
+        break;
+      case DECIMAL:
+        if (val.isSetString_val()) {
+          result =
+              new DecimalLiteral(new BigDecimal(val.string_val), constExpr.getType());
+        }
         break;
       case STRING:
-        if (val.isSetStringVal()) result = new StringLiteral(val.stringVal);
+        if (val.isSetString_val()) result = new StringLiteral(val.string_val);
         break;
       case DATE:
       case DATETIME:
       case TIMESTAMP:
         throw new AnalysisException(
             "DATE/DATETIME/TIMESTAMP literals not supported: " + constExpr.toSql());
+      default:
+        Preconditions.checkState(false);
     }
     // None of the fields in the thrift struct were set indicating a NULL.
     if (result == null) result = new NullLiteral();
 
-    return result;
+    result.analyze(null);
+    return (LiteralExpr)result;
   }
 }

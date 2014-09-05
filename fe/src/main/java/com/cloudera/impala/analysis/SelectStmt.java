@@ -102,8 +102,6 @@ public class SelectStmt extends QueryStmt {
   public Expr getWhereClause() { return whereClause_; }
   public AggregateInfo getAggInfo() { return aggInfo_; }
   @Override
-  public SortInfo getSortInfo() { return sortInfo_; }
-  @Override
   public ArrayList<String> getColLabels() { return colLabels_; }
   public Expr.SubstitutionMap getBaseTblSmap() { return baseTblSmap_; }
 
@@ -176,6 +174,7 @@ public class SelectStmt extends QueryStmt {
 
     createSortInfo(analyzer);
     analyzeAggregation(analyzer);
+    if (evaluateOrderBy_) createSortTupleInfo(analyzer);
 
     // Remember the SQL string before inline-view expression substitution.
     sqlString_ = toSql();
@@ -203,12 +202,10 @@ public class SelectStmt extends QueryStmt {
         Expr.cloneList(unassignedJoinConjuncts, baseTblSmap_);
     materializeSlots(analyzer, baseTblJoinConjuncts);
 
-    if (sortInfo_ != null) {
-      // mark ordering exprs before marking agg exprs because the ordering exprs
+    if (evaluateOrderBy_) {
+      // mark exprs for sort exprs before marking agg exprs because the ordering exprs
       // may contain agg exprs that are not referenced anywhere but the ORDER BY clause
-      List<Expr> resolvedExprs =
-          Expr.cloneList(sortInfo_.getOrderingExprs(), baseTblSmap_);
-      materializeSlots(analyzer, resolvedExprs);
+      sortInfo_.materializeRequiredSlots(analyzer, baseTblSmap_);
     }
 
     if (aggInfo_ != null) {
@@ -310,7 +307,7 @@ public class SelectStmt extends QueryStmt {
       throws AnalysisException, AuthorizationException {
     TupleDescriptor tupleDesc = analyzer.getDescriptor(tblName);
     if (tupleDesc == null) {
-      throw new AnalysisException("unknown table: " + tblName.toString());
+      throw new AnalysisException("unknown table alias '" + tblName.toString() + "'");
     }
     expandStar(analyzer, tblName, tupleDesc);
   }
@@ -411,6 +408,7 @@ public class SelectStmt extends QueryStmt {
       havingPred_.collect(Expr.isAggregatePredicate(), aggExprs);
     }
     if (sortInfo_ != null) {
+      // TODO: Avoid evaluating aggs in ignored order-bys
       TreeNode.collect(sortInfo_.getOrderingExprs(), Expr.isAggregatePredicate(),
           aggExprs);
     }
@@ -455,15 +453,20 @@ public class SelectStmt extends QueryStmt {
             finalAggInfo.getSMap());
     LOG.debug("combined smap: " + combinedSMap.debugString());
 
-    // change select list, having and ordering exprs to point to agg output
+    // change select list, having and ordering exprs to point to agg output. We need
+    // to reanalyze the exprs at this point.
+    // TODO: substitute really needs to bundle the reanalysis.
     Expr.substituteList(resultExprs_, combinedSMap);
+    Expr.reanalyze(resultExprs_, analyzer);
     LOG.debug("post-agg selectListExprs: " + Expr.debugString(resultExprs_));
     if (havingPred_ != null) {
       havingPred_ = havingPred_.substitute(combinedSMap);
+      havingPred_.reanalyze(analyzer);
       analyzer.registerConjuncts(havingPred_, null, false);
       LOG.debug("post-agg havingPred: " + havingPred_.debugString());
     }
     Expr.substituteList(orderingExprs, combinedSMap);
+    Expr.reanalyze(orderingExprs, analyzer);
     LOG.debug("post-agg orderingExprs: " + Expr.debugString(orderingExprs));
 
     // check that all post-agg exprs point to agg output
@@ -619,9 +622,7 @@ public class SelectStmt extends QueryStmt {
     ListIterator<Expr> i = exprs.listIterator();
     while (i.hasNext()) {
       Expr expr = i.next();
-      if (!(expr instanceof IntLiteral)) {
-        continue;
-      }
+      if (!(expr instanceof IntLiteral)) continue;
       long pos = ((IntLiteral) expr).getValue();
       if (pos < 1) {
         throw new AnalysisException(
@@ -705,9 +706,13 @@ public class SelectStmt extends QueryStmt {
 
   @Override
   public void getMaterializedTupleIds(ArrayList<TupleId> tupleIdList) {
-    // If select statement has an aggregate, then the aggregate tuple id is materialized.
+    // If the select statement has a sort/TopN that is evaluated, then the sort tuple
+    // is materialized. Else, if select statement has an aggregate, then the aggregate
+    // tuple id is materialized.
     // Otherwise, all referenced tables are materialized.
-    if (aggInfo_ != null) {
+    if (evaluateOrderBy_) {
+      tupleIdList.add(sortInfo_.getSortTupleDescriptor().getId());
+    } else if (aggInfo_ != null) {
       // Return the tuple id produced in the final aggregation step.
       tupleIdList.add(aggInfo_.getOutputTupleId());
     } else {

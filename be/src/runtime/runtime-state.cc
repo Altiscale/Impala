@@ -25,7 +25,9 @@
 #include "runtime/descriptors.h"
 #include "runtime/runtime-state.h"
 #include "runtime/timestamp-value.h"
+#include "runtime/data-stream-mgr.h"
 #include "runtime/data-stream-recvr.h"
+#include "util/bitmap.h"
 #include "util/cpu-info.h"
 #include "util/debug-util.h"
 #include "util/disk-info.h"
@@ -45,36 +47,36 @@ using namespace boost::algorithm;
 
 namespace impala {
 
-RuntimeState::RuntimeState(const TUniqueId& query_id,
-    const TUniqueId& fragment_instance_id, const TQueryContext& query_ctxt,
+RuntimeState::RuntimeState(const TPlanFragmentInstanceCtx& fragment_instance_ctx,
     const string& cgroup, ExecEnv* exec_env)
   : obj_pool_(new ObjectPool()),
-    data_stream_recvrs_pool_(new ObjectPool()),
     unreported_error_idx_(0),
-    query_ctxt_(query_ctxt),
-    now_(new TimestampValue(query_ctxt.now_string.c_str(),
-        query_ctxt.now_string.size())),
-    query_id_(query_id),
+    fragment_instance_ctx_(fragment_instance_ctx),
+    now_(new TimestampValue(fragment_instance_ctx_.query_ctx.now_string.c_str(),
+        fragment_instance_ctx_.query_ctx.now_string.size())),
     cgroup_(cgroup),
-    profile_(obj_pool_.get(), "Fragment " + PrintId(fragment_instance_id)),
+    profile_(obj_pool_.get(),
+        "Fragment " + PrintId(fragment_instance_ctx_.fragment_instance_id)),
     is_cancelled_(false),
-    query_resource_mgr_(NULL) {
-  Status status = Init(fragment_instance_id, exec_env);
+    query_resource_mgr_(NULL),
+    root_node_id_(-1) {
+  Status status = Init(exec_env);
   DCHECK(status.ok()) << status.GetErrorMsg();
 }
 
-RuntimeState::RuntimeState(const TQueryContext& query_ctxt)
+RuntimeState::RuntimeState(const TQueryCtx& query_ctx)
   : obj_pool_(new ObjectPool()),
-    data_stream_recvrs_pool_(new ObjectPool()),
     unreported_error_idx_(0),
-    query_ctxt_(query_ctxt),
-    now_(new TimestampValue(query_ctxt.now_string.c_str(),
-        query_ctxt.now_string.size())),
+    now_(new TimestampValue(query_ctx.now_string.c_str(),
+        query_ctx.now_string.size())),
     exec_env_(ExecEnv::GetInstance()),
     profile_(obj_pool_.get(), "<unnamed>"),
     is_cancelled_(false),
-    query_resource_mgr_(NULL) {
-  query_ctxt_.request.query_options.__set_batch_size(DEFAULT_BATCH_SIZE);
+    query_resource_mgr_(NULL),
+    root_node_id_(-1) {
+  fragment_instance_ctx_.__set_query_ctx(query_ctx);
+  fragment_instance_ctx_.query_ctx.request.query_options.__set_batch_size(
+      DEFAULT_BATCH_SIZE);
 }
 
 RuntimeState::~RuntimeState() {
@@ -93,10 +95,10 @@ RuntimeState::~RuntimeState() {
   query_mem_tracker_.reset();
 }
 
-Status RuntimeState::Init(const TUniqueId& fragment_instance_id, ExecEnv* exec_env) {
-  fragment_instance_id_ = fragment_instance_id;
+Status RuntimeState::Init(ExecEnv* exec_env) {
   exec_env_ = exec_env;
-  TQueryOptions& query_options = query_ctxt_.request.query_options;
+  TQueryOptions& query_options =
+      fragment_instance_ctx_.query_ctx.request.query_options;
   if (!query_options.disable_codegen) {
     RETURN_IF_ERROR(CreateCodegen());
   } else {
@@ -137,31 +139,12 @@ Status RuntimeState::InitMemTrackers(const TUniqueId& query_id,
           query_resource_mgr());
   instance_mem_tracker_.reset(new MemTracker(runtime_profile(), -1,
       runtime_profile()->name(), query_mem_tracker_.get()));
-  if (query_bytes_limit != -1) {
-    if (query_bytes_limit > MemInfo::physical_mem()) {
-      LOG(WARNING) << "Memory limit "
-                   << PrettyPrinter::Print(query_bytes_limit, TCounterType::BYTES)
-                   << " exceeds physical memory of "
-                   << PrettyPrinter::Print(MemInfo::physical_mem(), TCounterType::BYTES);
-    }
-    VLOG_QUERY << "Using query memory limit: "
-               << PrettyPrinter::Print(query_bytes_limit, TCounterType::BYTES);
-  }
 
   // TODO: this is a stopgap until we implement ExprContext
   udf_mem_tracker_.reset(
       new MemTracker(-1, "UDFs", instance_mem_tracker_.get()));
   udf_pool_.reset(new MemPool(udf_mem_tracker_.get()));
   return Status::OK;
-}
-
-DataStreamRecvr* RuntimeState::CreateRecvr(
-    const RowDescriptor& row_desc, PlanNodeId dest_node_id, int num_senders,
-    int buffer_size, RuntimeProfile* profile) {
-  DataStreamRecvr* recvr = exec_env_->stream_mgr()->CreateRecvr(this, row_desc,
-      fragment_instance_id_, dest_node_id, num_senders, buffer_size, profile);
-  data_stream_recvrs_pool_->Add(recvr);
-  return recvr;
 }
 
 void RuntimeState::set_now(const TimestampValue* now) {
@@ -178,7 +161,7 @@ Status RuntimeState::CreateCodegen() {
 
 bool RuntimeState::ErrorLogIsEmpty() {
   lock_guard<mutex> l(error_log_lock_);
-  return (error_log_.size() > 0);
+  return (error_log_.size() == 0);
 }
 
 string RuntimeState::ErrorLog() {
@@ -202,8 +185,8 @@ void RuntimeState::ReportFileErrors(const std::string& file_name, int num_errors
 
 bool RuntimeState::LogError(const string& error) {
   lock_guard<mutex> l(error_log_lock_);
-  if (error_log_.size() < query_ctxt_.request.query_options.max_errors) {
-    VLOG_QUERY << "Error from query " << query_id_ << ": " << error;
+  if (error_log_.size() < query_options().max_errors) {
+    VLOG_QUERY << "Error from query " << query_id() << ": " << error;
     error_log_.push_back(error);
     return true;
   }
@@ -212,6 +195,12 @@ bool RuntimeState::LogError(const string& error) {
 
 void RuntimeState::LogError(const Status& status) {
   if (status.ok()) return;
+  // Don't log cancelled or mem limit exceeded to the log.
+  // For cancelled, he error message is not useful ("Cancelled") and can happen due to
+  // a limit clause.
+  // For mem limit exceeded, the query will report it via SetMemLimitExceeded which
+  // makes the status error message redundant.
+  if (status.IsCancelled() || status.IsMemLimitExceeded()) return;
   LogError(status.GetErrorMsg());
 }
 
@@ -227,7 +216,7 @@ Status RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
     int64_t failed_allocation_size) {
   DCHECK_GE(failed_allocation_size, 0);
   {
-    boost::lock_guard<boost::mutex> l(query_status_lock_);
+    lock_guard<mutex> l(query_status_lock_);
     if (query_status_.ok()) {
       query_status_ = Status::MEM_LIMIT_EXCEEDED;
     } else {
@@ -253,9 +242,9 @@ Status RuntimeState::SetMemLimitExceeded(MemTracker* tracker,
   }
   LogError(ss.str());
   // Add warning about missing stats.
-  if (query_ctxt_.__isset.tables_missing_stats
-      && !query_ctxt_.tables_missing_stats.empty()) {
-    LogError(GetTablesMissingStatsWarning(query_ctxt_.tables_missing_stats));
+  if (query_ctx().__isset.tables_missing_stats
+      && !query_ctx().tables_missing_stats.empty()) {
+    LogError(GetTablesMissingStatsWarning(query_ctx().tables_missing_stats));
   }
   DCHECK(query_status_.IsMemLimitExceeded());
   return query_status_;
@@ -265,9 +254,24 @@ Status RuntimeState::CheckQueryState() {
   // TODO: it would be nice if this also checked for cancellation, but doing so breaks
   // cases where we use Status::CANCELLED to indicate that the limit was reached.
   if (instance_mem_tracker_->AnyLimitExceeded()) return SetMemLimitExceeded();
-  boost::lock_guard<boost::mutex> l(query_status_lock_);
+  lock_guard<mutex> l(query_status_lock_);
   return query_status_;
 }
 
+void RuntimeState::AddBitmapFilter(SlotId slot, const Bitmap* bitmap) {
+  lock_guard<mutex> l(bitmap_lock_);
+  if (bitmap != NULL) {
+    Bitmap* existing_bitmap = NULL;
+    if (slot_bitmap_filters_.find(slot) != slot_bitmap_filters_.end()) {
+      existing_bitmap = slot_bitmap_filters_[slot];
+    } else {
+      existing_bitmap = obj_pool_->Add(new Bitmap(slot_filter_bitmap_size()));
+      existing_bitmap->SetAllBits(true);
+      slot_bitmap_filters_[slot] = existing_bitmap;
+    }
+    DCHECK(existing_bitmap != NULL);
+    existing_bitmap->And(bitmap);
+  }
+}
 
 }

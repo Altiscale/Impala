@@ -18,15 +18,28 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import org.apache.hadoop.fs.RemoteIterator;
+import org.apache.hadoop.hdfs.DistributedFileSystem;
+import org.apache.hadoop.hdfs.protocol.CachePoolEntry;
+import org.apache.hadoop.hdfs.protocol.CachePoolInfo;
 import org.apache.hadoop.hive.metastore.api.UnknownDBException;
 import org.apache.log4j.Logger;
+import org.apache.sentry.provider.db.service.thrift.TSentryGroup;
+import org.apache.sentry.provider.db.service.thrift.TSentryPrivilege;
+import org.apache.sentry.provider.db.service.thrift.TSentryRole;
 import org.apache.thrift.TException;
 
+import com.cloudera.impala.authorization.SentryConfig;
 import com.cloudera.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import com.cloudera.impala.common.FileSystemUtil;
 import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.common.Pair;
 import com.cloudera.impala.thrift.TCatalog;
@@ -38,8 +51,11 @@ import com.cloudera.impala.thrift.TTable;
 import com.cloudera.impala.thrift.TTableName;
 import com.cloudera.impala.thrift.TUniqueId;
 import com.cloudera.impala.util.PatternMatcher;
+import com.cloudera.impala.util.SentryPolicyService;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
+import com.google.common.collect.Sets;
 
 /**
  * Specialized Catalog that implements the CatalogService specific Catalog
@@ -93,30 +109,195 @@ public class CatalogServiceCatalog extends Catalog {
 
   private final boolean loadInBackground_;
 
+  // Periodically polls HDFS to get the latest set of known cache pools.
+  private final ScheduledExecutorService cachePoolReader_ =
+      Executors.newScheduledThreadPool(1);
+
+  // The interface to access the Sentry Policy Service to read policy metadata. Null
+  // if Sentry Service is disabled.
+  private final SentryPolicyService sentryPolicyService_;
+
+  // If the Sentry Service is configured, this thread will periodically refresh the
+  // policy metadata.
+  private final ScheduledExecutorService policyReader_ =
+      Executors.newScheduledThreadPool(1);
+
   /**
-   * Initialize the CatalogServiceCatalog, loading all table metadata
-   * lazily.
+   * Initialize the CatalogServiceCatalog. If loadInBackground is true, table metadata
+   * will be loaded in the background
    */
   public CatalogServiceCatalog(boolean loadInBackground, int numLoadingThreads,
-      TUniqueId catalogServiceId) {
+      SentryConfig sentryConfig, TUniqueId catalogServiceId) {
     super(true);
     catalogServiceId_ = catalogServiceId;
     tableLoadingMgr_ = new TableLoadingMgr(this, numLoadingThreads);
     loadInBackground_ = loadInBackground;
+
+    cachePoolReader_.scheduleAtFixedRate(new CachePoolReader(), 0, 1, TimeUnit.MINUTES);
+    if (sentryConfig != null) {
+      sentryPolicyService_ = new SentryPolicyService(sentryConfig, null);
+      policyReader_.scheduleAtFixedRate(new AuthorizationPolicyReader(), 0, 60,
+          TimeUnit.SECONDS);
+    } else {
+      sentryPolicyService_ = null;
+    }
   }
 
   /**
-   * Only used for testing. Creates a catalog server with default options.
+   * Reads the current set of cache pools from HDFS and updates the catalog.
+   * Called periodically by the cachePoolReader_.
    */
-  public static CatalogServiceCatalog createForTesting(boolean loadInBackground) {
-    CatalogServiceCatalog cs =
-        new CatalogServiceCatalog(loadInBackground, 16, new TUniqueId());
-    try {
-      cs.reset();
-    } catch (CatalogException e) {
-      throw new IllegalStateException(e.getMessage(), e);
+  private class CachePoolReader implements Runnable {
+    public void run() {
+      LOG.trace("Reloading cache pool names from HDFS");
+      // Map of cache pool name to CachePoolInfo. Stored in a map to allow Set operations
+      // to be performed on the keys.
+      Map<String, CachePoolInfo> currentCachePools = Maps.newHashMap();
+      try {
+        DistributedFileSystem dfs = FileSystemUtil.getDistributedFileSystem();
+        RemoteIterator<CachePoolEntry> itr = dfs.listCachePools();
+        while (itr.hasNext()) {
+          CachePoolInfo cachePoolInfo = itr.next().getInfo();
+          currentCachePools.put(cachePoolInfo.getPoolName(), cachePoolInfo);
+        }
+      } catch (Exception e) {
+        LOG.error("Error loading cache pools: ", e);
+        return;
+      }
+
+      catalogLock_.writeLock().lock();
+      try {
+        // Determine what has changed relative to what we have cached.
+        Set<String> droppedCachePoolNames = Sets.difference(
+            hdfsCachePools_.keySet(), currentCachePools.keySet());
+        Set<String> createdCachePoolNames = Sets.difference(
+            currentCachePools.keySet(), hdfsCachePools_.keySet());
+        // Add all new cache pools.
+        for (String createdCachePool: createdCachePoolNames) {
+          HdfsCachePool cachePool = new HdfsCachePool(
+              currentCachePools.get(createdCachePool));
+          cachePool.setCatalogVersion(
+              CatalogServiceCatalog.this.incrementAndGetCatalogVersion());
+          hdfsCachePools_.add(cachePool);
+        }
+        // Remove dropped cache pools.
+        for (String cachePoolName: droppedCachePoolNames) {
+          hdfsCachePools_.remove(cachePoolName);
+          CatalogServiceCatalog.this.incrementAndGetCatalogVersion();
+        }
+      } finally {
+        catalogLock_.writeLock().unlock();
+      }
     }
-    return cs;
+  }
+
+  /**
+   * Class that periodically refreshes the authorization policy metadata by querying
+   * the Sentry Policy Service.
+   */
+  private class AuthorizationPolicyReader implements Runnable {
+    public void run() {
+      // Assume all roles should be removed. Then query the Policy Service  then remove
+      // roles from this set after querying the sentry service.
+      Set<String> rolesToRemove = authPolicy_.getAllRoleNames();
+      try {
+        // Read the full policy, adding new/modified roles to "updatedRoles".
+        for (TSentryRole sentryRole: sentryPolicyService_.listAllRoles()) {
+          // This role exists and should not be removed, delete it from the rolesToRemove
+          // set.
+          rolesToRemove.remove(sentryRole.getRoleName().toLowerCase());
+
+          Set<String> grantGroups = Sets.newHashSet();
+          for (TSentryGroup group: sentryRole.getGroups()) {
+            grantGroups.add(group.getGroupName());
+          }
+          Role existingRole = authPolicy_.getRole(sentryRole.getRoleName());
+          Role role;
+
+          // These roles are the same, use the current role.
+          if (existingRole != null &&
+              existingRole.getGrantGroups().equals(grantGroups)) {
+            role = existingRole;
+          } else {
+            role = new Role(sentryRole.getRoleName(), grantGroups);
+            // Increment the catalog version and add the role atomically.
+            catalogLock_.writeLock().lock();
+            try {
+              role.setCatalogVersion(incrementAndGetCatalogVersion());
+              authPolicy_.addRole(role);
+            } finally {
+              catalogLock_.writeLock().unlock();
+            }
+          }
+
+          // Assume all privileges should be removed. Privileges that still exists are
+          // deleted from this set and we are left with the set of privileges that need
+          // to be removed.
+          Set<String> privilegesToRemove = role.getPrivilegeNames();
+
+          // Check all the privileges that are part of this role.
+          for (TSentryPrivilege sentryPriv:
+              sentryPolicyService_.listRolePrivileges(role.getName())) {
+            privilegesToRemove.remove(sentryPriv.getPrivilegeName().toLowerCase());
+            RolePrivilege existingPriv =
+                role.getPrivilege(sentryPriv.getPrivilegeName());
+
+            // We already know about this privilege (privileges cannot be modified).
+            if (existingPriv != null &&
+                existingPriv.getCreateTimeMs() == sentryPriv.getCreateTime()) {
+              continue;
+            }
+            RolePrivilege priv = new RolePrivilege(role.getId(),
+                sentryPriv.getPrivilegeName(), sentryPriv.getPrivilegeScope(),
+                sentryPriv.getCreateTime());
+
+            // Increment the catalog version and add the privilege atomically.
+            catalogLock_.writeLock().lock();
+            try {
+              priv.setCatalogVersion(incrementAndGetCatalogVersion());
+              role.addPrivilege(priv);
+            } finally {
+              catalogLock_.writeLock().unlock();
+            }
+          }
+
+          // Remove the privileges that no longer exist, incrementing the catalog version
+          // to indicate a change.
+          catalogLock_.writeLock().lock();
+          try {
+            for (String privilegeName: privilegesToRemove) {
+              role.removePrivilege(privilegeName);
+              incrementAndGetCatalogVersion();
+            }
+          } finally {
+            catalogLock_.writeLock().unlock();
+          }
+        }
+      } catch (Exception e) {
+        LOG.error("Error making RPC to Sentry Policy Server. Skipping update: ", e);
+        return;
+      }
+
+      // Remove all the roles, incrementing the catalog version to indicate
+      // a change.
+      catalogLock_.writeLock().lock();
+      try {
+        for (String roleName: rolesToRemove) {
+          authPolicy_.removeRole(roleName);
+          incrementAndGetCatalogVersion();
+        }
+      } finally {
+        catalogLock_.writeLock().unlock();
+      }
+    }
+  }
+
+  /**
+   * Adds a list of cache directive IDs for the given table name. Asynchronously
+   * refreshes the table metadata once all cache directives complete.
+   */
+  public void watchCacheDirs(List<Long> dirIds, TTableName tblName) {
+    tableLoadingMgr_.watchCacheDirs(dirIds, tblName);
   }
 
   /**
@@ -189,9 +370,38 @@ public class CatalogServiceCatalog extends Catalog {
         for (Function fn: db.getFunctions(null, new PatternMatcher())) {
           TCatalogObject function = new TCatalogObject(TCatalogObjectType.FUNCTION,
               fn.getCatalogVersion());
-          function.setType(TCatalogObjectType.FUNCTION);
           function.setFn(fn.toThrift());
           resp.addToObjects(function);
+        }
+      }
+
+      for (DataSource dataSource: getDataSources()) {
+        TCatalogObject catalogObj = new TCatalogObject(TCatalogObjectType.DATA_SOURCE,
+            dataSource.getCatalogVersion());
+        catalogObj.setData_source(dataSource.toThrift());
+        resp.addToObjects(catalogObj);
+      }
+      for (HdfsCachePool cachePool: hdfsCachePools_) {
+        TCatalogObject pool = new TCatalogObject(TCatalogObjectType.HDFS_CACHE_POOL,
+            cachePool.getCatalogVersion());
+        pool.setCache_pool(cachePool.toThrift());
+        resp.addToObjects(pool);
+      }
+
+      // Get all roles
+      for (Role role: authPolicy_.getAllRoles()) {
+        TCatalogObject thriftRole = new TCatalogObject();
+        thriftRole.setRole(role.toThrift());
+        thriftRole.setCatalog_version(role.getCatalogVersion());
+        thriftRole.setType(role.getCatalogObjectType());
+        resp.addToObjects(thriftRole);
+
+        for (RolePrivilege p: role.getPrivileges()) {
+          TCatalogObject privilege = new TCatalogObject();
+          privilege.setPrivilege(p.toThrift());
+          privilege.setCatalog_version(p.getCatalogVersion());
+          privilege.setType(p.getCatalogObjectType());
+          resp.addToObjects(privilege);
         }
       }
 
@@ -240,6 +450,17 @@ public class CatalogServiceCatalog extends Catalog {
    * Resets this catalog instance by clearing all cached table and database metadata.
    */
   public void reset() throws CatalogException {
+    // First update the policy metadata.
+    if (sentryPolicyService_ != null) {
+      // Sentry Service is enabled.
+      try {
+        // Update the authorization policy, waiting for the result to complete.
+        policyReader_.submit(new AuthorizationPolicyReader()).get();
+      } catch (Exception e) {
+        throw new CatalogException("Error updating authorization policy: ", e);
+      }
+    }
+
     catalogLock_.writeLock().lock();
     try {
       nextTableId_.set(0);
@@ -460,6 +681,28 @@ public class CatalogServiceCatalog extends Catalog {
       return true;
     }
     return false;
+  }
+
+  /**
+   * Adds a data source to the catalog, incrementing the catalog version. Returns true
+   * if the add was successful, false otherwise.
+   */
+  @Override
+  public boolean addDataSource(DataSource dataSource) {
+    if (dataSources_.add(dataSource)) {
+      dataSource.setCatalogVersion(incrementAndGetCatalogVersion());
+      return true;
+    }
+    return false;
+  }
+
+  @Override
+  public DataSource removeDataSource(String dataSourceName) {
+    DataSource dataSource = dataSources_.remove(dataSourceName);
+    if (dataSource != null) {
+      dataSource.setCatalogVersion(incrementAndGetCatalogVersion());
+    }
+    return dataSource;
   }
 
   /**

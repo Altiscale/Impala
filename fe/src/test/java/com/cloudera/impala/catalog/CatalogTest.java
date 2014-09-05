@@ -22,12 +22,13 @@ import com.cloudera.impala.analysis.HdfsUri;
 import com.cloudera.impala.analysis.IntLiteral;
 import com.cloudera.impala.analysis.LiteralExpr;
 import com.cloudera.impala.catalog.MetaStoreClientPool.MetaStoreClient;
+import com.cloudera.impala.testutil.CatalogServiceTestCatalog;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 
 public class CatalogTest {
   private static CatalogServiceCatalog catalog_ =
-      CatalogServiceCatalog.createForTesting(false);
+      CatalogServiceTestCatalog.create();
 
   private void checkTableCols(Db db, String tblName, int numClusteringCols,
       String[] colNames, ColumnType[] colTypes) throws TableLoadingException {
@@ -264,9 +265,11 @@ public class CatalogTest {
         catalog_.getOrLoadTable("functional", "AllTypes"));
   }
 
-  @Test public void TestPartitions() throws TableLoadingException {
+  @Test
+  public void TestPartitions() throws TableLoadingException,
+      DatabaseNotFoundException {
     HdfsTable table =
-        (HdfsTable) catalog_.getDb("functional").getTable("AllTypes");
+        (HdfsTable) catalog_.getOrLoadTable("functional", "AllTypes");
     List<HdfsPartition> partitions = table.getPartitions();
 
     // check that partition keys cover the date range 1/1/2009-12/31/2010
@@ -295,6 +298,26 @@ public class CatalogTest {
       assertEquals(p.getFileDescriptors().size(), 1);
     }
     assertEquals(months.size(), 24);
+  }
+
+  @Test
+  public void TestInvalidDecimalPartitions() throws CatalogException {
+    // Test reading the metadata of a partitioned table that has invalid
+    // decimal partition key values.
+    Table table = catalog_.getOrLoadTable("functional", "invalid_decimal_part_tbl1");
+    assertTrue(table instanceof IncompleteTable);
+    IncompleteTable incompleteTable = (IncompleteTable) table;
+    assertTrue(incompleteTable.getCause() instanceof TableLoadingException);
+
+    table = catalog_.getOrLoadTable("functional", "invalid_decimal_part_tbl2");
+    assertTrue(table instanceof IncompleteTable);
+    incompleteTable = (IncompleteTable) table;
+    assertTrue(incompleteTable.getCause() instanceof TableLoadingException);
+
+    table = catalog_.getOrLoadTable("functional", "invalid_decimal_part_tbl3");
+    assertTrue(table instanceof IncompleteTable);
+    incompleteTable = (IncompleteTable) table;
+    assertTrue(incompleteTable.getCause() instanceof TableLoadingException);
   }
 
   // TODO: All Hive-stats related tests are temporarily disabled because of an unknown,
@@ -394,7 +417,7 @@ public class CatalogTest {
   public void testColStatsColTypeMismatch() throws Exception {
     // First load a table that has column stats.
     //catalog_.refreshTable("functional", "alltypesagg", false);
-    HdfsTable table = (HdfsTable) catalog_.getDb("functional").getTable("alltypesagg");
+    HdfsTable table = (HdfsTable) catalog_.getOrLoadTable("functional", "alltypesagg");
 
     // Now attempt to update a column's stats with mismatched stats data and ensure
     // we get the expected results.
@@ -478,15 +501,16 @@ public class CatalogTest {
   }
 
   @Test
-  public void testCreateTableMetadata() throws TableLoadingException {
-    Table table = catalog_.getDb("functional").getTable("alltypes");
+  public void testCreateTableMetadata() throws TableLoadingException,
+      DatabaseNotFoundException {
+    Table table = catalog_.getOrLoadTable("functional", "alltypes");
     // Tables are created via Impala so the metadata should have been populated properly.
     // alltypes is an external table.
     assertEquals(System.getProperty("user.name"), table.getMetaStoreTable().getOwner());
     assertEquals(TableType.EXTERNAL_TABLE.toString(),
         table.getMetaStoreTable().getTableType());
     // alltypesinsert is created using CREATE TABLE LIKE and is a MANAGED table
-    table = catalog_.getDb("functional").getTable("alltypesinsert");
+    table = catalog_.getOrLoadTable("functional", "alltypesinsert");
     assertEquals(System.getProperty("user.name"), table.getMetaStoreTable().getOwner());
     assertEquals(TableType.MANAGED_TABLE.toString(),
         table.getMetaStoreTable().getTableType());
