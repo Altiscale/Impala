@@ -18,7 +18,8 @@
 # "-INTERNAL" appended. Parts of the code will look for this to distinguish
 # between released and internal versions.
 VERSION=1.3.1-cdh4
-GIT_HASH=$(git rev-parse HEAD)
+# This is pass from upper script
+# GIT_HASH=$(git rev-parse HEAD)
 BUILD_TIME=`date`
 HEADER="# Generated version information from save-version.sh"
 echo -e \
