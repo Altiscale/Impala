@@ -154,8 +154,9 @@ fi
 
 if [ -e $HADOOP_HOME/lib/native/libgplcompression.so ]
 then
-  cp $HADOOP_HOME/lib/native/libgplcompression.* \
-    $IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/lib/native/
+  echo "ok - files are identical in the right location, nothing to copy here, just apply them"
+  # cp $HADOOP_HOME/lib/native/libgplcompression.* \
+  #   $IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/lib/native/
 else
   echo "No hadoop-lzo found"
 fi
