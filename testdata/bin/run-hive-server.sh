@@ -21,6 +21,4 @@ hive --service hiveserver2 &
 
 # Wait for the HiveServer2 service to come up because callers of this script
 # may rely on it being available.
-python $IMPALA_HOME/testdata/bin/wait-for-hiveserver2.py --transport=plain_sasl
-
-$IMPALA_HOME/testdata/bin/avoid_hive_replication_bug.sh
+python $IMPALA_HOME/testdata/bin/wait-for-hiveserver2.py

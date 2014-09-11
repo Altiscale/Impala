@@ -372,8 +372,7 @@ WHERE ss_date > '2001-09-15';
 ---- LOAD
 USE {db_name};
 
--- Disable auto.convert.join due to HIVE-5068
-set hive.auto.convert.join=false;
+set hive.auto.convert.join=true;
 set hive.exec.max.dynamic.partitions.pernode=10000;
 set hive.exec.max.dynamic.partitions=10000;
 set hive.exec.dynamic.partition.mode=nonstrict;
@@ -389,8 +388,7 @@ distribute by ss_date;
 ---- LOAD_LOCAL
 USE {db_name};
 
--- Disable auto.convert.join due to HIVE-5068
-set hive.auto.convert.join=false;
+set hive.auto.convert.join=true;
 set hive.exec.max.dynamic.partitions.pernode=10000;
 set hive.exec.max.dynamic.partitions=10000;
 set hive.exec.dynamic.partition.mode=nonstrict;

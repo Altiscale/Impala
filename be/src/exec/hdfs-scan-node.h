@@ -130,7 +130,7 @@ class HdfsScanNode : public ScanNode {
 
   RuntimeState* runtime_state() { return runtime_state_; }
 
-  DiskIoMgr::ReaderContext* reader_context() { return reader_context_; }
+  DiskIoMgr::RequestContext* reader_context() { return reader_context_; }
 
   const static int SKIP_COLUMN = -1;
 
@@ -147,11 +147,11 @@ class HdfsScanNode : public ScanNode {
   }
 
   // Returns the per format codegen'd function.  Scanners call this to get the
-  // codegen function to use.  Returns NULL if codegen should not be used.
-  llvm::Function* GetCodegenFn(THdfsFileFormat::type);
+  // codegen'd function to use.  Returns NULL if codegen should not be used.
+  void* GetCodegenFn(THdfsFileFormat::type);
 
   // Each call to GetCodegenFn() must call ReleaseCodegenFn().
-  void ReleaseCodegenFn(THdfsFileFormat::type type, llvm::Function* fn);
+  void ReleaseCodegenFn(THdfsFileFormat::type type, void* fn);
 
   // Returns a prepared copy of the query's conjunct exprs. Scanners use the conjunct
   // exprs directly when they cannot use a codegen'd function.
@@ -273,8 +273,8 @@ class HdfsScanNode : public ScanNode {
   // materialized string slots.
   bool requires_compaction_;
 
-  // ReaderContext object to use with the disk-io-mgr
-  DiskIoMgr::ReaderContext* reader_context_;
+  // RequestContext object to use with the disk-io-mgr for reads.
+  DiskIoMgr::RequestContext* reader_context_;
 
   // Descriptor for tuples this scan node constructs
   const TupleDescriptor* tuple_desc_;
@@ -294,6 +294,10 @@ class HdfsScanNode : public ScanNode {
   // File format => file descriptors.
   typedef std::map<THdfsFileFormat::type, std::vector<HdfsFileDesc*> > FileFormatsMap;
   FileFormatsMap per_type_files_;
+
+  // Set to true when the initial scan ranges are issued to the IoMgr. This happens
+  // on the first call to GetNext().
+  bool initial_ranges_issued_;
 
   // The estimated memory required to start up a new scanner thread. If the memory
   // left (due to limits) is less than this value, we won't start up optional
@@ -318,7 +322,7 @@ class HdfsScanNode : public ScanNode {
   // is based on the maximum number of parallel scan ranges possible, which is in turn
   // based on the number of cpu cores.
   boost::mutex codgend_fn_map_lock_;
-  typedef std::map<THdfsFileFormat::type, std::list<llvm::Function*> > CodegendFnMap;
+  typedef std::map<THdfsFileFormat::type, std::list<void*> > CodegendFnMap;
   CodegendFnMap codegend_fn_map_;
 
   // All conjunct copies that are created, including codegen'd and noncodegen'd
@@ -353,6 +357,7 @@ class HdfsScanNode : public ScanNode {
 
   // Vector containing slot descriptors for all materialized non-partition key
   // slots.  These descriptors are sorted in order of increasing col_pos
+  // TODO: Put this (with associated fields and logic) on ScanNode or ExecNode
   std::vector<SlotDescriptor*> materialized_slots_;
 
   // Vector containing slot descriptors for all materialized partition key slots

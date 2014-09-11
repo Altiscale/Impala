@@ -31,6 +31,7 @@ import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.PrintUtils;
 import com.cloudera.impala.common.TreeNode;
+import com.cloudera.impala.thrift.TExecStats;
 import com.cloudera.impala.thrift.TExplainLevel;
 import com.cloudera.impala.thrift.TPlan;
 import com.cloudera.impala.thrift.TPlanNode;
@@ -38,6 +39,7 @@ import com.cloudera.impala.thrift.TQueryOptions;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
+import com.google.common.math.LongMath;
 
 /**
  * Each PlanNode represents a single relational operator
@@ -245,6 +247,17 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
 
   protected void setDisplayName(String s) { displayName_ = s; }
 
+  final protected String getDisplayLabel() {
+    return String.format("%s:%s", id_.toString(), displayName_);
+  }
+
+  /**
+   * Subclasses can override to provide a node specific detail string that
+   * is displayed to the user.
+   * e.g. scan can return the table name.
+   */
+  protected String getDisplayLabelDetail() { return ""; }
+
   /**
    * Generate the explain plan tree. The plan will be in the form of:
    *
@@ -361,6 +374,14 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
     TPlanNode msg = new TPlanNode();
     msg.node_id = id_.asInt();
     msg.limit = limit_;
+
+    TExecStats estimatedStats = new TExecStats();
+    estimatedStats.setCardinality(cardinality_);
+    estimatedStats.setMemory_used(perHostMemCost_);
+    msg.setLabel(getDisplayLabel());
+    msg.setLabel_detail(getDisplayLabelDetail());
+    msg.setEstimated_stats(estimatedStats);
+
     for (TupleId tid: rowTupleIds_) {
       msg.addToRow_tuples(tid.asInt());
       msg.addToNullable_tuples(nullableTupleIds_.contains(tid));
@@ -519,7 +540,34 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    * Returns true if stats-related variables are valid.
    */
   protected boolean hasValidStats() {
-    return (numNodes_ == -1 || numNodes_ >= 0) && (cardinality_ == -1 || cardinality_ >= 0);
+    return (numNodes_ == -1 || numNodes_ >= 0) &&
+           (cardinality_ == -1 || cardinality_ >= 0);
+  }
+
+  /**
+   * Computes and returns the sum of two cardinalities. If an overflow occurs,
+   * the maximum Long value is returned (Long.MAX_VALUE).
+   */
+  public static long addCardinalities(long a, long b) {
+    try {
+      return LongMath.checkedAdd(a, b);
+    } catch (ArithmeticException e) {
+      LOG.warn("overflow when adding cardinalities: " + a + ", " + b);
+      return Long.MAX_VALUE;
+    }
+  }
+
+  /**
+   * Computes and returns the product of two cardinalities. If an overflow
+   * occurs, the maximum Long value is returned (Long.MAX_VALUE).
+   */
+  public static long multiplyCardinalities(long a, long b) {
+    try {
+      return LongMath.checkedMultiply(a, b);
+    } catch (ArithmeticException e) {
+      LOG.warn("overflow when multiplying cardinalities: " + a + ", " + b);
+      return Long.MAX_VALUE;
+    }
   }
 
   /**
@@ -536,10 +584,5 @@ abstract public class PlanNode extends TreeNode<PlanNode> {
    */
   public void computeCosts(TQueryOptions queryOptions) {
     perHostMemCost_ = 0;
-  }
-
-  public PlanNode clone(PlanNodeId id) {
-    Preconditions.checkState(false, "Not implemented");
-    return null;
   }
 }

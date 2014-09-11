@@ -42,7 +42,7 @@ import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.testutil.ImpaladTestCatalog;
 import com.cloudera.impala.testutil.TestUtils;
 import com.cloudera.impala.thrift.TExpr;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TQueryCtx;
 import com.google.common.base.Preconditions;
 
 public class AnalyzerTest {
@@ -61,8 +61,9 @@ public class AnalyzerTest {
     typeToLiteralValue_.put(ColumnType.SMALLINT, (Byte.MAX_VALUE + 1) + "");
     typeToLiteralValue_.put(ColumnType.INT, (Short.MAX_VALUE + 1) + "");
     typeToLiteralValue_.put(ColumnType.BIGINT, ((long) Integer.MAX_VALUE + 1) + "");
-    typeToLiteralValue_.put(ColumnType.FLOAT, "1.0");
-    typeToLiteralValue_.put(ColumnType.DOUBLE, (Float.MAX_VALUE + 1) + "");
+    typeToLiteralValue_.put(ColumnType.FLOAT, "cast(1.0 as float)");
+    typeToLiteralValue_.put(ColumnType.DOUBLE,
+        "cast(" + (Float.MAX_VALUE + 1) + " as double)");
     typeToLiteralValue_.put(ColumnType.TIMESTAMP,
         "cast('2012-12-21 00:00:00.000' as timestamp)");
     typeToLiteralValue_.put(ColumnType.STRING, "'Hello, World!'");
@@ -70,9 +71,9 @@ public class AnalyzerTest {
   }
 
   protected Analyzer createAnalyzer(String defaultDb) {
-    TQueryContext queryCtxt =
+    TQueryCtx queryCtx =
         TestUtils.createQueryContext(defaultDb, System.getProperty("user.name"));
-    return new Analyzer(catalog_, queryCtxt);
+    return new Analyzer(catalog_, queryCtx);
   }
 
   protected Analyzer createAnalyzerUsingHiveColLabels() {
@@ -161,19 +162,46 @@ public class AnalyzerTest {
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    */
   public ParseNode AnalyzesOk(String stmt) {
-    return AnalyzesOk(stmt, createAnalyzer(Catalog.DEFAULT_DB));
+    return AnalyzesOk(stmt, createAnalyzer(Catalog.DEFAULT_DB), null);
+  }
+
+  /**
+   * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
+   * If 'expectedWarning' is not null, asserts that a warning is produced.
+   */
+  public ParseNode AnalyzesOk(String stmt, String expectedWarning) {
+    return AnalyzesOk(stmt, createAnalyzer(Catalog.DEFAULT_DB), expectedWarning);
   }
 
   /**
    * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
    */
   public ParseNode AnalyzesOk(String stmt, Analyzer analyzer) {
+    return AnalyzesOk(stmt, analyzer, null);
+  }
+
+  /**
+   * Analyze 'stmt', expecting it to pass. Asserts in case of analysis error.
+   * If 'expectedWarning' is not null, asserts that a warning is produced.
+   */
+  public ParseNode AnalyzesOk(String stmt, Analyzer analyzer, String expectedWarning) {
     this.analyzer_ = analyzer;
     LOG.info("analyzing " + stmt);
     ParseNode node = ParsesOk(stmt);
     assertNotNull(node);
     try {
       node.analyze(analyzer);
+      if (expectedWarning != null) {
+        List<String> actualWarnings = analyzer.getWarnings();
+        boolean matchedWarning = false;
+        for (String actualWarn: actualWarnings) {
+          if (actualWarn.startsWith(expectedWarning)) {
+            matchedWarning = true;
+            break;
+          }
+        }
+        if (!matchedWarning) fail("Did not produce expected warning " + expectedWarning);
+      }
     } catch (ImpalaException e) {
       e.printStackTrace();
       fail("Error:\n" + e.toString());
@@ -249,16 +277,19 @@ public class AnalyzerTest {
   public void TestMemLayout() throws AnalysisException, AuthorizationException {
     testSelectStar();
     testNonNullable();
-    TestMixedNullable();
+    testMixedNullable();
+    testNonMaterializedSlots();
   }
 
   private void testSelectStar() throws AnalysisException, AuthorizationException {
     AnalyzesOk("select * from functional.AllTypes");
     DescriptorTable descTbl = analyzer_.getDescTbl();
-    for (SlotDescriptor slotD : descTbl.getTupleDesc(new TupleId(0)).getSlots()) {
+    TupleDescriptor tupleD = descTbl.getTupleDesc(new TupleId(0));
+    for (SlotDescriptor slotD: tupleD.getSlots()) {
       slotD.setIsMaterialized(true);
     }
     descTbl.computeMemLayout();
+    Assert.assertEquals(97.0f, tupleD.getAvgSerializedSize());
     checkLayoutParams("functional.alltypes.bool_col", 1, 2, 0, 0);
     checkLayoutParams("functional.alltypes.tinyint_col", 1, 3, 0, 1);
     checkLayoutParams("functional.alltypes.smallint_col", 2, 4, 0, 2);
@@ -271,7 +302,8 @@ public class AnalyzerTest {
     checkLayoutParams("functional.alltypes.double_col", 8, 40, 1, 1);
     int strSlotSize = PrimitiveType.STRING.getSlotSize();
     checkLayoutParams("functional.alltypes.date_string_col", strSlotSize, 48, 1, 2);
-    checkLayoutParams("functional.alltypes.string_col", strSlotSize, 48 + strSlotSize, 1, 3);
+    checkLayoutParams("functional.alltypes.string_col",
+        strSlotSize, 48 + strSlotSize, 1, 3);
   }
 
   private void testNonNullable() throws AnalysisException {
@@ -281,18 +313,18 @@ public class AnalyzerTest {
     // 8 - 15: count(*)
     AnalyzesOk("select count(int_col), count(*) from functional.AllTypes");
     DescriptorTable descTbl = analyzer_.getDescTbl();
-    com.cloudera.impala.analysis.TupleDescriptor aggDesc =
-        descTbl.getTupleDesc(new TupleId(1));
+    TupleDescriptor aggDesc = descTbl.getTupleDesc(new TupleId(1));
     for (SlotDescriptor slotD: aggDesc.getSlots()) {
       slotD.setIsMaterialized(true);
     }
     descTbl.computeMemLayout();
-    Assert.assertEquals(aggDesc.getByteSize(), 16);
+    Assert.assertEquals(16.0f, aggDesc.getAvgSerializedSize());
+    Assert.assertEquals(16, aggDesc.getByteSize());
     checkLayoutParams(aggDesc.getSlots().get(0), 8, 0, 0, -1);
     checkLayoutParams(aggDesc.getSlots().get(1), 8, 8, 0, -1);
   }
 
-  private void TestMixedNullable() throws AnalysisException {
+  private void testMixedNullable() throws AnalysisException {
     // one slot is nullable, one is not. The layout should look like:
     // (byte range : data)
     // 0 : 1 nullable-byte (only 1 bit used)
@@ -301,15 +333,50 @@ public class AnalyzerTest {
     // 16 - 23: count(*)
     AnalyzesOk("select sum(int_col), count(*) from functional.AllTypes");
     DescriptorTable descTbl = analyzer_.getDescTbl();
-    com.cloudera.impala.analysis.TupleDescriptor aggDesc =
-        descTbl.getTupleDesc(new TupleId(1));
+    TupleDescriptor aggDesc = descTbl.getTupleDesc(new TupleId(1));
     for (SlotDescriptor slotD: aggDesc.getSlots()) {
       slotD.setIsMaterialized(true);
     }
     descTbl.computeMemLayout();
-    Assert.assertEquals(aggDesc.getByteSize(), 24);
+    Assert.assertEquals(16.0f, aggDesc.getAvgSerializedSize());
+    Assert.assertEquals(24, aggDesc.getByteSize());
     checkLayoutParams(aggDesc.getSlots().get(0), 8, 8, 0, 0);
     checkLayoutParams(aggDesc.getSlots().get(1), 8, 16, 0, -1);
+  }
+
+  /**
+   * Tests that computeMemLayout() ignores non-materialized slots.
+   */
+  private void testNonMaterializedSlots() throws AnalysisException {
+    AnalyzesOk("select * from functional.alltypes");
+    DescriptorTable descTbl = analyzer_.getDescTbl();
+    TupleDescriptor tupleD = descTbl.getTupleDesc(new TupleId(0));
+    ArrayList<SlotDescriptor> slots = tupleD.getSlots();
+    for (SlotDescriptor slotD: slots) {
+      slotD.setIsMaterialized(true);
+    }
+    // Mark slots 0 (id), 7 (double_col), 9 (string_col) as non-materialized.
+    slots.get(0).setIsMaterialized(false);
+    slots.get(7).setIsMaterialized(false);
+    slots.get(9).setIsMaterialized(false);
+
+    descTbl.computeMemLayout();
+    Assert.assertEquals(68.0f, tupleD.getAvgSerializedSize());
+    // Check non-materialized slots.
+    checkLayoutParams("functional.alltypes.id", 0, -1, 0, 0);
+    checkLayoutParams("functional.alltypes.double_col", 0, -1, 0, 0);
+    checkLayoutParams("functional.alltypes.string_col", 0, -1, 0, 0);
+    // Check materialized slots.
+    checkLayoutParams("functional.alltypes.bool_col", 1, 2, 0, 0);
+    checkLayoutParams("functional.alltypes.tinyint_col", 1, 3, 0, 1);
+    checkLayoutParams("functional.alltypes.smallint_col", 2, 4, 0, 2);
+    checkLayoutParams("functional.alltypes.int_col", 4, 8, 0, 3);
+    checkLayoutParams("functional.alltypes.float_col", 4, 12, 0, 4);
+    checkLayoutParams("functional.alltypes.year", 4, 16, 0, 5);
+    checkLayoutParams("functional.alltypes.month", 4, 20, 0, 6);
+    checkLayoutParams("functional.alltypes.bigint_col", 8, 24, 0, 7);
+    int strSlotSize = PrimitiveType.STRING.getSlotSize();
+    checkLayoutParams("functional.alltypes.date_string_col", strSlotSize, 32, 1, 0);
   }
 
   private void checkLayoutParams(SlotDescriptor d, int byteSize, int byteOffset,
@@ -342,18 +409,8 @@ public class AnalyzerTest {
     // The table metadata should not have been loaded.
     AnalysisError("select * from functional.map_table",
         "Failed to load metadata for table: functional.map_table");
-    /*
-     * TODO: Renable these tests. The table contains decimal which we used to treat
-     * as a primitive type (and therefore could read tables that contains this type
-     * as long as we were skipping those columns. In hive 12's decimal, this is no
-     * longer the case.
-     */
     // Select supported types from a table with mixed supported/unsupported types.
     AnalyzesOk("select int_col, str_col, bigint_col from functional.unsupported_types");
-
-    // Select supported types from a table with mixed supported/unsupported types.
-    AnalyzesOk("select int_col, str_col, bigint_col from functional.unsupported_types");
-
     // Unsupported type binary.
     AnalysisError("select bin_col from functional.unsupported_types",
         "Unsupported type 'BINARY' in 'bin_col'.");
@@ -458,14 +515,14 @@ public class AnalyzerTest {
 
     // Analysis error from non-integral values
     AnalysisError("select * from functional.AllTypes limit 10.0",
-        "LIMIT expression must be an integer type but is 'FLOAT': 10.0");
+        "LIMIT expression must be an integer type but is 'DECIMAL(3,1)': 10.0");
     AnalysisError("select * from functional.AllTypes limit NOT FALSE",
         "LIMIT expression must be an integer type but is 'BOOLEAN': NOT FALSE");
     AnalysisError("select * from functional.AllTypes limit CAST(\"asdf\" AS INT)",
         "LIMIT expression evaluates to NULL: CAST('asdf' AS INT)");
     AnalysisError("select * from functional.AllTypes order by id limit 10 " +
         "OFFSET 10.0",
-        "OFFSET expression must be an integer type but is 'FLOAT': 10.0");
+        "OFFSET expression must be an integer type but is 'DECIMAL(3,1)': 10.0");
     AnalysisError("select * from functional.AllTypes order by id limit 10 " +
         "offset CAST('asdf' AS INT)",
         "OFFSET expression evaluates to NULL: CAST('asdf' AS INT)");
@@ -479,11 +536,13 @@ public class AnalyzerTest {
 
     // Offset is only valid with an order by
     AnalysisError("SELECT a FROM test LIMIT 10 OFFSET 5",
-        "OFFSET requires an ORDER BY clause: SELECT a FROM test LIMIT 10 OFFSET 5");
+        "OFFSET requires an ORDER BY clause: LIMIT 10 OFFSET 5");
     AnalysisError("SELECT x.id FROM (SELECT id FROM alltypesagg LIMIT 5 OFFSET 5) x " +
         "ORDER BY x.id LIMIT 100 OFFSET 4",
-        "OFFSET requires an ORDER BY clause: SELECT id FROM alltypesagg " +
-        "LIMIT 5 OFFSET 5");
+        "OFFSET requires an ORDER BY clause: LIMIT 5 OFFSET 5");
+    AnalysisError("SELECT a FROM test OFFSET 5",
+        "OFFSET requires an ORDER BY clause: OFFSET 5");
+    AnalyzesOk("SELECT id FROM functional.Alltypes ORDER BY bool_col OFFSET 5");
   }
 
   @Test

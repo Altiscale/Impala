@@ -98,6 +98,21 @@ struct TGetDbsResult {
   1: list<string> dbs
 }
 
+// Arguments to getDataSrcsNames, which returns a list of data sources that match an
+// optional pattern
+struct TGetDataSrcsParams {
+  // If not set, match every data source
+  1: optional string pattern
+}
+
+// getDataSrcsNames returns a list of data source names
+struct TGetDataSrcsResult {
+  1: required list<string> data_src_names
+  2: required list<string> locations
+  3: required list<string> class_names
+  4: required list<string> api_versions
+}
+
 // Used by DESCRIBE <table> statements to control what information is returned and how to
 // format the output.
 enum TDescribeTableOutputStyle {
@@ -125,6 +140,13 @@ struct TDescribeTableParams {
 struct TDescribeTableResult {
   // Output from a DESCRIBE TABLE command.
   1: required list<Data.TResultRow> results
+}
+
+// Parameters for SHOW DATA SOURCES commands
+struct TShowDataSrcsParams {
+  // Optional pattern to match data source names. If not set, all data sources are
+  // returned.
+  1: optional string show_pattern
 }
 
 // Parameters for SHOW DATABASES commands
@@ -214,6 +236,10 @@ struct TFinalizeParams {
   // during an INSERT. For a query with id a:b, files are written to <staging_dir>/.a_b/,
   // and that entire directory is removed after the INSERT completes.
   5: optional string staging_dir
+
+  // Identifier for the target table in the query-wide descriptor table (see
+  // TDescriptorTable and TTableDescriptor).
+  6: optional i64 table_id;
 }
 
 // Request for a LOAD DATA statement. LOAD DATA is only supported for HDFS backed tables.
@@ -268,7 +294,7 @@ struct TQueryExecRequest {
   // Set if the query needs finalization after it executes
   6: optional TFinalizeParams finalize_params
 
-  7: required ImpalaInternalService.TQueryContext query_ctxt
+  7: required ImpalaInternalService.TQueryCtx query_ctx
 
   // The same as the output of 'explain <query>'
   8: optional string query_plan
@@ -296,9 +322,12 @@ enum TCatalogOpType {
   SHOW_FUNCTIONS,
   RESET_METADATA,
   DDL,
-  SHOW_CREATE_TABLE
+  SHOW_CREATE_TABLE,
+  SHOW_DATA_SRCS
 }
 
+// TODO: Combine SHOW requests with a single struct that contains a field
+// indicating which type of show request it is.
 struct TCatalogOpRequest {
   1: required TCatalogOpType op_type
 
@@ -316,6 +345,9 @@ struct TCatalogOpRequest {
 
   // Parameters for SHOW FUNCTIONS
   6: optional TShowFunctionsParams show_fns_params
+
+  // Parameters for SHOW DATA SOURCES
+  11: optional TShowDataSrcsParams show_data_srcs_params
 
   // Parameters for DDL requests executed using the CatalogServer
   // such as CREATE, ALTER, and DROP. See CatalogService.TDdlExecRequest
@@ -407,6 +439,23 @@ struct TExecRequest {
   // List of catalog objects accessed by this request. May be empty in this
   // case that the query did not access any Catalog objects.
   8: optional list<TAccessEvent> access_events
+
+  // List of warnings that were generated during analysis. May be empty.
+  9: required list<string> analysis_warnings
+}
+
+// Parameters to FeSupport.cacheJar().
+struct TCacheJarParams {
+  // HDFS URI for the jar
+  1: required string hdfs_location
+}
+
+// Result from FeSupport.cacheJar().
+struct TCacheJarResult {
+  1: required Status.TStatus status
+
+  // Local path for the jar. Set only if status is OK.
+  2: optional string local_path
 }
 
 // A UDF may include optional prepare and close functions in addition the main evaluation
@@ -532,4 +581,14 @@ struct TGetJvmMetricsResponse {
   // One entry for every pool tracked by the Jvm, plus a synthetic aggregate pool called
   // 'total'
   1: required list<TJvmMemoryPool> memory_pools
+}
+
+struct TGetHadoopConfigRequest {
+  // The value of the <name> in the config <property>
+  1: required string name
+}
+
+struct TGetHadoopConfigResponse {
+  // The corresponding value if one exists
+  1: optional string value
 }

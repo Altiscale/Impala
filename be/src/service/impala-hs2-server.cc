@@ -193,9 +193,10 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
     status->__set_sqlState(SQLSTATE_GENERAL_ERROR);
     return;
   }
-  TQueryContext query_ctxt;
-  session->ToThrift(session_id, &query_ctxt.session);
-  request->__set_session(query_ctxt.session);
+  TQueryCtx query_ctx;
+  PrepareQueryContext(&query_ctx);
+  session->ToThrift(session_id, &query_ctx.session);
+  request->__set_session(query_ctx.session);
 
   shared_ptr<QueryExecState> exec_state;
   // There is no user-supplied query text available because this metadata operation comes
@@ -204,9 +205,9 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
       _TMetadataOpcode_VALUES_TO_NAMES.find(request->opcode);
   const string& query_text = query_text_it == _TMetadataOpcode_VALUES_TO_NAMES.end() ?
       "N/A" : query_text_it->second;
-  query_ctxt.request.stmt = query_text;
-  exec_state.reset(new QueryExecState(query_ctxt, exec_env_,
-      frontend_.get(), this, session));
+  query_ctx.request.stmt = query_text;
+  exec_state.reset(new QueryExecState(query_ctx, exec_env_,
+      exec_env_->frontend(), this, session));
   Status register_status = RegisterQuery(session, exec_state);
   if (!register_status.ok()) {
     status->__set_statusCode(
@@ -216,8 +217,6 @@ void ImpalaServer::ExecuteMetadataOp(const THandleIdentifier& session_handle,
     return;
   }
 
-  // start execution of metadata first;
-  PrepareQueryContext(&query_ctxt);
   Status exec_status = exec_state->Exec(*request);
   if (!exec_status.ok()) {
     status->__set_statusCode(
@@ -272,8 +271,8 @@ Status ImpalaServer::FetchInternal(const TUniqueId& query_id, int32_t fetch_size
 }
 
 Status ImpalaServer::TExecuteStatementReqToTQueryContext(
-    const TExecuteStatementReq execute_request, TQueryContext* query_ctxt) {
-  query_ctxt->request.stmt = execute_request.statement;
+    const TExecuteStatementReq execute_request, TQueryCtx* query_ctx) {
+  query_ctx->request.stmt = execute_request.statement;
   VLOG_QUERY << "TExecuteStatementReq: " << ThriftDebugString(execute_request);
   {
     shared_ptr<SessionState> session_state;
@@ -283,9 +282,9 @@ Status ImpalaServer::TExecuteStatementReqToTQueryContext(
         &session_id, &secret));
 
     RETURN_IF_ERROR(GetSessionState(session_id, &session_state));
-    session_state->ToThrift(session_id, &query_ctxt->session);
+    session_state->ToThrift(session_id, &query_ctx->session);
     lock_guard<mutex> l(session_state->lock);
-    query_ctxt->request.query_options = session_state->default_query_options;
+    query_ctx->request.query_options = session_state->default_query_options;
   }
 
   if (execute_request.__isset.confOverlay) {
@@ -293,10 +292,10 @@ Status ImpalaServer::TExecuteStatementReqToTQueryContext(
     for (; conf_itr != execute_request.confOverlay.end(); ++conf_itr) {
       if (conf_itr->first == IMPALA_RESULT_CACHING_OPT) continue;
       RETURN_IF_ERROR(SetQueryOptions(conf_itr->first, conf_itr->second,
-          &query_ctxt->request.query_options));
+          &query_ctx->request.query_options));
     }
     VLOG_QUERY << "TClientRequest.queryOptions: "
-               << ThriftDebugString(query_ctxt->request.query_options);
+               << ThriftDebugString(query_ctx->request.query_options);
   }
   return Status::OK;
 }
@@ -304,7 +303,9 @@ Status ImpalaServer::TExecuteStatementReqToTQueryContext(
 // HiveServer2 API
 void ImpalaServer::OpenSession(TOpenSessionResp& return_val,
     const TOpenSessionReq& request) {
-  VLOG_QUERY << "OpenSession(): request=" << ThriftDebugString(request);
+  // DO NOT log this Thrift struct in its entirety, in case a bad client sets the
+  // password.
+  VLOG_QUERY << "OpenSession(): username=" << request.username;
 
   // Generate session ID and the secret
   TUniqueId session_id;
@@ -431,8 +432,8 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
     const TExecuteStatementReq& request) {
   VLOG_QUERY << "ExecuteStatement(): request=" << ThriftDebugString(request);
 
-  TQueryContext query_ctxt;
-  Status status = TExecuteStatementReqToTQueryContext(request, &query_ctxt);
+  TQueryCtx query_ctx;
+  Status status = TExecuteStatementReqToTQueryContext(request, &query_ctx);
   HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
 
   TUniqueId session_id;
@@ -466,7 +467,7 @@ void ImpalaServer::ExecuteStatement(TExecuteStatementResp& return_val,
   }
 
   shared_ptr<QueryExecState> exec_state;
-  status = Execute(&query_ctxt, session, &exec_state);
+  status = Execute(&query_ctx, session, &exec_state);
   HS2_RETURN_IF_ERROR(return_val, status, SQLSTATE_GENERAL_ERROR);
 
   // Optionally enable result caching on the QueryExecState.
@@ -820,18 +821,22 @@ void ImpalaServer::GetLog(TGetLogResp& return_val, const TGetLogReq& request) {
   ScopedSessionState session_handle(this);
   const TUniqueId session_id = exec_state->session_id();
   HS2_RETURN_IF_ERROR(return_val, session_handle.WithSession(session_id),
-      SQLSTATE_GENERAL_ERROR);
+                      SQLSTATE_GENERAL_ERROR);
 
+  stringstream ss;
   if (exec_state->coord() != NULL) {
-    // Report progress and all errors
-    // Hue parses the progress string to do progress indication.
-    stringstream ss;
+    // Report progress
     ss << exec_state->coord()->progress().ToString() << "\n";
-    ss << exec_state->coord()->GetErrorLog();
-    return_val.log = ss.str();
-    return_val.status.__set_statusCode(
-        apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS);
   }
+  // Report analysis errors
+  ss << join(exec_state->GetAnalysisWarnings(), "\n");
+  if (exec_state->coord() != NULL) {
+    // Report execution errors
+    ss << exec_state->coord()->GetErrorLog();
+  }
+  return_val.log = ss.str();
+  return_val.status.__set_statusCode(
+      apache::hive::service::cli::thrift::TStatusCode::SUCCESS_STATUS);
 }
 
 void ImpalaServer::TColumnValueToHiveServer2TColumnValue(const TColumnValue& col_val,
@@ -840,57 +845,58 @@ void ImpalaServer::TColumnValueToHiveServer2TColumnValue(const TColumnValue& col
   switch (type.type) {
     case TPrimitiveType::BOOLEAN:
       hs2_col_val->__isset.boolVal = true;
-      hs2_col_val->boolVal.value = col_val.boolVal;
-      hs2_col_val->boolVal.__isset.value = col_val.__isset.boolVal;
+      hs2_col_val->boolVal.value = col_val.bool_val;
+      hs2_col_val->boolVal.__isset.value = col_val.__isset.bool_val;
       break;
     case TPrimitiveType::TINYINT:
       hs2_col_val->__isset.byteVal = true;
-      hs2_col_val->byteVal.value = col_val.intVal;
-      hs2_col_val->byteVal.__isset.value = col_val.__isset.intVal;
+      hs2_col_val->byteVal.value = col_val.byte_val;
+      hs2_col_val->byteVal.__isset.value = col_val.__isset.byte_val;
       break;
     case TPrimitiveType::SMALLINT:
       hs2_col_val->__isset.i16Val = true;
-      hs2_col_val->i16Val.value = col_val.intVal;
-      hs2_col_val->i16Val.__isset.value = col_val.__isset.intVal;
+      hs2_col_val->i16Val.value = col_val.short_val;
+      hs2_col_val->i16Val.__isset.value = col_val.__isset.short_val;
       break;
     case TPrimitiveType::INT:
       hs2_col_val->__isset.i32Val = true;
-      hs2_col_val->i32Val.value = col_val.intVal;
-      hs2_col_val->i32Val.__isset.value = col_val.__isset.intVal;
+      hs2_col_val->i32Val.value = col_val.int_val;
+      hs2_col_val->i32Val.__isset.value = col_val.__isset.int_val;
       break;
     case TPrimitiveType::BIGINT:
       hs2_col_val->__isset.i64Val = true;
-      hs2_col_val->i64Val.value = col_val.longVal;
-      hs2_col_val->i64Val.__isset.value = col_val.__isset.longVal;
+      hs2_col_val->i64Val.value = col_val.long_val;
+      hs2_col_val->i64Val.__isset.value = col_val.__isset.long_val;
       break;
     case TPrimitiveType::FLOAT:
     case TPrimitiveType::DOUBLE:
       hs2_col_val->__isset.doubleVal = true;
-      hs2_col_val->doubleVal.value = col_val.doubleVal;
-      hs2_col_val->doubleVal.__isset.value = col_val.__isset.doubleVal;
+      hs2_col_val->doubleVal.value = col_val.double_val;
+      hs2_col_val->doubleVal.__isset.value = col_val.__isset.double_val;
       break;
     case TPrimitiveType::STRING:
     case TPrimitiveType::TIMESTAMP:
       // HiveServer2 requires timestamp to be presented as string.
       hs2_col_val->__isset.stringVal = true;
-      hs2_col_val->stringVal.__isset.value = col_val.__isset.stringVal;
-      if (col_val.__isset.stringVal) {
-        hs2_col_val->stringVal.value = col_val.stringVal;
+      hs2_col_val->stringVal.__isset.value = col_val.__isset.string_val;
+      if (col_val.__isset.string_val) {
+        hs2_col_val->stringVal.value = col_val.string_val;
       }
       break;
     default:
-      DCHECK(false) << "bad type: " << TypeToString(ThriftToType(type.type));
+      DCHECK(false) << "bad type: " << ColumnType(type);
       break;
   }
 }
 
 void ImpalaServer::ExprValueToHiveServer2TColumnValue(const void* value,
-    const TColumnType& type,
+    const TColumnType& t,
     apache::hive::service::cli::thrift::TColumnValue* hs2_col_val) {
+  ColumnType type(t);
   bool not_null = (value != NULL);
-  switch (type.type) {
+  switch (t.type) {
     case TPrimitiveType::NULL_TYPE:
-      // Set NULLs in the boolVal.
+      // Set NULLs in the bool_val.
       hs2_col_val->__isset.boolVal = true;
       hs2_col_val->boolVal.__isset.value = false;
       break;
@@ -948,8 +954,31 @@ void ImpalaServer::ExprValueToHiveServer2TColumnValue(const void* value,
         RawValue::PrintValue(value, TYPE_TIMESTAMP, -1, &(hs2_col_val->stringVal.value));
       }
       break;
+    case TPrimitiveType::DECIMAL:
+      // HiveServer2 requires decimal to be presented as string.
+      hs2_col_val->__isset.stringVal = true;
+      hs2_col_val->stringVal.__isset.value = not_null;
+      if (not_null) {
+        switch (type.GetByteSize()) {
+          case 4:
+            hs2_col_val->stringVal.value =
+              reinterpret_cast<const Decimal4Value*>(value)->ToString(type);
+            break;
+          case 8:
+            hs2_col_val->stringVal.value =
+              reinterpret_cast<const Decimal8Value*>(value)->ToString(type);
+            break;
+          case 16:
+            hs2_col_val->stringVal.value =
+              reinterpret_cast<const Decimal16Value*>(value)->ToString(type);
+            break;
+          default:
+            DCHECK(false) << "bad type: " << type;
+        }
+      }
+      break;
     default:
-      DCHECK(false) << "bad type: " << TypeToString(ThriftToType(type.type));
+      DCHECK(false) << "bad type: " << type;
       break;
   }
 }

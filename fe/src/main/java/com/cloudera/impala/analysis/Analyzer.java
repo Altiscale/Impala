@@ -49,7 +49,7 @@ import com.cloudera.impala.planner.PlanNode;
 import com.cloudera.impala.service.FeSupport;
 import com.cloudera.impala.thrift.TAccessEvent;
 import com.cloudera.impala.thrift.TCatalogObjectType;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TQueryCtx;
 import com.cloudera.impala.util.DisjointSet;
 import com.cloudera.impala.util.TSessionStateUtil;
 import com.google.common.base.Preconditions;
@@ -86,13 +86,17 @@ public class Analyzer {
   public final static String TBL_ALREADY_EXISTS_ERROR_MSG = "Table already exists: ";
   public final static String FN_DOES_NOT_EXIST_ERROR_MSG = "Function does not exist: ";
   public final static String FN_ALREADY_EXISTS_ERROR_MSG = "Function already exists: ";
+  public final static String DATA_SRC_DOES_NOT_EXIST_ERROR_MSG =
+      "Data source does not exist: ";
+  public final static String DATA_SRC_ALREADY_EXISTS_ERROR_MSG =
+      "Data source already exists: ";
 
   private final static Logger LOG = LoggerFactory.getLogger(Analyzer.class);
 
   private final User user_;
 
-  // true if the corresponding select block has a limit clause
-  private boolean hasLimit_ = false;
+  // true if the corresponding select block has a limit and/or offset clause
+  private boolean hasLimitOffsetClause_ = false;
 
   // Current depth of nested analyze() calls. Used for enforcing a
   // maximum expr-tree depth. Needs to be manually maintained by the user
@@ -102,13 +106,24 @@ public class Analyzer {
   // state shared between all objects of an Analyzer tree
   private static class GlobalState {
     public final ImpaladCatalog catalog;
-    public final TQueryContext queryCtxt;
+    public final TQueryCtx queryCtx;
     public final DescriptorTable descTbl = new DescriptorTable();
     public final IdGenerator<ExprId> conjunctIdGenerator = ExprId.createGenerator();
 
     // True if we are analyzing an explain request. Should be set before starting
     // analysis.
     public boolean isExplain;
+
+    // True if we are analyzing an insert statement.
+    // TODO: The use of this flag is temporary. When analyzing a query statement, we need
+    // to distinguish between a top-level SELECT and an INSERT INTO SELECT to know
+    // whether to evaluate an order-by without limit. The correct way to do this would be
+    // to analyze the query statement in the INSERT INTO SELECT with a new analyzer that
+    // is the child of the INSERT statement's analyzer. This is also the right thing to do
+    // with respect to scoping WITH CLAUSE aliases before the INSERT and SELECT clauses,
+    // but that leads to problems with recursive references for queries of the form:
+    // with t1 as (...) insert into with t1 as (select * from t1) select * from t1.
+    public boolean isInsertStmt = false;
 
     // whether to use Hive's auto-generated column labels
     public boolean useHiveColLabels = false;
@@ -150,6 +165,10 @@ public class Analyzer {
     // accesses to catalog objects
     public List<TAccessEvent> accessEvents = Lists.newArrayList();
 
+    // Tracks all warnings (e.g. non-fatal errors) that were generated during analysis.
+    // These are passed to the backend and eventually propagated to the shell.
+    public final List<String> warnings = Lists.newArrayList();
+
     // map from equivalence class id to the list of its member slots
     private final Map<EquivalenceClassId, ArrayList<SlotId>> equivClassMembers =
         Maps.newHashMap();
@@ -164,9 +183,9 @@ public class Analyzer {
     private final List<Pair<SlotId, SlotId>> registeredValueTransfers =
         Lists.newArrayList();
 
-    public GlobalState(ImpaladCatalog catalog, TQueryContext queryCtxt) {
+    public GlobalState(ImpaladCatalog catalog, TQueryCtx queryCtx) {
       this.catalog = catalog;
-      this.queryCtxt = queryCtxt;
+      this.queryCtx = queryCtx;
     }
   };
 
@@ -181,20 +200,26 @@ public class Analyzer {
   // map from lowercase table alias to a view definition of a WITH clause.
   private final Map<String, ViewRef> withClauseViews_ = Maps.newHashMap();
 
-  // map from lowercase table alias to descriptor.
+  // Map from lowercase table alias to descriptor. Tables without an explicit alias
+  // are assigned two implicit aliases: the unqualified and fully-qualified table name.
+  // Such tables have two entries pointing to the same descriptor. If an alias is
+  // ambiguous, then this map retains the first entry with that alias to simplify error
+  // checking (duplicate vs. ambiguous alias).
   private final Map<String, TupleDescriptor> aliasMap_ = Maps.newHashMap();
 
-  // map from lowercase qualified column name ("alias.col") to descriptor
+  // Set of lowercase ambiguous implicit table aliases.
+  private final Set<String> ambiguousAliases_ = Sets.newHashSet();
+
+  // map from lowercase explicit or fully-qualified implicit alias to descriptor
   private final Map<String, SlotDescriptor> slotRefMap_ = Maps.newHashMap();
 
   // Tracks the all tables/views found during analysis that were missing metadata.
-  Set<TableName> missingTbls_ = new HashSet<TableName>();
-  public Set<TableName> getMissingTbls() { return missingTbls_; }
+  private Set<TableName> missingTbls_ = new HashSet<TableName>();
 
-  public Analyzer(ImpaladCatalog catalog, TQueryContext queryCxt) {
+  public Analyzer(ImpaladCatalog catalog, TQueryCtx queryCtx) {
     this.ancestors_ = Lists.newArrayList();
-    this.globalState_ = new GlobalState(catalog, queryCxt);
-    user_ = new User(TSessionStateUtil.getEffectiveUser(queryCxt.session));
+    this.globalState_ = new GlobalState(catalog, queryCtx);
+    user_ = new User(TSessionStateUtil.getEffectiveUser(queryCtx.session));
   }
 
   /**
@@ -211,6 +236,9 @@ public class Analyzer {
     Preconditions.checkNotNull(user);
     this.user_ = user;
   }
+
+  public Set<TableName> getMissingTbls() { return missingTbls_; }
+  public List<String> getWarnings() { return globalState_.warnings; }
 
   /**
    * Substitute analyzer's internal expressions (conjuncts) with the given substitution
@@ -282,27 +310,49 @@ public class Analyzer {
   }
 
   /**
-   * Checks that 'name' references an existing base table and that alias
-   * isn't already registered. Creates and returns an empty TupleDescriptor
-   * and registers it against alias. If alias is empty, register
-   * "name.tbl" and "name.db.tbl" as aliases.
-   * Requires that all views have been substituted.
+   * Creates an returns an empty TupleDescriptor for the given table ref and registers
+   * it against all its legal aliases. For tables refs with an explicit alias, only the
+   * explicit alias is legal. For tables refs with no explicit alias, the fully-qualified
+   * and unqualified table names are legal aliases. Column references against unqualified
+   * implicit aliases can be ambiguous, therefore, we register such ambiguous aliases
+   * here. Requires that all views have been substituted.
+   * Throws if an existing explicit alias or implicit fully-qualified alias
+   * has already been registered for another table ref.
    */
-  public TupleDescriptor registerBaseTableRef(BaseTableRef ref)
+  public TupleDescriptor registerTableRef(TableRef ref)
       throws AnalysisException, AuthorizationException {
-    String lookupAlias = ref.getAlias().toLowerCase();
-    if (aliasMap_.containsKey(lookupAlias)) {
-      throw new AnalysisException("Duplicate table alias: '" + lookupAlias + "'");
+    // Alias is the explicit alias or the fully-qualified table name.
+    String alias = ref.getAlias().toLowerCase();
+    if (aliasMap_.containsKey(alias)) {
+      throw new AnalysisException("Duplicate table alias: '" + alias + "'");
     }
 
-    Table tbl = getTable(ref.getName(), ref.getPrivilegeRequirement(), true);
-    // Views should have been substituted already.
-    Preconditions.checkState(!(tbl instanceof View),
-        String.format("View %s has not been properly substituted.", tbl.getFullName()));
-    TupleDescriptor result = globalState_.descTbl.createTupleDescriptor();
-    result.setTable(tbl);
-    result.setAlias(lookupAlias);
-    aliasMap_.put(lookupAlias, result);
+    // If ref has no explicit alias, then the unqualified and the fully-qualified table
+    // names are legal implicit aliases. Column references against unqualified implicit
+    // aliases can be ambiguous, therefore, we register such ambiguous aliases here.
+    String unqualifiedAlias = null;
+    if (!ref.hasExplicitAlias()) {
+      unqualifiedAlias = ref.getName().getTbl().toLowerCase();
+      TupleDescriptor tupleDesc = aliasMap_.get(unqualifiedAlias);
+      if (tupleDesc != null) {
+        if (tupleDesc.hasExplicitAlias()) {
+          throw new AnalysisException(
+              "Duplicate table alias: '" + unqualifiedAlias + "'");
+        } else {
+          ambiguousAliases_.add(unqualifiedAlias);
+        }
+      }
+    }
+
+    TupleDescriptor result = ref.createTupleDescriptor(this);
+    result.setAlias(ref.getAlias(), ref.hasExplicitAlias());
+    // Register explicit or fully-qualified implicit alias.
+    aliasMap_.put(alias, result);
+    if (!ref.hasExplicitAlias()) {
+      // Register unqualified implicit alias.
+      Preconditions.checkNotNull(unqualifiedAlias);
+      aliasMap_.put(unqualifiedAlias, result);
+    }
     return result;
   }
 
@@ -317,33 +367,18 @@ public class Analyzer {
   }
 
   /**
-   * Register an inline view. The enclosing select block of the inline view should have
-   * been analyzed.
-   * Checks that the alias isn't already registered. Checks the inline view doesn't have
-   * duplicate column names.
-   * Creates and returns an empty, non-materialized TupleDescriptor for the inline view
-   * and registers it against alias.
-   * An InlineView object is created and is used as the underlying table of the tuple
-   * descriptor.
+   * Return descriptor of registered table/alias or null if no matching descriptor was
+   * found. Attempts to resolve name in the context of any of the registered tuples.
+   * Throws an analysis exception if name is unqualified and could match multiple
+   * registered descriptors (i.e., is ambiguous).
    */
-  public TupleDescriptor registerInlineViewRef(InlineViewRef ref)
-      throws AnalysisException {
-    String lookupAlias = ref.getAlias().toLowerCase();
-    if (aliasMap_.containsKey(lookupAlias)) {
-      throw new AnalysisException("Duplicate table alias: '" + lookupAlias + "'");
+  public TupleDescriptor getDescriptor(TableName name) throws AnalysisException {
+    String lookupAlias = name.toString().toLowerCase();
+    if (!name.isFullyQualified() && ambiguousAliases_.contains(lookupAlias)) {
+      throw new AnalysisException(
+          "unqualified table alias '" + name.toString() + "' is ambiguous");
     }
-    // Delegate creation of the tuple descriptor to the concrete inline view ref.
-    TupleDescriptor tupleDesc = ref.createTupleDescriptor(globalState_.descTbl);
-    tupleDesc.setAlias(lookupAlias);
-    aliasMap_.put(lookupAlias, tupleDesc);
-    return tupleDesc;
-  }
-
-  /**
-   * Return descriptor of registered table/alias.
-   */
-  public TupleDescriptor getDescriptor(TableName name) {
-    return aliasMap_.get(name.toString().toLowerCase());
+    return aliasMap_.get(lookupAlias);
   }
 
   public TupleDescriptor getTupleDesc(TupleId id) {
@@ -358,6 +393,12 @@ public class Analyzer {
   }
 
   /**
+   * Return true if this analyzer has no ancestors. (i.e. false for the analyzer created
+   * for inline views/ union operands, etc.)
+   */
+  public boolean isRootAnalyzer() { return ancestors_.isEmpty(); }
+
+  /**
    * Checks that 'col' references an existing column for a registered table alias;
    * if alias is empty, tries to resolve the column name in the context of any of the
    * registered tables. Creates and returns an empty SlotDescriptor if the
@@ -366,43 +407,49 @@ public class Analyzer {
    */
   public SlotDescriptor registerColumnRef(TableName tblName, String colName)
       throws AnalysisException {
-    String alias;
+    TupleDescriptor tupleDesc = null;
+    Column col = null;
     if (tblName == null) {
-      alias = resolveColumnRef(colName, null);
-      if (alias == null) {
+      // Resolve colName in the context of all registered tables.
+      tupleDesc = resolveColumnRef(colName);
+      if (tupleDesc == null) {
         throw new AnalysisException("couldn't resolve column reference: '" +
             colName + "'");
       }
+      col = tupleDesc.getTable().getColumn(colName);
+      Preconditions.checkNotNull(col);
     } else {
-      alias = tblName.toString().toLowerCase();
+      // Resolve colName in the context of tblName.
+      String lookupAlias = tblName.toString().toLowerCase();
+      if (!tblName.isFullyQualified() && ambiguousAliases_.contains(lookupAlias)) {
+        throw new AnalysisException(
+            String.format("unqualified table alias '%s' in column " +
+                "reference '%s' is ambiguous",
+                tblName.toString(), tblName.toString() + "." + colName));
+      }
+      tupleDesc = aliasMap_.get(lookupAlias);
+      if (tupleDesc == null) {
+        throw new AnalysisException(
+            String.format("unknown table alias '%s' in column reference '%s'",
+                tblName.toString(), tblName.toString() + "." + colName));
+      }
+      col = tupleDesc.getTable().getColumn(colName);
+      if (col == null) {
+        throw new AnalysisException(
+            String.format("couldn't resolve column reference: '%s'",
+                tblName.toString() + "." + colName));
+      }
     }
 
-    TupleDescriptor tupleDesc = aliasMap_.get(alias);
-    // Try to resolve column references ("table.col") that do not refer to an explicit
-    // alias, and that do not use a fully-qualified table name.
-    String tmpAlias = alias;
-    if (tupleDesc == null && tblName != null) {
-      tmpAlias = resolveColumnRef(colName, tblName.getTbl());
-      tupleDesc = aliasMap_.get(tmpAlias);
-    }
-    if (tupleDesc == null) {
-      throw new AnalysisException("unknown table alias: '" + alias + "'");
-    }
-    alias = tmpAlias;
-
-    Column col = tupleDesc.getTable().getColumn(colName);
-    if (col == null) {
-      throw new AnalysisException("unknown column '" + colName +
-          "' (table alias '" + alias + "')");
-    }
-
-    String key = alias + "." + col.getName();
+    // SlotRefs are registered against the tuple's explicit or fully-qualified
+    // implicit alias.
+    String key = tupleDesc.getAlias() + "." + col.getName();
     SlotDescriptor result = slotRefMap_.get(key);
     if (result != null) return result;
     result = addSlotDescriptor(tupleDesc);
     result.setColumn(col);
     result.setLabel(col.getName());
-    slotRefMap_.put(alias + "." + col.getName(), result);
+    slotRefMap_.put(key, result);
     return result;
   }
 
@@ -416,25 +463,24 @@ public class Analyzer {
   }
 
   /**
-   * Resolves column name in context of any of the registered table aliases.
-   * Returns null if not found or multiple bindings to different tables exist,
-   * otherwise returns the table alias.
-   * If a specific table name was given (tableName != null) then only
-   * columns from registered tables with a matching name are considered.
+   * Resolves column name in context of any of the registered tuple descriptors.
+   * Returns the matching tuple descriptor or null if none could be found.
+   * Throws if multiple bindings to different tables exist.
    */
-  private String resolveColumnRef(String colName, String tableName)
-      throws AnalysisException {
-    String result = null;
+  private TupleDescriptor resolveColumnRef(String colName) throws AnalysisException {
+    TupleDescriptor result = null;
     for (Map.Entry<String, TupleDescriptor> entry: aliasMap_.entrySet()) {
-      Table table = entry.getValue().getTable();
-      Column col = table.getColumn(colName);
-      if (col != null &&
-          (tableName == null || tableName.equalsIgnoreCase(table.getName()))) {
-        if (result != null) {
+      TupleDescriptor tupleDesc = entry.getValue();
+      Column col = tupleDesc.getTable().getColumn(colName);
+      if (col != null) {
+        // The same tuple descriptor may have been registered for multiple
+        // implicit aliases, so only throw an error if the tuple descriptors
+        // are different.
+        if (result != null && result != tupleDesc) {
           throw new AnalysisException(
-              "Unqualified column reference '" + colName + "' is ambiguous");
+              "unqualified column reference '" + colName + "' is ambiguous");
         }
-        result = entry.getKey();
+        result = tupleDesc;
       }
     }
     return result;
@@ -1071,7 +1117,7 @@ public class Analyzer {
           + nullTuplePred.toSql() + "." + e.getMessage());
     }
     try {
-      return FeSupport.EvalPredicate(nullTuplePred, getQueryContext());
+      return FeSupport.EvalPredicate(nullTuplePred, getQueryCtx());
     } catch (InternalException e) {
       Preconditions.checkState(false, "Failed to evaluate generated predicate: "
           + nullTuplePred.toSql() + "." + e.getMessage());
@@ -1337,9 +1383,9 @@ public class Analyzer {
   }
 
   public Map<String, ViewRef> getWithClauseViews() { return withClauseViews_; }
-  public String getDefaultDb() { return globalState_.queryCtxt.session.database; }
+  public String getDefaultDb() { return globalState_.queryCtx.session.database; }
   public User getUser() { return user_; }
-  public TQueryContext getQueryContext() { return globalState_.queryCtxt; }
+  public TQueryCtx getQueryCtx() { return globalState_.queryCtx; }
 
   /**
    * Returns a list of the successful catalog object access events. Does not include
@@ -1460,16 +1506,30 @@ public class Analyzer {
   public String getTargetDbName(FunctionName fnName) {
     return fnName.isFullyQualified() ? fnName.getDb() : getDefaultDb();
   }
+  /**
+   * Returns a the fully-qualified table name of tableName. If tableName
+   * is already fully qualified, returns tableName.
+   */
+  public TableName getFullyQualifiedTableName(TableName tableName) {
+    if (tableName.isFullyQualified()) return tableName;
+    return new TableName(getDefaultDb(), tableName.getTbl());
+  }
 
   public void setIsExplain(boolean isExplain) { globalState_.isExplain = isExplain; }
+  public void setIsInsertStmt(boolean isInsertStmt) {
+    globalState_.isInsertStmt = isInsertStmt;
+  }
+
   public boolean isExplain() { return globalState_.isExplain; }
+  public boolean isInsertStmt() { return globalState_.isInsertStmt; }
   public void setUseHiveColLabels(boolean useHiveColLabels) {
     globalState_.useHiveColLabels = useHiveColLabels;
   }
   public boolean useHiveColLabels() { return globalState_.useHiveColLabels; }
 
-  public boolean hasLimit() { return hasLimit_; }
-  public void setHasLimit(boolean hasLimit) { this.hasLimit_ = hasLimit; }
+  public void setHasLimitOffsetClause(boolean hasLimitOffset) {
+    this.hasLimitOffsetClause_ = hasLimitOffset;
+  }
 
   public List<Expr> getConjuncts() {
     return new ArrayList<Expr>(globalState_.conjuncts.values());
@@ -1481,6 +1541,13 @@ public class Analyzer {
 
   public boolean hasValueTransfer(SlotId a, SlotId b) {
     return globalState_.valueTransferGraph.hasValueTransfer(a, b);
+  }
+
+  /**
+   * Add a warning that will be displayed to the user.
+   */
+  public void addWarning(String msg) {
+    globalState_.warnings.add(msg);
   }
 
   /**
@@ -1690,10 +1757,12 @@ public class Analyzer {
           LOG.trace("value transfer: from " + slotIds.first.toString());
           Pair<SlotId, SlotId> firstToSecond = null;
           Pair<SlotId, SlotId> secondToFirst = null;
-          if (!(secondBlock.hasLimit_ && secondBlock.ancestors_.contains(firstBlock))) {
+          if (!(secondBlock.hasLimitOffsetClause_ &&
+              secondBlock.ancestors_.contains(firstBlock))) {
             firstToSecond = new Pair<SlotId, SlotId>(slotIds.first, slotIds.second);
           }
-          if (!(firstBlock.hasLimit_ && firstBlock.ancestors_.contains(secondBlock))) {
+          if (!(firstBlock.hasLimitOffsetClause_ &&
+              firstBlock.ancestors_.contains(secondBlock))) {
             secondToFirst = new Pair<SlotId, SlotId>(slotIds.second, slotIds.first);
           }
           // Add bi-directional value transfers to the completeSubGraphs, or
@@ -1728,18 +1797,14 @@ public class Analyzer {
           continue;
         }
 
-        // value transfer is not legal if the receiving slot is in an enclosed
-        // scope of the source slot and the receiving slot's block has a limit
-        Analyzer innerBlock = globalState_.blockBySlot.get(innerSlot);
-        Analyzer outerBlock = globalState_.blockBySlot.get(outerSlot);
+        // value transfer is always legal because the outer and inner slot must come from
+        // the same block; transitive value transfers into inline views with a limit are
+        // prevented because the inline view's aux predicates won't transfer values into
+        // the inline view's block (handled in the 'tableRef == null' case above)
         if (tblRef.getJoinOp() == JoinOperator.LEFT_OUTER_JOIN) {
-          if (!(outerBlock.hasLimit_ && outerBlock.ancestors_.contains(innerBlock))) {
-            valueTransfers.add(new Pair<SlotId, SlotId>(outerSlot, innerSlot));
-          }
+          valueTransfers.add(new Pair<SlotId, SlotId>(outerSlot, innerSlot));
         } else if (tblRef.getJoinOp() == JoinOperator.RIGHT_OUTER_JOIN) {
-          if (!(innerBlock.hasLimit_ && innerBlock.ancestors_.contains(outerBlock))) {
-            valueTransfers.add(new Pair<SlotId, SlotId>(innerSlot, outerSlot));
-          }
+          valueTransfers.add(new Pair<SlotId, SlotId>(innerSlot, outerSlot));
         }
       }
     }

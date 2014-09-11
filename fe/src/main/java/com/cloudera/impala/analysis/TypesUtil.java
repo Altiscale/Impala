@@ -14,6 +14,8 @@
 
 package com.cloudera.impala.analysis;
 
+import java.math.BigDecimal;
+
 import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.common.AnalysisException;
 import com.google.common.base.Preconditions;
@@ -27,19 +29,17 @@ public class TypesUtil {
 
   /**
    * [1-9] precision -> 4 bytes
-   * [10-19] precision -> 8 bytes
-   * [20-38] precision -> 24 bytes
-   * TODO:
-   * At 38 digits of precision, this only requires 16 bytes but the backend
-   * library currently uses 8 additional bytes. Also, for precision [20-28],
-   * we could support a 12 byte decimal but currently a 12 byte decimal in
-   * the BE still takes 24 bytes due to the padding.
+   * [10-18] precision -> 8 bytes
+   * [19-38] precision -> 16 bytes
+   * TODO: Support 12 byte decimal?
+   * For precision [20-28], we could support a 12 byte decimal but currently a 12
+   * byte decimal in the BE is not implemented.
    */
   public static int getDecimalSlotSize(ColumnType type) {
     Preconditions.checkState(type.isFullySpecifiedDecimal());
     if (type.decimalPrecision() <= 9) return 4;
-    if (type.decimalPrecision() <= 19) return 8;
-    return 24;
+    if (type.decimalPrecision() <= 18) return 8;
+    return 16;
   }
 
   /**
@@ -133,8 +133,12 @@ public class TypesUtil {
 
   /**
    * Returns the resulting typical type from (t1 op t2)
-   * These rules are identical to the hive/sql server rules.
+   * These rules are mostly taken from the hive/sql server rules with some changes.
    * http://blogs.msdn.com/b/sqlprogrammability/archive/2006/03/29/564110.aspx
+   *
+   * Changes:
+   *  - Multiply does not need +1 for the result precision.
+   *  - Divide scale truncation is different.
    */
   public static ColumnType getDecimalArithmeticResultType(ColumnType t1, ColumnType t2,
       ArithmeticExpr.Operator op) throws AnalysisException {
@@ -152,11 +156,21 @@ public class TypesUtil {
         return ColumnType.createDecimalTypeInternal(
             sMax + Math.max(p1 - s1, p2 - s2) + 1, sMax);
       case MULTIPLY:
-        return ColumnType.createDecimalTypeInternal(p1 + p2 + 1, s1 + s2);
+        return ColumnType.createDecimalTypeInternal(p1 + p2, s1 + s2);
       case DIVIDE:
-        return ColumnType.createDecimalTypeInternal(
-            p1 - s1 + s2 + Math.max(DECIMAL_DIVISION_SCALE_INCREMENT, s1 + p2 + 1),
-            Math.max(DECIMAL_DIVISION_SCALE_INCREMENT, s1 + p2 + 1));
+        int resultScale = Math.max(DECIMAL_DIVISION_SCALE_INCREMENT, s1 + p2 + 1);
+        int resultPrecision = p1 - s1 + s2 + resultScale;
+        if (resultPrecision > ColumnType.MAX_PRECISION) {
+          // In this case, the desired resulting precision exceeds the maximum and
+          // we need to truncate some way. We can either remove digits before or
+          // after the decimal and there is no right answer. This is an implementation
+          // detail and different databases will handle this differently.
+          // For simplicity, we will set the resulting scale to be the max of the input
+          // scales and use the maximum precision.
+          resultScale = Math.max(s1, s2);
+          resultPrecision = ColumnType.MAX_PRECISION;
+        }
+        return ColumnType.createDecimalTypeInternal(resultPrecision, resultScale);
       case MOD:
         return ColumnType.createDecimalTypeInternal(
             Math.min(p1 - s1, p2 - s2) + sMax, sMax);
@@ -164,5 +178,43 @@ public class TypesUtil {
         throw new AnalysisException(
             "Operation '" + op + "' is not allowed for decimal types.");
     }
+  }
+
+  /**
+   * Computes the ColumnType that can represent 'v' with no loss of resolution.
+   * The scale/precision in BigDecimal is not compatible with SQL decimal semantics
+   * (much more like significant figures and exponent).
+   * Returns null if the value cannot be represented.
+   */
+  public static ColumnType computeDecimalType(BigDecimal v) {
+    // PlainString returns the string with no exponent. We walk it to compute
+    // the digits before and after.
+    // TODO: better way?
+    String str = v.toPlainString();
+    int digitsBefore = 0;
+    int digitsAfter = 0;
+    boolean decimalFound = false;
+    boolean leadingZeros = true;
+    for (int i = 0; i < str.length(); ++i) {
+      char c = str.charAt(i);
+      if (c == '-') continue;
+      if (c == '.') {
+        decimalFound = true;
+        continue;
+      }
+      if (decimalFound) {
+        ++digitsAfter;
+      } else {
+        // Strip out leading 0 before the decimal point. We want "0.1" to
+        // be parsed as ".1" (1 digit instead of 2).
+        if (c == '0' && leadingZeros) continue;
+        leadingZeros = false;
+        ++digitsBefore;
+      }
+    }
+    if (digitsAfter > ColumnType.MAX_SCALE) return null;
+    if (digitsBefore + digitsAfter > ColumnType.MAX_PRECISION) return null;
+    if (digitsBefore == 0 && digitsAfter == 0) digitsBefore = 1;
+    return ColumnType.createDecimalType(digitsBefore + digitsAfter, digitsAfter);
   }
 }

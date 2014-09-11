@@ -29,6 +29,7 @@ add_library(Util
   codec.cc
   compress.cc
   cpu-info.cc
+  decimal-util.cc
   dynamic-util.cc
   debug-util.cc
   decompress.cc
@@ -36,6 +37,7 @@ add_library(Util
   disk-info.cc
   error-util.cc
   fe-test-info.cc
+  filesystem-util.cc
   hdfs-util.cc
   hdfs-bulk-ops.cc
   impalad-metrics.cc
@@ -63,6 +65,7 @@ add_library(Util
   url-parser.cc
   url-coding.cc
   llama-util.cc
+  table-printer.cc
 )
 
 add_library(Webserver STATIC

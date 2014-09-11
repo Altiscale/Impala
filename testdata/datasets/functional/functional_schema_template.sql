@@ -301,6 +301,41 @@ TBLPROPERTIES("hbase.table.name" = "functional_hbase.hbasealltypeserror");
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
+hbasecolumnfamilies
+---- HBASE_COLUMN_FAMILIES
+0
+1
+2
+3
+d
+---- CREATE_HIVE
+-- Create an HBase table with multiple column families
+CREATE EXTERNAL TABLE IF NOT EXISTS {db_name}{db_suffix}.{table_name} (
+  id int,
+  bool_col boolean,
+  tinyint_col tinyint,
+  smallint_col smallint,
+  int_col int,
+  bigint_col bigint,
+  float_col float,
+  double_col double,
+  date_string_col string,
+  string_col string,
+  timestamp_col timestamp)
+STORED BY 'org.apache.hadoop.hive.hbase.HBaseStorageHandler'
+WITH SERDEPROPERTIES (
+  "hbase.columns.mapping" =
+  ":key,0:bool_col,1:tinyint_col,2:smallint_col,3:int_col,d:bigint_col,d:float_col,d:double_col,d:date_string_col,d:string_col,d:timestamp_col"
+)
+TBLPROPERTIES("hbase.table.name" = "functional_hbase.hbasecolumnfamilies");
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col,
+date_string_col, string_col, timestamp_col FROM functional.alltypestiny;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
 alltypeserrornonulls
 ---- CREATE
 CREATE EXTERNAL TABLE IF NOT EXISTS  {db_name}{db_suffix}.{table_name} (
@@ -422,11 +457,14 @@ ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=7);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=8);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=9);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=10);
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=NULL);
 ---- DEPENDENT_LOAD
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition (year, month, day)
 SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month, day
 FROM {db_name}.{table_name};
 ---- LOAD
+SET hive.exec.dynamic.partition.mode=nonstrict;
+SET hive.exec.dynamic.partition=true;
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/target/AllTypesAgg/100101.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(year=2010, month=1, day=1);
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/target/AllTypesAgg/100102.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(year=2010, month=1, day=2);
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/target/AllTypesAgg/100103.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(year=2010, month=1, day=3);
@@ -437,6 +475,7 @@ LOAD DATA LOCAL INPATH '{impala_home}/testdata/target/AllTypesAgg/100107.txt' OV
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/target/AllTypesAgg/100108.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(year=2010, month=1, day=8);
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/target/AllTypesAgg/100109.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(year=2010, month=1, day=9);
 LOAD DATA LOCAL INPATH '{impala_home}/testdata/target/AllTypesAgg/100110.txt' OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name} PARTITION(year=2010, month=1, day=10);
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition (year, month, day) SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month, tinyint_col as day FROM {db_name}.{table_name} WHERE year=2010 and month=1 and day != '__HIVE_DEFAULT_PARTITION__' and tinyint_col IS NULL order by id;
 ====
 ---- DATASET
 functional
@@ -670,6 +709,15 @@ AS SELECT * FROM {db_name}{db_suffix}.alltypes;
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
+alltypes_hive_view
+---- CREATE_HIVE
+-- Test that Impala can handle incorrect column metadata created by Hive (IMPALA-994).
+-- Beeline cannot handle the stmt below when broken up into multiple lines.
+CREATE VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name} AS SELECT * FROM {db_name}{db_suffix}.alltypes;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
 alltypes_view_sub
 ---- CREATE
 CREATE VIEW IF NOT EXISTS {db_name}{db_suffix}.{table_name} (x, y, z)
@@ -875,6 +923,7 @@ ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=7);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=8);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=9);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=10);
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(year=2010, month=1, day=NULL);
 ---- DEPENDENT_LOAD
 insert overwrite table {db_name}{db_suffix}.{table_name} partition (year, month, day) SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month, day FROM {db_name}.{table_name} where id % 4 = 0;
 insert into table {db_name}{db_suffix}.{table_name} partition (year, month, day) SELECT id, bool_col, tinyint_col, smallint_col, int_col, bigint_col, float_col, double_col, date_string_col, string_col, timestamp_col, year, month, day FROM {db_name}.{table_name} where id % 4 = 1;
@@ -1033,13 +1082,13 @@ ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(id=8);
 ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(id=9);
 ----  DEPENDENT_LOAD
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition (id)
-select bool_col,id FROM {db_name}.alltypesagg where id < 10;
+select distinct bool_col,id FROM {db_name}.alltypesagg where id < 10 order by id;
 ---- LOAD
 SET hive.exec.dynamic.partition.mode=nonstrict;
 SET hive.exec.dynamic.partition=true;
   SET hive.input.format=org.apache.hadoop.hive.ql.io.HiveInputFormat;
 INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition (id)
-select bool_col,id FROM {db_name}.alltypesagg where id < 10;
+select distinct bool_col,id FROM {db_name}.alltypesagg where id < 10 order by id;
 ====
 ---- DATASET
 functional
@@ -1222,6 +1271,82 @@ OUTPUTFORMAT
 ---- DATASET
 functional
 ---- BASE_TABLE_NAME
+decimal_tbl
+---- COLUMNS
+d1 DECIMAL
+d2 DECIMAL(10, 0)
+d3 DECIMAL(20, 10)
+d4 DECIMAL(38, 38)
+d5 DECIMAL(10, 5)
+---- PARTITION_COLUMNS
+d6 DECIMAL(9, 0)
+---- ALTER
+ALTER TABLE {table_name} ADD IF NOT EXISTS PARTITION(d6=1);
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- LOAD
+`hadoop fs -mkdir -p /test-warehouse/decimal_tbl/d6=1 && hadoop fs -put -f \
+${IMPALA_HOME}/testdata/data/decimal_tbl.txt /test-warehouse/decimal_tbl/d6=1/
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} partition(d6)
+select * from functional.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+invalid_decimal_part_tbl1
+---- COLUMNS
+c1 INT
+---- PARTITION_COLUMNS
+d1 DECIMAL(4,2)
+---- LOAD
+-- To test reading from a partitioned table with invalid decimal partition values (see IMPALA-1040).
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(d1="str_value") select int_col from functional.alltypestiny;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+invalid_decimal_part_tbl2
+---- COLUMNS
+c1 INT
+---- PARTITION_COLUMNS
+d1 DECIMAL(4,2)
+---- LOAD
+-- To test reading from a partitioned table with invalid decimal partition values (see IMPALA-1040).
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(d1=3.141) select int_col from functional.alltypestiny;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+invalid_decimal_part_tbl3
+---- COLUMNS
+c1 INT
+---- PARTITION_COLUMNS
+d1 DECIMAL(4,2)
+---- LOAD
+-- To test reading from a partitioned table with invalid decimal partition values (see IMPALA-1040).
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name} PARTITION(d1=314.1) select int_col from functional.alltypestiny;
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+decimal_tiny
+---- COLUMNS
+c1 DECIMAL(10, 4)
+c2 DECIMAL(15, 5)
+c3 DECIMAL(1,1)
+---- ROW_FORMAT
+delimited fields terminated by ','
+---- LOAD
+`hadoop fs -mkdir -p /test-warehouse/decimal_tiny && hadoop fs -put -f \
+${IMPALA_HOME}/testdata/data/decimal-tiny.txt /test-warehouse/decimal_tiny/
+---- DEPENDENT_LOAD
+INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
+select * from functional.{table_name};
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
 widetable_250_cols
 ---- COLUMNS
 `${IMPALA_HOME}/testdata/common/widetable.py --get_columns -n 250
@@ -1260,4 +1385,15 @@ INSERT OVERWRITE TABLE {db_name}{db_suffix}.{table_name}
 select * from functional.{table_name};
 ---- LOAD
 `${IMPALA_HOME}/testdata/common/widetable.py --create_data -n 1000 -o /tmp/widetable_data.csv
+====
+---- DATASET
+functional
+---- BASE_TABLE_NAME
+avro_decimal_tbl
+---- COLUMNS
+name STRING
+value DECIMAL(5,2)
+---- DEPENDENT_LOAD
+LOAD DATA LOCAL INPATH '${{env:IMPALA_HOME}}/testdata/data/avro_decimal_tbl.avro'
+OVERWRITE INTO TABLE {db_name}{db_suffix}.{table_name};
 ====

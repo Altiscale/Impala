@@ -30,6 +30,7 @@
 #include "runtime/tuple-row.h"
 #include "runtime/tuple.h"
 #include "runtime/string-value.h"
+#include "util/bitmap.h"
 #include "util/bit-util.h"
 #include "util/decompress.h"
 #include "util/debug-util.h"
@@ -139,15 +140,22 @@ class HdfsParquetScanner::BaseColumnReader {
     return PARQUET_TO_IMPALA_CODEC[metadata_->codec];
   }
 
-  // Read the next value into tuple for this column.  Returns
-  // false if there are no more values in the file.
+  // Read the next value into tuple for this column.  Returns false if there are no
+  // more values in the file.
+  // *conjuncts_failed is an in/out parameter. If false, it means this row has already
+  // been filtered out (i.e. ReadValue is really a SkipValue()) and should be set to
+  // true if ReadValue() can filter out this row.
   // TODO: this is the function that needs to be codegen'd (e.g. CodegenReadValue())
   // The codegened functions from all the materialized cols will then be combined
   // into one function.
   // TODO: another option is to materialize col by col for the entire row batch in
   // one call.  e.g. MaterializeCol would write out 1024 values.  Our row batches
   // are currently dense so we'll need to figure out something there.
-  bool ReadValue(MemPool* pool, Tuple* tuple);
+  bool ReadValue(MemPool* pool, Tuple* tuple, bool* conjuncts_failed);
+
+  // TODO: Some encodings might benefit a lot from a SkipValues(int num_rows) if
+  // we know this row can be skipped. This could be very useful with stats and big
+  // sections can be skipped. Implement that when we can benefit from it.
 
  protected:
   friend class HdfsParquetScanner;
@@ -189,6 +197,19 @@ class HdfsParquetScanner::BaseColumnReader {
   // The number of values seen so far. Updated per data page.
   int64_t num_values_read_;
 
+  // Cache of the bitmap_filter_ (if any) for this slot.
+  const Bitmap* bitmap_filter_;
+  // Cache of hash_seed_ to use with bitmap_filter_.
+  uint32_t hash_seed_;
+
+  // Bitmap filters are optional (i.e. they can be ignored and the results will be
+  // correct). Keep track of stats to determine if the filter is not effective. If
+  // the number of rows filtered out is too low, this is not worth the cost.
+  // TODO: this should be cost based taking into account how much we save when we
+  // filter a row.
+  int64_t rows_returned_;
+  int64_t bitmap_filter_rows_rejected_;
+
   BaseColumnReader(HdfsParquetScanner* parent, const SlotDescriptor* desc, int file_idx)
     : parent_(parent),
       desc_(desc),
@@ -199,6 +220,11 @@ class HdfsParquetScanner::BaseColumnReader {
       decompressed_data_pool_(new MemPool(parent->scan_node_->mem_tracker())),
       num_buffered_values_(0),
       num_values_read_(0) {
+    RuntimeState* state = parent_->scan_node_->runtime_state();
+    bitmap_filter_ = state->GetBitmapFilter(desc_->id());
+    hash_seed_ = state->fragment_hash_seed();
+    rows_returned_ = 0;
+    bitmap_filter_rows_rejected_ = 0;
   }
 
   // Read the next data page.  If a dictionary page is encountered, that will
@@ -222,7 +248,7 @@ class HdfsParquetScanner::BaseColumnReader {
   // Returns false if there was an error.
   // Subclass must implement this.
   // TODO: we need to remove this with codegen.
-  virtual bool ReadSlot(void* slot, MemPool* pool) = 0;
+  virtual bool ReadSlot(void* slot, MemPool* pool, bool* conjuncts_failed) = 0;
 };
 
 // Per column type reader.
@@ -232,11 +258,16 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
   ColumnReader(HdfsParquetScanner* parent, const SlotDescriptor* desc, int file_idx)
     : BaseColumnReader(parent, desc, file_idx) {
     DCHECK_NE(desc->type().type, TYPE_BOOLEAN);
+    if (desc->type().type == TYPE_DECIMAL) {
+      fixed_len_size_ = ParquetPlainEncoder::DecimalSize(desc->type());
+    } else {
+      fixed_len_size_ = -1;
+    }
   }
 
  protected:
   virtual void CreateDictionaryDecoder(uint8_t* values, int size) {
-    dict_decoder_.reset(new DictDecoder<T>(values, size));
+    dict_decoder_.reset(new DictDecoder<T>(values, size, fixed_len_size_));
     dict_decoder_base_ = dict_decoder_.get();
   }
 
@@ -248,22 +279,36 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
       }
       dict_decoder_->SetData(data, size);
     }
+
+    // Check if we should disable the bitmap filter. We'll do this if the filter
+    // is not removing a lot of rows.
+    // TODO: how to pick the selectivity?
+    if (bitmap_filter_ != NULL && rows_returned_ > 10000 &&
+        bitmap_filter_rows_rejected_ < rows_returned_ * .1) {
+      bitmap_filter_ = NULL;
+    }
     return Status::OK;
   }
 
-  virtual bool ReadSlot(void* slot, MemPool* pool)  {
+  virtual bool ReadSlot(void* slot, MemPool* pool, bool* conjuncts_failed)  {
     parquet::Encoding::type page_encoding =
         current_page_header_.data_page_header.encoding;
-    bool result;
+    bool result = true;
     if (page_encoding == parquet::Encoding::PLAIN_DICTIONARY) {
       result = dict_decoder_->GetValue(reinterpret_cast<T*>(slot));
     } else {
       DCHECK(page_encoding == parquet::Encoding::PLAIN);
-      data_ += ParquetPlainEncoder::Decode<T>(data_, reinterpret_cast<T*>(slot));
+      data_ += ParquetPlainEncoder::Decode<T>(data_, fixed_len_size_,
+          reinterpret_cast<T*>(slot));
       if (parent_->scan_node_->requires_compaction()) {
         CopySlot(reinterpret_cast<T*>(slot), pool);
       }
-      return true;
+    }
+    ++rows_returned_;
+    if (!*conjuncts_failed && bitmap_filter_ != NULL) {
+      uint32_t h = RawValue::GetHashValue(slot, desc_->type(), hash_seed_);
+      *conjuncts_failed = !bitmap_filter_->Get<true>(h);
+      ++bitmap_filter_rows_rejected_;
     }
     return result;
   }
@@ -274,6 +319,10 @@ class HdfsParquetScanner::ColumnReader : public HdfsParquetScanner::BaseColumnRe
   }
 
   scoped_ptr<DictDecoder<T> > dict_decoder_;
+
+  // The size of this column with plain encoding for FIXED_LEN_BYTE_ARRAY. Unused
+  // otherwise.
+  int fixed_len_size_;
 };
 
 template<>
@@ -304,7 +353,7 @@ class HdfsParquetScanner::BoolColumnReader : public HdfsParquetScanner::BaseColu
     return Status::OK;
   }
 
-  virtual bool ReadSlot(void* slot, MemPool* pool)  {
+  virtual bool ReadSlot(void* slot, MemPool* pool, bool* conjuncts_failed)  {
     bool valid = bool_values_.GetValue(1, reinterpret_cast<bool*>(slot));
     if (!valid) parent_->parse_status_ = Status("Invalid bool column.");
     return valid;
@@ -379,6 +428,19 @@ HdfsParquetScanner::BaseColumnReader* HdfsParquetScanner::CreateReader(
       break;
     case TYPE_STRING:
       reader = new ColumnReader<StringValue>(this, desc, file_idx);
+      break;
+    case TYPE_DECIMAL:
+      switch (desc->type().GetByteSize()) {
+        case 4:
+          reader = new ColumnReader<Decimal4Value>(this, desc, file_idx);
+          break;
+        case 8:
+          reader = new ColumnReader<Decimal8Value>(this, desc, file_idx);
+          break;
+        case 16:
+          reader = new ColumnReader<Decimal16Value>(this, desc, file_idx);
+          break;
+      }
       break;
     default:
       DCHECK(false);
@@ -603,7 +665,8 @@ inline int HdfsParquetScanner::BaseColumnReader::ReadDefinitionLevel() {
   return definition_level;
 }
 
-inline bool HdfsParquetScanner::BaseColumnReader::ReadValue(MemPool* pool, Tuple* tuple) {
+inline bool HdfsParquetScanner::BaseColumnReader::ReadValue(
+    MemPool* pool, Tuple* tuple, bool* conjuncts_failed) {
   if (num_buffered_values_ == 0) {
     parent_->assemble_rows_timer_.Stop();
     parent_->parse_status_ = ReadDataPage();
@@ -625,7 +688,7 @@ inline bool HdfsParquetScanner::BaseColumnReader::ReadValue(MemPool* pool, Tuple
   }
 
   DCHECK_EQ(definition_level, 1);
-  return ReadSlot(tuple->GetSlot(desc_->tuple_offset()), pool);
+  return ReadSlot(tuple->GetSlot(desc_->tuple_offset()), pool, conjuncts_failed);
 }
 
 Status HdfsParquetScanner::ProcessSplit() {
@@ -657,7 +720,7 @@ Status HdfsParquetScanner::ProcessSplit() {
     CommitRows(0);
 
     RETURN_IF_ERROR(InitColumns(i));
-    RETURN_IF_ERROR(AssembleRows());
+    RETURN_IF_ERROR(AssembleRows(i));
   }
 
   return Status::OK;
@@ -665,41 +728,120 @@ Status HdfsParquetScanner::ProcessSplit() {
 
 // TODO: this needs to be codegen'd.  The ReadValue function needs to be codegen'd,
 // specific to type and encoding and then inlined into AssembleRows().
-Status HdfsParquetScanner::AssembleRows() {
+Status HdfsParquetScanner::AssembleRows(int row_group_idx) {
   assemble_rows_timer_.Start();
-  while (!scan_node_->ReachedLimit() && !context_->cancelled()) {
-    MemPool* pool;
+  // Read at most as many rows as stated in the metadata
+  int64_t expected_rows_in_group = file_metadata_.row_groups[row_group_idx].num_rows;
+  int64_t rows_read = 0;
+  bool reached_limit = scan_node_->ReachedLimit();
+  bool cancelled = context_->cancelled();
+  int num_column_readers = column_readers_.size();
+  MemPool* pool;
+
+  while (!reached_limit && !cancelled && rows_read < expected_rows_in_group) {
     Tuple* tuple;
     TupleRow* row;
-    int num_rows = GetMemory(&pool, &tuple, &row);
-    int num_to_commit = 0;
+    int64_t row_mem_limit = static_cast<int64_t>(GetMemory(&pool, &tuple, &row));
+    int64_t expected_rows_to_read = expected_rows_in_group - rows_read;
+    int64_t num_rows = std::min(expected_rows_to_read, row_mem_limit);
 
-    for (int i = 0; i < num_rows; ++i) {
-      InitTuple(template_tuple_, tuple);
-      for (int c = 0; c < column_readers_.size(); ++c) {
-        if (!column_readers_[c]->ReadValue(pool, tuple)) {
-          assemble_rows_timer_.Stop();
-          // This column is complete and has no more data.  This indicates
-          // we are done with this row group.
-          // For correctly formed files, this should be the first column we
-          // are reading.
-          DCHECK(c == 0 || !parse_status_.ok()) << "c=" << c << " "
-              << parse_status_.GetErrorMsg();;
-          COUNTER_UPDATE(scan_node_->rows_read_counter(), i);
-          RETURN_IF_ERROR(CommitRows(num_to_commit));
-          return parse_status_;
+    int num_to_commit = 0;
+    if (num_column_readers > 0) {
+      for (int i = 0; i < num_rows; ++i) {
+        bool conjuncts_failed = false;
+        InitTuple(template_tuple_, tuple);
+        for (int c = 0; c < num_column_readers; ++c) {
+          if (!column_readers_[c]->ReadValue(pool, tuple, &conjuncts_failed)) {
+            assemble_rows_timer_.Stop();
+            // This column is complete and has no more data.  This indicates
+            // we are done with this row group.
+            // For correctly formed files, this should be the first column we
+            // are reading.
+            DCHECK(c == 0 || !parse_status_.ok())
+              << "c=" << c << " " << parse_status_.GetErrorMsg();;
+            COUNTER_UPDATE(scan_node_->rows_read_counter(), i);
+            RETURN_IF_ERROR(CommitRows(num_to_commit));
+
+            // If we reach this point, it means that we reached the end of file for
+            // this column. Test if the expected number of rows from metadata matches
+            // the actual number of rows in the file.
+            rows_read += i;
+            if (rows_read != expected_rows_in_group) {
+              HdfsParquetScanner::BaseColumnReader* reader = column_readers_[c];
+              DCHECK(reader->stream_ != NULL);
+              stringstream ss;
+              ss << "Metadata states that in group " << reader->stream_->filename()
+                 << "[" << row_group_idx << "] there are " << expected_rows_in_group
+                 << " rows, but only " << rows_read << " rows were read.";
+              if (scan_node_->runtime_state()->abort_on_error()) {
+                return Status(ss.str());
+              } else {
+                scan_node_->runtime_state()->LogError(ss.str());
+              }
+            }
+            return parse_status_;
+          }
+        }
+        if (conjuncts_failed) continue;
+        row->SetTuple(scan_node_->tuple_idx(), tuple);
+        if (ExecNode::EvalConjuncts(&(*conjuncts_)[0], num_conjuncts_, row)) {
+          row = next_row(row);
+          tuple = next_tuple(tuple);
+          ++num_to_commit;
         }
       }
-
+    } else {
+      // Special case when there is no data for the accessed column(s) in the file.
+      // This can happen, for example, due to schema evolution (alter table add column).
+      // Since all the tuples are same, evaluating conjuncts only for the first tuple.
+      DCHECK_GT(num_rows, 0);
+      InitTuple(template_tuple_, tuple);
       row->SetTuple(scan_node_->tuple_idx(), tuple);
       if (ExecNode::EvalConjuncts(&(*conjuncts_)[0], num_conjuncts_, row)) {
         row = next_row(row);
         tuple = next_tuple(tuple);
-        ++num_to_commit;
+
+        for (int i = 1; i < num_rows; ++i) {
+          InitTuple(template_tuple_, tuple);
+          row->SetTuple(scan_node_->tuple_idx(), tuple);
+          row = next_row(row);
+          tuple = next_tuple(tuple);
+        }
+        num_to_commit += num_rows;
       }
     }
+    rows_read += num_rows;
     COUNTER_UPDATE(scan_node_->rows_read_counter(), num_rows);
     RETURN_IF_ERROR(CommitRows(num_to_commit));
+
+    reached_limit = scan_node_->ReachedLimit();
+    cancelled = context_->cancelled();
+  }
+
+  if (!reached_limit && !cancelled && (num_column_readers > 0)) {
+    // If we get to this point, it means that we have read as many rows as the metadata
+    // told us we should read. Attempt to read one more row and if that succeeds report
+    // the error.
+    DCHECK_EQ(rows_read, expected_rows_in_group);
+    uint8_t dummy_tuple_mem[tuple_byte_size_];
+    Tuple* dummy_tuple = reinterpret_cast<Tuple*>(&dummy_tuple_mem);
+    InitTuple(template_tuple_, dummy_tuple);
+    bool conjuncts_failed = false;
+    if (column_readers_[0]->ReadValue(pool, dummy_tuple, &conjuncts_failed)) {
+      // If another tuple is successfully read, it means that there are still values
+      // in the file.
+      HdfsParquetScanner::BaseColumnReader* reader = column_readers_[0];
+      DCHECK(reader->stream_ != NULL);
+      stringstream ss;
+      ss << "Metadata states that in group " << reader->stream_->filename() << "["
+         << row_group_idx << "] there are " << expected_rows_in_group << " rows, but"
+         << " there is at least one more row in the file.";
+      if (scan_node_->runtime_state()->abort_on_error()) {
+        return Status(ss.str());
+      } else {
+        scan_node_->runtime_state()->LogError(ss.str());
+      }
+    }
   }
 
   assemble_rows_timer_.Stop();
@@ -1019,8 +1161,9 @@ Status HdfsParquetScanner::ValidateColumn(const SlotDescriptor* slot_desc, int c
   for (int i = 0; i < encodings.size(); ++i) {
     if (!IsEncodingSupported(encodings[i])) {
       stringstream ss;
-      ss << "File " << stream_->filename() << " uses an unsupported encoding: "
-         << PrintEncoding(encodings[i]) << " for column " << schema_element.name;
+      ss << "File '" << stream_->filename() << "' uses an unsupported encoding: "
+         << PrintEncoding(encodings[i]) << " for column '" << schema_element.name
+         << "'.";
       return Status(ss.str());
     }
   }
@@ -1030,8 +1173,9 @@ Status HdfsParquetScanner::ValidateColumn(const SlotDescriptor* slot_desc, int c
       file_data.meta_data.codec != parquet::CompressionCodec::SNAPPY &&
       file_data.meta_data.codec != parquet::CompressionCodec::GZIP) {
     stringstream ss;
-    ss << "File " << stream_->filename() << " uses an unsupported compression: "
-        << file_data.meta_data.codec << " for column " << schema_element.name;
+    ss << "File '" << stream_->filename() << "' uses an unsupported compression: "
+        << file_data.meta_data.codec << " for column '" << schema_element.name
+        << "'.";
     return Status(ss.str());
   }
 
@@ -1039,8 +1183,8 @@ Status HdfsParquetScanner::ValidateColumn(const SlotDescriptor* slot_desc, int c
   parquet::Type::type type = IMPALA_TO_PARQUET_TYPES[slot_desc->type().type];
   if (type != file_data.meta_data.type) {
     stringstream ss;
-    ss << "File " << stream_->filename() << " has an incompatible type with the"
-       << " table schema for column " << schema_element.name << ".  Expected type: "
+    ss << "File '" << stream_->filename() << "' has an incompatible type with the"
+       << " table schema for column '" << schema_element.name << "'.  Expected type: "
        << type << ".  Actual type: " << file_data.meta_data.type;
     return Status(ss.str());
   }
@@ -1049,8 +1193,8 @@ Status HdfsParquetScanner::ValidateColumn(const SlotDescriptor* slot_desc, int c
   const vector<string> schema_path = file_data.meta_data.path_in_schema;
   if (schema_path.size() != 1) {
     stringstream ss;
-    ss << "File " << stream_->filename() << " contains a nested schema for column "
-       << schema_element.name << ".  This is currently not supported.";
+    ss << "File '" << stream_->filename() << "' contains a nested schema for column '"
+       << schema_element.name << "'.  This is currently not supported.";
     return Status(ss.str());
   }
 
@@ -1058,11 +1202,98 @@ Status HdfsParquetScanner::ValidateColumn(const SlotDescriptor* slot_desc, int c
   if (schema_element.repetition_type != parquet::FieldRepetitionType::OPTIONAL &&
       schema_element.repetition_type != parquet::FieldRepetitionType::REQUIRED) {
     stringstream ss;
-    ss << "File " << stream_->filename() << " column " << schema_element.name
-       << " contains an unsupported column repetition type: "
+    ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+       << "' contains an unsupported column repetition type: "
        << schema_element.repetition_type;
     return Status(ss.str());
   }
 
+  // Check the decimal scale in the file matches the metastore scale and precision.
+  // We fail the query if the metadata makes it impossible for us to safely read
+  // the file. If we don't require the metadata, we will fail the query if
+  // abort_on_error is true, otherwise we will just log a warning.
+  bool is_converted_type_decimal = schema_element.__isset.converted_type &&
+      schema_element.converted_type == parquet::ConvertedType::DECIMAL;
+  if (slot_desc->type().type == TYPE_DECIMAL) {
+    // We require that the scale and byte length be set.
+    if (schema_element.type != parquet::Type::FIXED_LEN_BYTE_ARRAY) {
+      stringstream ss;
+      ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+         << "' should be a decimal column encoded using FIXED_LEN_BYTE_ARRAY.";
+      return Status(ss.str());
+    }
+
+    if (!schema_element.__isset.type_length) {
+      stringstream ss;
+      ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+         << "' does not have type_length set.";
+      return Status(ss.str());
+    }
+
+    int expected_len = ParquetPlainEncoder::DecimalSize(slot_desc->type());
+    if (schema_element.type_length != expected_len) {
+      stringstream ss;
+      ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+         << "' has an invalid type length. Expecting: " << expected_len
+         << " len in file: " << schema_element.type_length;
+      return Status(ss.str());
+    }
+
+    if (!schema_element.__isset.scale) {
+      stringstream ss;
+      ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+         << "' does not have the scale set.";
+      return Status(ss.str());
+    }
+
+    if (schema_element.scale != slot_desc->type().scale) {
+      // TODO: we could allow a mismatch and do a conversion at this step.
+      stringstream ss;
+      ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+         << "' has a scale that does not match the table metadata scale."
+         << " File metadata scale: " << schema_element.scale
+         << " Table metadata scale: " << slot_desc->type().scale;
+      return Status(ss.str());
+    }
+
+    // The other decimal metadata should be there but we don't need it.
+    if (!schema_element.__isset.precision) {
+      stringstream ss;
+      ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+         << "' does not have the precision set.";
+      if (state_->abort_on_error()) return Status(ss.str());
+      state_->LogError(ss.str());
+    } else {
+      if (schema_element.precision != slot_desc->type().precision) {
+        // TODO: we could allow a mismatch and do a conversion at this step.
+        stringstream ss;
+        ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+          << "' has a precision that does not match the table metadata precision."
+          << " File metadata precision: " << schema_element.precision
+          << " Table metadata precision: " << slot_desc->type().precision;
+        if (state_->abort_on_error()) return Status(ss.str());
+        state_->LogError(ss.str());
+      }
+    }
+
+    if (!is_converted_type_decimal) {
+      // TODO: is this validation useful? It is not required at all to read the data and
+      // might only serve to reject otherwise perfectly readable files.
+      stringstream ss;
+      ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+         << "' does not have converted type set to DECIMAL.";
+      if (state_->abort_on_error()) return Status(ss.str());
+      state_->LogError(ss.str());
+    }
+  } else if (schema_element.__isset.scale || schema_element.__isset.precision ||
+      is_converted_type_decimal) {
+    stringstream ss;
+    ss << "File '" << stream_->filename() << "' column '" << schema_element.name
+       << "' contains decimal data but the table metadata has type " << slot_desc->type();
+    if (state_->abort_on_error()) return Status(ss.str());
+    state_->LogError(ss.str());
+  }
+
   return Status::OK;
 }
+

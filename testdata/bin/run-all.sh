@@ -17,10 +17,10 @@
 
 # If -format is passed, format the mini-dfs cluster.
 
-HDFS_FORMAT_CLUSTER="--hdfsnoformat"
+HDFS_FORMAT_CLUSTER=""
 if [ "$1" == "-format" ]; then
   echo "Formatting cluster"
-  HDFS_FORMAT_CLUSTER=""
+  HDFS_FORMAT_CLUSTER="-format"
 elif [[ $1 ]]; then
   echo "Usage: run-all.sh [-format]"
   echo "[-format] : Format the mini-dfs cluster before starting"
@@ -49,5 +49,3 @@ $IMPALA_HOME/testdata/bin/run-hbase.sh &>${IMPALA_TEST_CLUSTER_LOG_DIR}/run-hbas
 echo " --> Starting Hive Server and Metastore Service"
 $IMPALA_HOME/testdata/bin/run-hive-server.sh\
     &>${IMPALA_TEST_CLUSTER_LOG_DIR}/run-hive-server.log
-
-

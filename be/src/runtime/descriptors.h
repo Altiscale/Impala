@@ -24,9 +24,10 @@
 
 #include "common/status.h"
 #include "common/global-types.h"
+#include "runtime/types.h"
+
 #include "gen-cpp/Descriptors_types.h"  // for TTupleId
 #include "gen-cpp/Types_types.h"
-#include "runtime/primitive-type.h"
 
 namespace llvm {
   class Function;
@@ -86,6 +87,7 @@ class SlotDescriptor {
   }
   bool is_materialized() const { return is_materialized_; }
   bool is_nullable() const { return null_indicator_offset_.bit_mask != 0; }
+  int slot_size() const { return slot_size_; }
 
   std::string DebugString() const;
 
@@ -97,7 +99,7 @@ class SlotDescriptor {
   // The codegen function is cached.
   llvm::Function* CodegenUpdateNull(LlvmCodeGen*, llvm::StructType* tuple, bool set_null);
 
- protected:
+ private:
   friend class DescriptorTbl;
   friend class TupleDescriptor;
 
@@ -111,6 +113,9 @@ class SlotDescriptor {
   // the idx of the slot in the tuple descriptor (0-based).
   // this is provided by the FE
   const int slot_idx_;
+
+  // the byte size of this slot.
+  const int slot_size_;
 
   // the idx of the slot in the llvm codegen'd tuple struct
   // this is set by TupleDescriptor during codegen and takes into account
@@ -144,6 +149,7 @@ class TableDescriptor {
 
   const std::string& name() const { return name_; }
   const std::string& database() const { return database_; }
+  const std::vector<std::string>& col_names() const { return col_names_; }
 
  protected:
   std::string name_;
@@ -151,6 +157,7 @@ class TableDescriptor {
   TableId id_;
   int num_cols_;
   int num_clustering_cols_;
+  std::vector<std::string> col_names_;
 };
 
 // Metadata for a single partition inside an Hdfs table.
@@ -166,6 +173,7 @@ class HdfsPartitionDescriptor {
   int block_size() const { return block_size_; }
   const std::string& location() const { return location_; }
   THdfsCompression::type compression() const { return compression_; }
+  int64_t id() const { return id_; }
 
   // Calls Prepare() on all partition key exprs. Calls after the first are no-ops.
   // Note that because these exprs are always literals, they do not need to be opened or
@@ -182,6 +190,7 @@ class HdfsPartitionDescriptor {
   int block_size_;
   std::string location_;
   THdfsCompression::type compression_;
+  int64_t id_;
 
   // True if PrepareExprs has been called, to prevent repeating expensive codegen
   bool exprs_prepared_;
@@ -204,7 +213,6 @@ class HdfsTableDescriptor : public TableDescriptor {
  public:
   HdfsTableDescriptor(const TTableDescriptor& tdesc, ObjectPool* pool);
   const std::string& hdfs_base_dir() const { return hdfs_base_dir_; }
-  const std::vector<std::string>& col_names() const { return col_names_; }
   const std::string& null_partition_key_value() const {
     return null_partition_key_value_;
   }
@@ -228,7 +236,6 @@ class HdfsTableDescriptor : public TableDescriptor {
 
  protected:
   std::string hdfs_base_dir_;
-  std::vector<std::string> col_names_;
   std::string null_partition_key_value_;
   // Special string to indicate NULL values in text-encoded columns.
   std::string null_column_value_;
@@ -265,6 +272,13 @@ class HBaseTableDescriptor : public TableDescriptor {
 
   // List of family/qualifier pairs.
   std::vector<HBaseColumnDescriptor> cols_;
+};
+
+// Descriptor for a DataSourceTable
+class DataSourceTableDescriptor : public TableDescriptor {
+ public:
+  DataSourceTableDescriptor(const TTableDescriptor& tdesc) : TableDescriptor(tdesc) { }
+  virtual std::string DebugString() const;
 };
 
 class TupleDescriptor {

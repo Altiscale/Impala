@@ -86,7 +86,6 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
     }
 
     if (is_cancelled_) {
-      DCHECK(ready_buffers_.empty());
       DCHECK(!status_.ok());
       return status_;
     }
@@ -100,12 +99,10 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
 
   // Update tracking counters. The buffer has now moved from the IoMgr to the
   // caller.
-  if (cached_buffer_ == NULL) {
-    ++io_mgr_->num_buffers_in_readers_;
-    ++reader_->num_buffers_in_reader_;
-    --reader_->num_ready_buffers_;
-    --reader_->num_used_buffers_;
-  }
+  ++io_mgr_->num_buffers_in_readers_;
+  ++reader_->num_buffers_in_reader_;
+  --reader_->num_ready_buffers_;
+  --reader_->num_used_buffers_;
 
   Status status = (*buffer)->status_;
   if (!status.ok()) {
@@ -123,7 +120,7 @@ Status DiskIoMgr::ScanRange::GetNext(BufferDescriptor** buffer) {
   }
 
   DCHECK(reader_->Validate()) << endl << reader_->DebugString();
-  if (reader_->state_ == ReaderContext::Cancelled) {
+  if (reader_->state_ == RequestContext::Cancelled) {
     reader_->blocked_ranges_.Remove(this);
     Cancel(reader_->status_);
     (*buffer)->Return();
@@ -152,18 +149,15 @@ void DiskIoMgr::ScanRange::Cancel(const Status& status) {
     unique_lock<mutex> scan_range_lock(lock_);
     unique_lock<mutex> hdfs_lock(hdfs_lock_);
     DCHECK(Validate()) << DebugString();
-    if (is_cancelled_) {
-      DCHECK(ready_buffers_.empty());
-      return;
-    }
+    if (is_cancelled_) return;
     is_cancelled_ = true;
     status_ = status;
-    CleanupQueuedBuffers();
   }
   buffer_ready_cv_.notify_all();
+  CleanupQueuedBuffers();
 
   // For cached buffers, we can't close the range until the cached buffer is returned.
-  // Close is handled in DiskIoMgr::ReturnBuffer().
+  // Close() is called from DiskIoMgr::ReturnBuffer().
   if (cached_buffer_ == NULL) Close();
 }
 
@@ -173,6 +167,7 @@ void DiskIoMgr::ScanRange::CleanupQueuedBuffers() {
   reader_->num_buffers_in_reader_ += ready_buffers_.size();
   reader_->num_used_buffers_ -= ready_buffers_.size();
   reader_->num_ready_buffers_ -= ready_buffers_.size();
+
   while (!ready_buffers_.empty()) {
     BufferDescriptor* buffer = ready_buffers_.front();
     buffer->Return();
@@ -185,7 +180,8 @@ string DiskIoMgr::ScanRange::DebugString() const {
   ss << "file=" << file_ << " disk_id=" << disk_id_ << " offset=" << offset_
      << " len=" << len_ << " bytes_read=" << bytes_read_
      << " buffer_queue=" << ready_buffers_.size()
-     << " capacity=" << ready_buffers_capacity_;
+     << " capacity=" << ready_buffers_capacity_
+     << " hdfs_file=" << hdfs_file_;
   return ss.str();
 }
 
@@ -201,18 +197,18 @@ bool DiskIoMgr::ScanRange::Validate() {
                  << " eosr_queued_=" << eosr_queued_;
     return false;
   }
-  if (is_cancelled_ && !ready_buffers_.empty()) {
-    LOG(WARNING) << "Cancelling the reader must clean up queued buffers."
-                 << " is_cancelled_=" << is_cancelled_
-                 << " ready_buffers_.size()=" << ready_buffers_.size();
-    return false;
-  }
   return true;
 }
 
 DiskIoMgr::ScanRange::ScanRange(int capacity)
   : ready_buffers_capacity_(capacity) {
-  Reset(NULL, -1, -1, -1, false);
+  request_type_ = RequestType::READ;
+  Reset("", -1, -1, -1, false);
+}
+
+DiskIoMgr::ScanRange::~ScanRange() {
+  DCHECK(hdfs_file_ == NULL) << "File was not closed.";
+  DCHECK(cached_buffer_ == NULL) << "Cached buffer was not released.";
 }
 
 void DiskIoMgr::ScanRange::Reset(const char* file, int64_t len, int64_t offset,
@@ -227,9 +223,11 @@ void DiskIoMgr::ScanRange::Reset(const char* file, int64_t len, int64_t offset,
   cached_buffer_ = NULL;
   io_mgr_ = NULL;
   reader_ = NULL;
+  hdfs_file_ = NULL;
 }
 
-void DiskIoMgr::ScanRange::InitInternal(DiskIoMgr* io_mgr, ReaderContext* reader) {
+void DiskIoMgr::ScanRange::InitInternal(DiskIoMgr* io_mgr, RequestContext* reader) {
+  DCHECK(hdfs_file_ == NULL);
   io_mgr_ = io_mgr;
   reader_ = reader;
   local_file_ = NULL;
@@ -255,7 +253,7 @@ Status DiskIoMgr::ScanRange::Open() {
 
     // TODO: is there much overhead opening hdfs files?  Should we try to preserve
     // the handle across multiple scan ranges of a file?
-    hdfs_file_ = hdfsOpenFile(reader_->hdfs_connection_, file_, O_RDONLY, 0, 0, 0);
+    hdfs_file_ = hdfsOpenFile(reader_->hdfs_connection_, file(), O_RDONLY, 0, 0, 0);
     if (hdfs_file_ == NULL) {
       return Status(GetHdfsErrorMsg("Failed to open HDFS file ", file_));
     }
@@ -269,7 +267,7 @@ Status DiskIoMgr::ScanRange::Open() {
   } else {
     if (local_file_ != NULL) return Status::OK;
 
-    local_file_ = fopen(file_, "r");
+    local_file_ = fopen(file(), "r");
     if (local_file_ == NULL) {
       string error_msg = GetStrErrMsg();
       stringstream ss;
@@ -300,14 +298,9 @@ void DiskIoMgr::ScanRange::Close() {
     if (success == 0) {
       reader_->bytes_read_local_ += read_statistics->totalLocalBytesRead;
       reader_->bytes_read_short_circuit_ += read_statistics->totalShortCircuitBytesRead;
-      reader_->bytes_read_dn_cache_ += read_statistics->totalZeroCopyBytesRead;
       hdfsFileFreeReadStatistics(read_statistics);
     }
 
-    if (cached_buffer_ != NULL) {
-      hadoopRzBufferFree(hdfs_file_, cached_buffer_);
-      cached_buffer_ = NULL;
-    }
     hdfsCloseFile(reader_->hdfs_connection_, hdfs_file_);
     hdfs_file_ = NULL;
   } else {
@@ -367,45 +360,8 @@ Status DiskIoMgr::ScanRange::Read(char* buffer, int64_t* bytes_read, bool* eosr)
 Status DiskIoMgr::ScanRange::ReadFromCache(bool* read_succeeded) {
   DCHECK(try_cache_);
   DCHECK_EQ(bytes_read_, 0);
+  // On CDH4, this always fails.
   *read_succeeded = false;
-  Status status = Open();
-  if (!status.ok()) return status;
-
-  // Cached reads not supported on local filesystem.
-  if (reader_->hdfs_connection_ == NULL) return Status::OK;
-
-  {
-    unique_lock<mutex> scan_range_lock(lock_);
-    if (is_cancelled_) return Status::CANCELLED;
-
-    DCHECK(hdfs_file_ != NULL);
-    DCHECK(cached_buffer_ == NULL);
-    cached_buffer_ = hadoopReadZero(hdfs_file_, io_mgr_->cached_read_options_, len());
-
-    // Data was not cached, caller will fall back to normal read path.
-    if (cached_buffer_ == NULL) return Status::OK;
-  }
-
-  // Cached read succeeded.
-  void* buffer = const_cast<void*>(hadoopRzBufferGet(cached_buffer_));
-  int32_t bytes_read = hadoopRzBufferLength(cached_buffer_);
-  // For now, entire the entire block is cached or none of it.
-  // TODO: if HDFS ever changes this, we'll have to handle the case where half
-  // the block is cached.
-  DCHECK_EQ(bytes_read, len());
-
-  // Create a single buffer desc for the entire scan range and enqueue that.
-  BufferDescriptor* desc = io_mgr_->GetBufferDesc(
-      reader_, this, reinterpret_cast<char*>(buffer), 0);
-  desc->len_ = bytes_read;
-  desc->scan_range_offset_ = 0;
-  desc->eosr_ = true;
-  bytes_read_ = bytes_read;
-  EnqueueBuffer(desc);
-  if (reader_->bytes_read_counter_ != NULL) {
-    COUNTER_UPDATE(reader_->bytes_read_counter_, bytes_read);
-  }
-  *read_succeeded = true;
   return Status::OK;
 }
 

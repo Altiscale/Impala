@@ -153,6 +153,11 @@ public class AuditingTest extends AnalyzerTest {
     Assert.assertEquals(accessEvents, Lists.newArrayList(
         new TAccessEvent("tpch.lineitem", TCatalogObjectType.TABLE, "VIEW_METADATA"),
         new TAccessEvent("tpch.new_lineitem", TCatalogObjectType.TABLE, "CREATE")));
+
+    accessEvents = AnalyzeAccessEvents("create table tpch.new_table like parquet "
+        + "'/test-warehouse/schemas/zipcode_incomes.parquet'");
+    Assert.assertEquals(accessEvents, Lists.newArrayList(
+        new TAccessEvent("tpch.new_table", TCatalogObjectType.TABLE, "CREATE")));
   }
 
   @Test
@@ -242,11 +247,11 @@ public class AuditingTest extends AnalyzerTest {
   }
 
   @Test
-  public void TestShowStats() throws AnalysisException, AuthorizationException{
-    String[] statsQuals = new String[]{ "table", "column" };
+  public void TestShow() throws AnalysisException, AuthorizationException{
+    String[] statsQuals = new String[]{ "partitions", "table stats", "column stats" };
     for (String qual: statsQuals) {
       List<TAccessEvent> accessEvents =
-          AnalyzeAccessEvents(String.format("show %s stats functional.alltypes", qual));
+          AnalyzeAccessEvents(String.format("show %s functional.alltypes", qual));
       Assert.assertEquals(accessEvents, Lists.newArrayList(new TAccessEvent(
           "functional.alltypes", TCatalogObjectType.TABLE, "VIEW_METADATA")));
     }

@@ -3,6 +3,7 @@
 # table. The table name should match the base table name defined in the schema template
 # file.
 table_name:stringids, constraint:restrict_to, table_format:hbase/none/none
+table_name:hbasecolumnfamilies, constraint:restrict_to, table_format:hbase/none/none
 table_name:insertalltypesagg, constraint:restrict_to, table_format:hbase/none/none
 table_name:alltypessmallbinary, constraint:restrict_to, table_format:hbase/none/none
 table_name:insertalltypesaggbinary, constraint:restrict_to, table_format:hbase/none/none
@@ -57,6 +58,7 @@ table_name:nullformat_custom, constraint:exclude, table_format:parquet/none/none
 
 table_name:alltypes_view, constraint:restrict_to, table_format:text/none/none
 table_name:alltypes_view, constraint:restrict_to, table_format:seq/snap/block
+table_name:alltypes_hive_view, constraint:restrict_to, table_format:text/none/none
 table_name:alltypes_view_sub, constraint:restrict_to, table_format:text/none/none
 table_name:alltypes_view_sub, constraint:restrict_to, table_format:seq/snap/block
 table_name:alltypes_parens, constraint:restrict_to, table_format:text/none/none
@@ -88,6 +90,21 @@ table_name:widerow, constraint:exclude, table_format:hbase/none/none
 # with no corresponding LOAD statement.
 table_name:nullformat_custom, constraint:exclude, table_format:hbase/none/none
 table_name:unsupported_types, constraint:exclude, table_format:hbase/none/none
+
+# On CDH4, decimal can only be tested on formats Impala can write to (text and parquet)
+# TODO: add Avro once Hive or Impala can write Avro decimals
+table_name:decimal_tbl, constraint:restrict_to, table_format:text/none/none
+table_name:decimal_tiny, constraint:restrict_to, table_format:text/none/none
+table_name:decimal_tbl, constraint:restrict_to, table_format:parquet/none/none
+table_name:decimal_tiny, constraint:restrict_to, table_format:parquet/none/none
+
+# invalid_decimal_part_tbl[1,2,3] tables are used for testing invalid decimal
+# partition key values (see IMPALA-1040)
+table_name:invalid_decimal_part_tbl1, constraint:restrict_to, table_format:text/none/none
+table_name:invalid_decimal_part_tbl2, constraint:restrict_to, table_format:text/none/none
+table_name:invalid_decimal_part_tbl3, constraint:restrict_to, table_format:text/none/none
+
+table_name:avro_decimal_tbl, constraint:restrict_to, table_format:avro/snap/block
 
 # hbase doesn't seem to like very wide tables
 table_name:widetable_250_cols, constraint:exclude, table_format:hbase/none/none

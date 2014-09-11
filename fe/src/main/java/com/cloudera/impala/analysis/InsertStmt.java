@@ -135,6 +135,7 @@ public class InsertStmt extends StatementBase {
   @Override
   public void analyze(Analyzer analyzer) throws AnalysisException,
       AuthorizationException {
+    analyzer.setIsInsertStmt(true);
     try {
       if (withClause_ != null) withClause_.analyze(analyzer);
     } catch (AnalysisException e) {
@@ -639,6 +640,8 @@ public class InsertStmt extends StatementBase {
     return strBuilder.toString();
   }
 
+  @Override
   public void setIsExplain(boolean isExplain) { isExplain_ = isExplain; }
+  @Override
   public boolean isExplain() { return isExplain_; }
 }

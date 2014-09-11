@@ -31,6 +31,7 @@ import com.cloudera.impala.catalog.Catalog;
 import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.Function;
 import com.cloudera.impala.catalog.Function.CompareMode;
+import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.common.TreeNode;
 import com.cloudera.impala.thrift.TExpr;
@@ -173,6 +174,14 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     analyze(analyzer);
   }
 
+  static public void reanalyze(List<Expr> exprs, Analyzer analyzer)
+      throws AnalysisException, AuthorizationException {
+    if (exprs == null) return;
+    for (Expr e: exprs) {
+      e.reanalyze(analyzer);
+    }
+  }
+
   protected void computeNumDistinctValues() {
     if (isConstant()) {
       numDistinctValues_ = 1;
@@ -214,37 +223,128 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
   /**
    * Generates the necessary casts for the children of this expr to call fn_.
-   * child(0) is cast to the functions first argument, child(1) to the second etc.
-   * This does not do any validation and the casts are assumed to be same.
+   * child(0) is cast to the function's first argument, child(1) to the second etc.
+   * This does not do any validation and the casts are assumed to be safe.
+   *
+   * If the function signature contains wildcard decimals, each wildcard child
+   * argument will be cast to the highest resolution that can contain all of
+   * the child wildcard arguments.
+   * e.g. cast(decimal(*), decimal(*))
+   *      called with cast(decimal(10,2), decimal(5,3))
+   * both children will be cast to (11, 3).
    */
   protected void castForFunctionCall() throws AnalysisException {
     Preconditions.checkState(fn_ != null);
     ColumnType[] fnArgs = fn_.getArgs();
-    if (fnArgs.length > 0) {
-      for (int i = 0; i < children_.size(); ++i) {
-        // For varargs, we must compare with the last type in fnArgs.argTypes.
-        int ix = Math.min(fnArgs.length - 1, i);
-        if (!children_.get(i).type_.matchesType(fnArgs[ix])) castChild(fnArgs[ix], i);
+    ColumnType resolvedWildcardType = getResolvedWildCardType();
+    for (int i = 0; i < children_.size(); ++i) {
+      // For varargs, we must compare with the last type in fnArgs.argTypes.
+      int ix = Math.min(fnArgs.length - 1, i);
+      if (fnArgs[ix].isWildcardDecimal()) {
+        Preconditions.checkState(resolvedWildcardType != null);
+        if (!children_.get(i).type_.equals(resolvedWildcardType)) {
+          castChild(resolvedWildcardType, i);
+        }
+      } else if (!children_.get(i).type_.matchesType(fnArgs[ix])) {
+        castChild(fnArgs[ix], i);
       }
     }
   }
 
   /**
-   * Checks that the given expr is within the expr child and expr depth limits.
-   * Throws an AnalysisException if any of those limits is exceeded.
+   * Returns the max resolution type of all the wild card decimal types.
+   * Returns null if there are no wild card types.
    */
-  private void checkExprLimits(Analyzer analyzer) throws AnalysisException {
-    if (children_.size() > EXPR_CHILDREN_LIMIT) {
-      String sql = toSql();
-      String sqlSubstr = sql.substring(0, Math.min(80, sql.length()));
-      throw new AnalysisException(String.format("Exceeded the maximum number of child " +
-          "expressions (%s).\nExpression has %s children:\n%s...",
-          EXPR_CHILDREN_LIMIT, children_.size(), sqlSubstr));
+  ColumnType getResolvedWildCardType() throws AnalysisException {
+    ColumnType result = null;
+    ColumnType[] fnArgs = fn_.getArgs();
+    for (int i = 0; i < children_.size(); ++i) {
+      // For varargs, we must compare with the last type in fnArgs.argTypes.
+      int ix = Math.min(fnArgs.length - 1, i);
+      if (!fnArgs[ix].isWildcardDecimal()) continue;
+
+      ColumnType childType = children_.get(i).type_;
+      Preconditions.checkState(!childType.isWildcardDecimal(),
+          "Child expr should have been resolved.");
+      if (result == null) {
+        result = childType.getMinResolutionDecimal();
+      } else {
+        result = ColumnType.getAssignmentCompatibleType(result, childType);
+      }
     }
-    // Do not print the expr because the toSql() may also overflow the stack.
-    if (analyzer.getCallDepth() > EXPR_DEPTH_LIMIT) {
-      throw new AnalysisException(String.format("Exceeded the maximum depth of an " +
-          "expresison tree (%s).", EXPR_DEPTH_LIMIT));
+    if (result != null) {
+      if (result.isNull()) {
+        throw new AnalysisException(
+            "Cannot resolve DECIMAL precision and scale from NULL type.");
+      }
+      Preconditions.checkState(result.isDecimal() && !result.isWildcardDecimal());
+    }
+    return result;
+  }
+
+  /**
+   * Returns true if e is a CastExpr and the target type is a decimal.
+   */
+  private boolean isExplicitCastToDecimal(Expr e) {
+    if (!(e instanceof CastExpr)) return false;
+    CastExpr c = (CastExpr)e;
+    return !c.isImplicit() && c.getType().isDecimal();
+  }
+
+  /**
+   * Converts DecimalLiterals in the tree rooted at child to targetType and
+   * reanalyzes that subtree.
+   */
+  private void convertNumericLiteralsToFloat(Analyzer analyzer, Expr child,
+      ColumnType targetType) throws AnalysisException, AuthorizationException {
+    if (!targetType.isFloatingPointType() && !targetType.isIntegerType()) return;
+    if (targetType.isIntegerType()) targetType = ColumnType.DOUBLE;
+    List<DecimalLiteral> literals = Lists.newArrayList();
+    child.collectAll(Predicates.instanceOf(DecimalLiteral.class), literals);
+    for (DecimalLiteral l: literals) {
+      l.explicitlyCastToFloat(targetType);
+    }
+    child.reanalyze(analyzer);
+  }
+
+  /**
+   * Converts numeric literal in the expr tree rooted at this expr to return floating
+   * point types instead of decimals, if possible.
+   *
+   * Decimal has a higher processing cost than floating point and we should not pay
+   * the cost if the user does not require the accuracy. For example:
+   * "select float_col + 1.1" would start out with 1.1 as a decimal(2,1) and the
+   * float_col would be promoted to a high accuracy decimal. This function will identify
+   * this case and treat 1.1 as a float.
+   * In the case of "decimal_col + 1.1", 1.1 would remain a decimal.
+   * In the case of "float_col + cast(1.1 as decimal(2,1))", the result would be a
+   * decimal.
+   *
+   * Another way to think about it is that DecimalLiterals are analyzed as returning
+   * decimals (of the narrowest precision/scale) and we later convert them to a floating
+   * point type when it is consistent with the user's intent.
+   *
+   * TODO: another option is to do constant folding in the FE and then apply this rule.
+   */
+  protected void convertNumericLiteralsFromDecimal(Analyzer analyzer)
+      throws AnalysisException, AuthorizationException {
+    Preconditions.checkState(this instanceof ArithmeticExpr ||
+        this instanceof BinaryPredicate);
+    Preconditions.checkState(children_.size() == 2);
+    ColumnType t0 = getChild(0).getType();
+    ColumnType t1 = getChild(1).getType();
+    boolean c0IsConstantDecimal = getChild(0).isConstant() && t0.isDecimal();
+    boolean c1IsConstantDecimal = getChild(1).isConstant() && t1.isDecimal();
+    if (c0IsConstantDecimal && c1IsConstantDecimal) return;
+    if (!c0IsConstantDecimal && !c1IsConstantDecimal) return;
+
+    // Only child(0) or child(1) is a const decimal. See if we can cast it to
+    // the type of the other child.
+    if (c0IsConstantDecimal && !isExplicitCastToDecimal(getChild(0))) {
+      convertNumericLiteralsToFloat(analyzer, getChild(0), t1);
+    }
+    if (c1IsConstantDecimal && !isExplicitCastToDecimal(getChild(1))) {
+      convertNumericLiteralsToFloat(analyzer, getChild(1), t0);
     }
   }
 
@@ -280,6 +380,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   protected void treeToThriftHelper(TExpr container) {
     Preconditions.checkState(isAnalyzed_,
         "Must be analyzed before serializing to thrift. %s", this);
+    Preconditions.checkState(!type_.isWildcardDecimal());
     TExprNode msg = new TExprNode();
     msg.type = type_.toThrift();
     msg.num_children = children_.size();
@@ -777,6 +878,17 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
   }
 
   /**
+   * @return true if this expr is either a null literal or a cast from
+   * a null literal.
+   */
+  public boolean isNullLiteral() {
+    if (this instanceof NullLiteral) return true;
+    if (!(this instanceof CastExpr)) return false;
+    Preconditions.checkState(children_.size() == 1);
+    return children_.get(0).isNullLiteral();
+  }
+
+  /**
    * Checks whether this expr returns a boolean type or NULL type.
    * If not, throws an AnalysisException with an appropriate error message using
    * 'name' as a prefix. For example, 'name' could be "WHERE clause".
@@ -885,5 +997,13 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     } else {
       return null;
     }
+  }
+
+  /**
+   * Negates a boolean Expr.
+   */
+  public Expr negate() {
+    Preconditions.checkState(type_.getPrimitiveType() == PrimitiveType.BOOLEAN);
+    return new CompoundPredicate(CompoundPredicate.Operator.NOT, this, null);
   }
 }

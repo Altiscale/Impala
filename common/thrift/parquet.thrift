@@ -54,12 +54,31 @@ enum ConvertedType {
   /** a key/value pair is converted into a group of two fields */
   MAP_KEY_VALUE = 2;
 
-  /** a list is converted into an optional field containing a repeated field for its 
+  /** a list is converted into an optional field containing a repeated field for its
    * values */
   LIST = 3;
+
+  /** an enum is converted into a binary field */
+  ENUM = 4;
+
+  /**
+   * A decimal value.
+   *
+   * This may be used to annotate binary or fixed primitive types. The
+   * underlying byte array stores the unscaled value encoded as two's
+   * complement using big-endian byte order (the most significant byte is the
+   * zeroth element). The value of the decimal is the value * 10^{-scale}.
+   *
+   * This must be accompanied by a (maximum) precision and a scale in the
+   * SchemaElement. The precision specifies the number of digits in the decimal
+   * and the scale stores the location of the decimal point. For example 1.23
+   * would have precision 3 (3 total digits) and scale 2 (the decimal point is
+   * 2 digits over).
+   */
+  DECIMAL = 5;
 }
 
-/** 
+/**
  * Representation of Schemas
  */
 enum FieldRepetitionType {
@@ -71,6 +90,20 @@ enum FieldRepetitionType {
 
   /** The field is repeated and can contain 0 or more values */
   REPEATED = 2;
+}
+
+/**
+ * Statistics per row group and per page
+ * All fields are optional.
+ */
+struct Statistics {
+   /** min and max value of the column, encoded in PLAIN encoding */
+   1: optional binary max;
+   2: optional binary min;
+   /** count of null value in the column */
+   3: optional i64 null_count;
+   /** count of distinct values occurring */
+   4: optional i64 distinct_count;
 }
 
 /**
@@ -108,6 +141,18 @@ struct SchemaElement {
    * Used to record the original type to help with cross conversion.
    */
   6: optional ConvertedType converted_type;
+
+  /** Used when this column contains decimal data.
+   * See the DECIMAL converted type for more details.
+   */
+  7: optional i32 scale
+  8: optional i32 precision
+
+  /** When the original schema supports field ids, this will save the
+   * original field id in the parquet schema
+   */
+  9: optional i32 field_id;
+
 }
 
 /**
@@ -122,30 +167,56 @@ enum Encoding {
    * INT64 - 8 bytes per value.  Stored as little-endian.
    * FLOAT - 4 bytes per value.  IEEE. Stored as little-endian.
    * DOUBLE - 8 bytes per value.  IEEE. Stored as little-endian.
-   * BYTE_ARRAY - 4 byte length stored as little endian, followed by bytes.  
+   * BYTE_ARRAY - 4 byte length stored as little endian, followed by bytes.
    * FIXED_LEN_BYTE_ARRAY - Just the bytes.
    */
   PLAIN = 0;
 
-  /** Group VarInt encoding for INT32/INT64. */
-  GROUP_VAR_INT = 1;
+  /** Group VarInt encoding for INT32/INT64.
+   * This encoding is deprecated. It was never used
+   */
+  //  GROUP_VAR_INT = 1;
 
-  /** Dictionary encoding. The values in the dictionary are encoded in the 
-   * plain type. 
+  /**
+   * Deprecated: Dictionary encoding. The values in the dictionary are encoded in the
+   * plain type.
+   * in a data page use RLE_DICTIONARY instead.
+   * in a Dictionary page use PLAIN instead
    */
   PLAIN_DICTIONARY = 2;
 
-  /** Group packed run length encoding. Usable for definition/reptition levels
-   * encoding */
+  /** Group packed run length encoding. Usable for definition/repetition levels
+   * encoding and Booleans (on one bit: 0 is false; 1 is true.)
+   */
   RLE = 3;
 
   /** Bit packed encoding.  This can only be used if the data has a known max
-   * width.  Usable for definition/repetition levels encoding.  **/
+   * width.  Usable for definition/repetition levels encoding.
+   */
   BIT_PACKED = 4;
+
+  /** Delta encoding for integers. This can be used for int columns and works best
+   * on sorted data
+   */
+  DELTA_BINARY_PACKED = 5;
+
+  /** Encoding for byte arrays to separate the length values and the data. The lengths
+   * are encoded using DELTA_BINARY_PACKED
+   */
+  DELTA_LENGTH_BYTE_ARRAY = 6;
+
+  /** Incremental-encoded byte array. Prefix lengths are encoded using DELTA_BINARY_PACKED.
+   * Suffixes are stored as delta length byte arrays.
+   */
+  DELTA_BYTE_ARRAY = 7;
+
+  /** Dictionary encoding: the ids are encoded using the RLE encoding
+   */
+  RLE_DICTIONARY = 8;
 }
 
 /**
- * Supported compression algorithms.  
+ * Supported compression algorithms.
  */
 enum CompressionCodec {
   UNCOMPRESSED = 0;
@@ -158,6 +229,7 @@ enum PageType {
   DATA_PAGE = 0;
   INDEX_PAGE = 1;
   DICTIONARY_PAGE = 2;
+  DATA_PAGE_V2 = 3;
 }
 
 /** Data page header */
@@ -173,6 +245,9 @@ struct DataPageHeader {
 
   /** Encoding used for repetition levels **/
   4: required Encoding repetition_level_encoding;
+
+  /** Optional statistics for the data in this page**/
+  5: optional Statistics statistics;
 }
 
 struct IndexPageHeader {
@@ -185,6 +260,43 @@ struct DictionaryPageHeader {
 
   /** Encoding using this dictionary page **/
   2: required Encoding encoding
+
+  /** If true, the entries in the dictionary are sorted in ascending order **/
+  3: optional bool is_sorted;
+}
+
+/**
+ * New page format alowing reading levels without decompressing the data
+ * Repetition and definition levels are uncompressed
+ * The remaining section containing the data is compressed if is_compressed is true
+ **/
+struct DataPageHeaderV2 {
+  /** Number of values, including NULLs, in this data page. **/
+  1: required i32 num_values
+  /** Number of NULL values, in this data page.
+      Number of non-null = num_values - num_nulls which is also the number of values in the data section **/
+  2: required i32 num_nulls
+  /** Number of rows in this data page. which means pages change on record boundaries (r = 0) **/
+  3: required i32 num_rows
+  /** Encoding used for data in this page **/
+  4: required Encoding encoding
+
+  // repetition levels and definition levels are always using RLE (without size in it)
+
+  /** length of the repetition levels */
+  5: required i32 definition_levels_byte_length;
+  /** length of the definition levels */
+  6: required i32 repetition_levels_byte_length;
+
+  /**  whether the values are compressed.
+  Which means the section of the page between
+  definition_levels_byte_length + repetition_levels_byte_length + 1 and compressed_page_size (included)
+  is compressed with the compression_codec.
+  If missing it is considered compressed */
+  7: optional bool is_compressed = 1;
+
+  /** optional statistics for this column chunk */
+  8: optional Statistics statistics;
 }
 
 struct PageHeader {
@@ -198,7 +310,7 @@ struct PageHeader {
   3: required i32 compressed_page_size
 
   /** 32bit crc for the data below. This allows for disabling checksumming in HDFS
-   *  if only a few pages needs to be read 
+   *  if only a few pages needs to be read
    **/
   4: optional i32 crc
 
@@ -206,14 +318,30 @@ struct PageHeader {
   5: optional DataPageHeader data_page_header;
   6: optional IndexPageHeader index_page_header;
   7: optional DictionaryPageHeader dictionary_page_header;
+  8: optional DataPageHeaderV2 data_page_header_v2;
 }
 
-/** 
+/**
  * Wrapper struct to store key values
  */
  struct KeyValue {
   1: required string key
   2: optional string value
+}
+
+/**
+ * Wrapper struct to specify sort order
+ */
+struct SortingColumn {
+  /** The column index (in this row group) **/
+  1: required i32 column_idx
+
+  /** If true, indicates this column is sorted in descending order. **/
+  2: required bool descending
+
+  /** If true, nulls will come before non-null values, otherwise,
+   * nulls go at the end. */
+  3: required bool nulls_first
 }
 
 /**
@@ -223,7 +351,7 @@ struct ColumnMetaData {
   /** Type of this column **/
   1: required Type type
 
-  /** Set of all encodings used for this column. The purpose is to validate 
+  /** Set of all encodings used for this column. The purpose is to validate
    * whether we can decode those pages. **/
   2: required list<Encoding> encodings
 
@@ -253,10 +381,13 @@ struct ColumnMetaData {
 
   /** Byte offset from the beginning of file to first (only) dictionary page **/
   11: optional i64 dictionary_page_offset
+
+  /** optional statistics for this column chunk */
+  12: optional Statistics statistics;
 }
 
 struct ColumnChunk {
-  /** File where column data is stored.  If not set, assumed to be same file as 
+  /** File where column data is stored.  If not set, assumed to be same file as
     * metadata.  This path is relative to the current file.
     **/
   1: optional string file_path
@@ -266,11 +397,11 @@ struct ColumnChunk {
 
   /** Column metadata for this chunk. This is the same content as what is at
    * file_path/file_offset.  Having it here has it replicated in the file
-   * metadata. 
+   * metadata.
    **/
   3: optional ColumnMetaData meta_data
 }
-  
+
 struct RowGroup {
   1: required list<ColumnChunk> columns
 
@@ -279,6 +410,11 @@ struct RowGroup {
 
   /** Number of rows in this row group **/
   3: required i64 num_rows
+
+  /** If set, specifies a sort ordering of the rows in this RowGroup.
+   * The sorting columns can be a subset of all the columns.
+   */
+  4: optional list<SortingColumn> sorting_columns
 }
 
 /**
@@ -306,7 +442,7 @@ struct FileMetaData {
   5: optional list<KeyValue> key_value_metadata
 
   /** String for application that wrote this file.  This should be in the format
-   * <Application> version <App Version> (build <App Build Hash>).  
+   * <Application> version <App Version> (build <App Build Hash>).
    * e.g. impala version 1.0 (build 6cf94d29b2b7115df4de2c06e2ab4326d721eb55)
    **/
   6: optional string created_by

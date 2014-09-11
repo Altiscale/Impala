@@ -23,19 +23,20 @@ import java.util.Map;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
-import org.apache.hadoop.hbase.Cell;
 import org.apache.hadoop.hbase.HBaseConfiguration;
 import org.apache.hadoop.hbase.HColumnDescriptor;
 import org.apache.hadoop.hbase.HConstants;
 import org.apache.hadoop.hbase.HRegionInfo;
 import org.apache.hadoop.hbase.HRegionLocation;
 import org.apache.hadoop.hbase.HTableDescriptor;
+import org.apache.hadoop.hbase.KeyValue;
 import org.apache.hadoop.hbase.client.HTable;
 import org.apache.hadoop.hbase.client.Result;
 import org.apache.hadoop.hbase.client.ResultScanner;
 import org.apache.hadoop.hbase.client.Scan;
-import org.apache.hadoop.hbase.io.compress.Compression;
+import org.apache.hadoop.hbase.io.hfile.Compression;
 import org.apache.hadoop.hbase.util.Bytes;
+import org.apache.hadoop.hbase.util.FSUtils;
 import org.apache.hadoop.hive.hbase.HBaseSerDe;
 import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
@@ -88,10 +89,17 @@ public class HBaseTable extends Table {
   private static final String HBASE_STORAGE_HANDLER =
       "org.apache.hadoop.hive.hbase.HBaseStorageHandler";
 
+  // Column family of HBase row key
+  private static final String ROW_KEY_COLUMN_FAMILY = ":key";
+
   // Keep the conf around
   private final static Configuration hbaseConf_ = HBaseConfiguration.create();
 
   private HTable hTable_ = null;
+
+  // Cached column families. Used primarily for speeding up row stats estimation
+  // (see CDH-19292).
+  private HColumnDescriptor[] columnFamilies_ = null;
 
   protected HBaseTable(TableId id, org.apache.hadoop.hive.metastore.api.Table msTbl,
       Db db, String name, String owner) {
@@ -242,6 +250,7 @@ public class HBaseTable extends Table {
     try {
       hbaseTableName_ = getHBaseTableName(getMetaStoreTable());
       hTable_ = new HTable(hbaseConf_, hbaseTableName_);
+      columnFamilies_ = null;
       Map<String, String> serdeParams =
           getMetaStoreTable().getSd().getSerdeInfo().getParameters();
       String hbaseColumnsMapping = serdeParams.get(HBaseSerDe.HBASE_COLUMNS_MAPPING);
@@ -279,6 +288,9 @@ public class HBaseTable extends Table {
       // Populate tmp cols in the order they appear in the Hive metastore.
       // We will reorder the cols below.
       List<HBaseColumn> tmpCols = new ArrayList<HBaseColumn>();
+      // Store the key column separately.
+      // TODO: Change this to an ArrayList once we support composite row keys.
+      HBaseColumn keyCol = null;
       for (int i = 0; i < fieldSchemas.size(); ++i) {
         FieldSchema s = fieldSchemas.get(i);
         ColumnType t = ColumnType.INVALID;
@@ -291,20 +303,32 @@ public class HBaseTable extends Table {
         HBaseColumn col = new HBaseColumn(s.getName(), hbaseColumnFamilies.get(i),
             hbaseColumnQualifiers.get(i), hbaseColumnBinaryEncodings.get(i),
             t, s.getComment(), -1);
-        tmpCols.add(col);
         // Load column stats from the Hive metastore into col.
         loadColumnStats(col, client);
+        if (col.getColumnFamily().equals(ROW_KEY_COLUMN_FAMILY)) {
+          // Store the row key column separately from the rest
+          keyCol = col;
+        } else {
+          tmpCols.add(col);
+        }
       }
+      Preconditions.checkState(keyCol != null);
 
-      // HBase columns are ordered by columnFamily,columnQualifier,
+      // The backend assumes that the row key column is always first and
+      // that the remaining HBase columns are ordered by columnFamily,columnQualifier,
       // so the final position depends on the other mapped HBase columns.
       // Sort columns and update positions.
       Collections.sort(tmpCols);
       colsByPos_.clear();
       colsByName_.clear();
+
+      keyCol.setPosition(0);
+      colsByPos_.add(keyCol);
+      colsByName_.put(keyCol.getName(), keyCol);
+      // Update the positions of the remaining columns
       for (int i = 0; i < tmpCols.size(); ++i) {
         HBaseColumn col = tmpCols.get(i);
-        col.setPosition(i);
+        col.setPosition(i + 1);
         colsByPos_.add(col);
         colsByName_.put(col.getName(), col);
       }
@@ -327,6 +351,7 @@ public class HBaseTable extends Table {
     try {
       hbaseTableName_ = getHBaseTableName(getMetaStoreTable());
       hTable_ = new HTable(hbaseConf_, hbaseTableName_);
+      columnFamilies_ = null;
     } catch (Exception e) {
       throw new TableLoadingException("Failed to load metadata for HBase table from " +
           "thrift table: " + name_, e);
@@ -379,9 +404,11 @@ public class HBaseTable extends Table {
     try {
       // Check to see if things are compressed.
       // If they are we'll estimate a compression factor.
-      HColumnDescriptor[] families =
-          hTable_.getTableDescriptor().getColumnFamilies();
-      for (HColumnDescriptor desc: families) {
+      if (columnFamilies_ == null) {
+        columnFamilies_ = hTable_.getTableDescriptor().getColumnFamilies();
+      }
+      Preconditions.checkNotNull(columnFamilies_);
+      for (HColumnDescriptor desc: columnFamilies_) {
         isCompressed |= desc.getCompression() != Compression.Algorithm.NONE;
       }
 
@@ -415,15 +442,15 @@ public class HBaseTable extends Table {
             Result r = rs.next();
             if (r == null) break;
             currentRowCount += 1;
-            for (Cell c: r.list()) {
+            for (KeyValue kv : r.list()) {
               // some extra row size added to make up for shared overhead
-              currentRowSize += c.getRowLength() // row key
+              currentRowSize += kv.getRowLength() // row key
                   + 4 // row key length field
-                  + c.getFamilyLength() // Column family bytes
+                  + kv.getFamilyLength() // Column family bytes
                   + 4  // family length field
-                  + c.getQualifierLength() // qualifier bytes
+                  + kv.getQualifierLength() // qualifier bytes
                   + 4 // qualifier length field
-                  + c.getValueLength() // length of the value
+                  + kv.getValueLength() // length of the value
                   + 4 // value length field
                   + 10; // extra overhead for hfile index, checksums, metadata, etc
             }
@@ -463,21 +490,10 @@ public class HBaseTable extends Table {
    */
   public long getHdfsSize(HRegionInfo info) throws IOException {
     Path tableDir = HTableDescriptor.getTableDir(
-        getRootDir(hbaseConf_), Bytes.toBytes(hbaseTableName_));
+        FSUtils.getRootDir(hbaseConf_), Bytes.toBytes(hbaseTableName_));
     FileSystem fs = tableDir.getFileSystem(hbaseConf_);
     Path regionDir = tableDir.suffix("/" + info.getEncodedName());
     return fs.getContentSummary(regionDir).getLength();
-  }
-
-  /**
-   * Returns hbase's root directory: i.e. <code>hbase.rootdir</code> from
-   * the given configuration as a qualified Path.
-   * Method copied from HBase FSUtils.java to avoid depending on HBase server.
-   */
-  public static Path getRootDir(final Configuration c) throws IOException {
-    Path p = new Path(c.get(HConstants.HBASE_DIR));
-    FileSystem fs = p.getFileSystem(c);
-    return p.makeQualified(fs);
   }
 
   /**
@@ -492,6 +508,7 @@ public class HBaseTable extends Table {
         new TTableDescriptor(id_.asInt(), TTableType.HBASE_TABLE, colsByPos_.size(),
             numClusteringCols_, hbaseTableName_, db_.getName());
     tableDescriptor.setHbaseTable(getTHBaseTable());
+    tableDescriptor.setColNames(getColumnNames());
     return tableDescriptor;
   }
 

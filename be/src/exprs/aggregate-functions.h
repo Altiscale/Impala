@@ -16,7 +16,7 @@
 #ifndef IMPALA_EXPRS_AGGREGATE_FUNCTIONS_H
 #define IMPALA_EXPRS_AGGREGATE_FUNCTIONS_H
 
-#include "udf/udf.h"
+#include "udf/udf-internal.h"
 
 using namespace impala_udf;
 
@@ -49,6 +49,10 @@ class AggregateFunctions {
   // SumUpdate, SumMerge
   template <typename SRC_VAL, typename DST_VAL>
   static void Sum(FunctionContext*, const SRC_VAL& src, DST_VAL* dst);
+
+  // Sum for decimals
+  static void SumUpdate(FunctionContext*, const DecimalVal& src, DecimalVal* dst);
+  static void SumMerge(FunctionContext*, const DecimalVal& src, DecimalVal* dst);
 
   // MinUpdate/MinMerge
   template <typename T>
@@ -87,9 +91,26 @@ class AggregateFunctions {
   static void HllUpdate(FunctionContext*, const T& src, StringVal* dst);
   static void HllMerge(FunctionContext*, const StringVal& src, StringVal* dst);
   static StringVal HllFinalize(FunctionContext*, const StringVal& src);
+
+  // Knuth's variance algorithm, more numerically stable than canonical stddev
+  // algorithms; reference implementation:
+  // http://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Online_algorithm
+  static void KnuthVarInit(FunctionContext* context, StringVal* val);
+  template <typename T>
+  static void KnuthVarUpdate(FunctionContext* context, const T& input, StringVal* val);
+  static void KnuthVarMerge(FunctionContext* context, const StringVal& src,
+                            StringVal* dst);
+  static StringVal KnuthVarFinalize(FunctionContext* context, const StringVal& val);
+
+  // Calculates the biased variance, uses KnuthVar Init-Update-Merge functions
+  static StringVal KnuthVarPopFinalize(FunctionContext* context, const StringVal& val);
+
+  // Calculates STDDEV, uses KnuthVar Init-Update-Merge functions
+  static StringVal KnuthStddevFinalize(FunctionContext* context, const StringVal& val);
+
+  // Calculates the biased STDDEV, uses KnuthVar Init-Update-Merge functions
+  static StringVal KnuthStddevPopFinalize(FunctionContext* context, const StringVal& val);
 };
 
 }
-
 #endif
-

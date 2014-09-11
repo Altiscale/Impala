@@ -116,8 +116,10 @@ class ImpalaConnection(object):
 
 # Represents a connection to Impala using the Beeswax API.
 class BeeswaxConnection(ImpalaConnection):
-  def __init__(self, host_port, use_kerberos=False):
-    self.__beeswax_client = ImpalaBeeswaxClient(host_port, use_kerberos)
+  def __init__(self, host_port, use_kerberos=False, user=None, password=None,
+               use_ssl=False):
+    self.__beeswax_client = ImpalaBeeswaxClient(host_port, use_kerberos, user=user,
+                                                password=password, use_ssl=use_ssl)
     self.__host_port = host_port
     self.QUERY_STATES = self.__beeswax_client.query_states
 
@@ -180,6 +182,10 @@ class BeeswaxConnection(ImpalaConnection):
     """Invalidate the Impalad catalog"""
     return self.execute("invalidate metadata")
 
+  def invalidate_table(self, table_name):
+    """Invalidate a specific table from the catalog"""
+    return self.execute("invalidate metadata %s" % (table_name))
+
   def refresh_table(self, db_name, table_name):
     """Refresh a specific table from the catalog"""
     return self.execute("refresh %s.%s" % (db_name, table_name))
@@ -192,3 +198,7 @@ class BeeswaxConnection(ImpalaConnection):
 def create_connection(host_port, use_kerberos=False):
   # TODO: Support HS2 connections.
   return BeeswaxConnection(host_port=host_port, use_kerberos=use_kerberos)
+
+def create_ldap_connection(host_port, user, password, use_ssl=False):
+  return BeeswaxConnection(host_port=host_port, user=user, password=password,
+                           use_ssl=use_ssl)

@@ -14,7 +14,6 @@
 
 package com.cloudera.impala.catalog;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicLong;
@@ -25,7 +24,6 @@ import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.analysis.Expr;
 import com.cloudera.impala.analysis.LiteralExpr;
-import com.cloudera.impala.analysis.NullLiteral;
 import com.cloudera.impala.analysis.PartitionKeyValue;
 import com.cloudera.impala.thrift.ImpalaInternalServiceConstants;
 import com.cloudera.impala.thrift.TAccessLevel;
@@ -34,8 +32,8 @@ import com.cloudera.impala.thrift.TExprNode;
 import com.cloudera.impala.thrift.THdfsFileBlock;
 import com.cloudera.impala.thrift.THdfsFileDesc;
 import com.cloudera.impala.thrift.THdfsPartition;
-import com.cloudera.impala.thrift.TNetworkAddress;
 import com.cloudera.impala.thrift.TTableStats;
+import com.cloudera.impala.util.HdfsCachingUtil;
 import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
@@ -103,82 +101,31 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
   }
 
   /**
-   * Represents metadata of a single block replica.
-   */
-  public static class BlockReplica {
-    private final boolean isCached_;
-    private final int hostIdx_;
-
-    /**
-     * Creates a BlockReplica given a host ID/index and a flag specifying whether this
-     * replica is cahced. Host IDs are assigned when loading the block metadata in
-     * HdfsTable.
-     */
-    public BlockReplica(int hostIdx, boolean isCached) {
-      hostIdx_ = hostIdx;
-      isCached_ = isCached;
-    }
-
-    /**
-     * Parses the location (an ip address:port string) of the replica and returns a
-     * TNetworkAddress with this information, or null if parsing fails.
-     */
-    public static TNetworkAddress parseLocation(String location) {
-      Preconditions.checkNotNull(location);
-      String[] ip_port = location.split(":");
-      if (ip_port.length != 2) return null;
-      try {
-        return new TNetworkAddress(ip_port[0], Integer.parseInt(ip_port[1]));
-      } catch (NumberFormatException e) {
-        return null;
-      }
-    }
-
-    public boolean isCached() { return isCached_; }
-    public int getHostIdx() { return hostIdx_; }
-  }
-
-  /**
    * File Block metadata
    */
   public static class FileBlock {
     private final THdfsFileBlock fileBlock_;
-    private boolean isCached_; // Set to true if there is at least one cached replica.
 
     private FileBlock(THdfsFileBlock fileBlock) {
-      fileBlock_ = fileBlock;
-      isCached_ = false;
-      for (boolean isCached: fileBlock.getIs_replica_cached()) {
-        isCached_ |= isCached;
-      }
+      this.fileBlock_ = fileBlock;
     }
 
     /**
      * Construct a FileBlock given the start offset (in bytes) of the file associated
-     * with this block, the length of the block (in bytes), and a list of BlockReplicas.
-     * Does not fill diskIds.
+     * with this block, the length of the block (in bytes), and the set of host IDs
+     * that contain replicas of this block. Host IDs are assigned when loading the
+     * block metadata in HdfsTable. Does not fill diskIds.
      */
-    public FileBlock(long offset, long blockLength,
-        List<BlockReplica> replicaHostIdxs) {
+    public FileBlock(long offset, long blockLength, List<Integer> replicaHostIdxs) {
       Preconditions.checkNotNull(replicaHostIdxs);
       fileBlock_ = new THdfsFileBlock();
       fileBlock_.setOffset(offset);
       fileBlock_.setLength(blockLength);
-
-      fileBlock_.setReplica_host_idxs(new ArrayList<Integer>(replicaHostIdxs.size()));
-      fileBlock_.setIs_replica_cached(new ArrayList<Boolean>(replicaHostIdxs.size()));
-      isCached_ = false;
-      for (BlockReplica replica: replicaHostIdxs) {
-        fileBlock_.addToReplica_host_idxs(replica.getHostIdx());
-        fileBlock_.addToIs_replica_cached(replica.isCached());
-        isCached_ |= replica.isCached();
-      }
+      fileBlock_.setReplica_host_idxs(replicaHostIdxs);
     }
 
     public long getOffset() { return fileBlock_.getOffset(); }
     public long getLength() { return fileBlock_.getLength(); }
-    // Returns true if at there at least one cached replica.
-    public boolean isCached() { return isCached_; }
     public List<Integer> getReplicaHostIdxs() {
       return fileBlock_.getReplica_host_idxs();
     }
@@ -200,11 +147,9 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
      */
     public int getDiskId(int hostIndex) {
       if (fileBlock_.disk_ids == null) return -1;
+      Preconditions.checkArgument(hostIndex >= 0);
+      Preconditions.checkArgument(hostIndex < fileBlock_.getDisk_idsSize());
       return fileBlock_.getDisk_ids().get(hostIndex);
-    }
-
-    public boolean isCached(int hostIndex) {
-      return fileBlock_.getIs_replica_cached().get(hostIndex);
     }
 
     public THdfsFileBlock toThrift() { return fileBlock_; }
@@ -223,15 +168,15 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     }
   }
 
-  private final HdfsTable table;
-  private final List<LiteralExpr> partitionKeyValues;
+  private final HdfsTable table_;
+  private final List<LiteralExpr> partitionKeyValues_;
   // estimated number of rows in partition; -1: unknown
-  private long numRows = -1;
-  private static AtomicLong partitionIdCounter = new AtomicLong();
+  private long numRows_ = -1;
+  private static AtomicLong partitionIdCounter_ = new AtomicLong();
 
   // A unique ID for each partition, used to identify a partition in the thrift
   // representation of a table.
-  private final long id;
+  private final long id_;
 
   /*
    * Note: Although you can write multiple formats to a single partition (by changing
@@ -239,16 +184,19 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
    * we. We should therefore treat mixing formats inside one partition as user error.
    * It's easy to add per-file metadata to FileDescriptor if this changes.
    */
-  private final HdfsStorageDescriptor fileFormatDescriptor;
-  private final org.apache.hadoop.hive.metastore.api.Partition msPartition;
-  private final List<FileDescriptor> fileDescriptors;
-  private final String location;
+  private final HdfsStorageDescriptor fileFormatDescriptor_;
+  private final org.apache.hadoop.hive.metastore.api.Partition msPartition_;
+  private final List<FileDescriptor> fileDescriptors_;
+  private final String location_;
   private final static Logger LOG = LoggerFactory.getLogger(HdfsPartition.class);
   private boolean isDirty_ = false;
-  private final TAccessLevel accessLevel;
+  // True if this partition is marked as cached. Does not necessarily mean the data is
+  // cached.
+  private boolean isMarkedCached_ = false;
+  private final TAccessLevel accessLevel_;
 
   public HdfsStorageDescriptor getInputFormatDescriptor() {
-    return fileFormatDescriptor;
+    return fileFormatDescriptor_;
   }
 
   /**
@@ -257,7 +205,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
    * table.
    */
   public org.apache.hadoop.hive.metastore.api.Partition getMetaStorePartition() {
-    return msPartition;
+    return msPartition_;
   }
 
   /**
@@ -288,15 +236,17 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
    * Returns the storage location (HDFS path) of this partition. Should only be called
    * for partitioned tables.
    */
-  public String getLocation() { return location; }
-  public long getId() { return id; }
-  public HdfsTable getTable() { return table; }
-  public void setNumRows(long numRows) { this.numRows = numRows; }
-  public long getNumRows() { return numRows; }
+  public String getLocation() { return location_; }
+  public long getId() { return id_; }
+  public HdfsTable getTable() { return table_; }
+  public void setNumRows(long numRows) { numRows_ = numRows; }
+  public long getNumRows() { return numRows_; }
+  public boolean isMarkedCached() { return isMarkedCached_; }
+  void markCached() { isMarkedCached_ = true; }
 
   // Returns the HDFS permissions Impala has to this partition's directory - READ_ONLY,
   // READ_WRITE, etc.
-  public TAccessLevel getAccessLevel() { return accessLevel; }
+  public TAccessLevel getAccessLevel() { return accessLevel_; }
 
   /**
    * Marks this partition's metadata as "dirty" indicating that changes have been
@@ -309,9 +259,9 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
   /**
    * Returns an immutable list of partition key expressions
    */
-  public List<LiteralExpr> getPartitionValues() { return partitionKeyValues; }
+  public List<LiteralExpr> getPartitionValues() { return partitionKeyValues_; }
   public List<HdfsPartition.FileDescriptor> getFileDescriptors() {
-    return fileDescriptors;
+    return fileDescriptors_;
   }
 
   private HdfsPartition(HdfsTable table,
@@ -320,18 +270,23 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
       HdfsStorageDescriptor fileFormatDescriptor,
       List<HdfsPartition.FileDescriptor> fileDescriptors, long id,
       String location, TAccessLevel accessLevel) {
-    this.table = table;
-    this.msPartition = msPartition;
-    this.location = location;
-    this.partitionKeyValues = ImmutableList.copyOf(partitionKeyValues);
-    this.fileDescriptors = ImmutableList.copyOf(fileDescriptors);
-    this.fileFormatDescriptor = fileFormatDescriptor;
-    this.id = id;
-    this.accessLevel = accessLevel;
+    table_ = table;
+    msPartition_ = msPartition;
+    location_ = location;
+    partitionKeyValues_ = ImmutableList.copyOf(partitionKeyValues);
+    fileDescriptors_ = ImmutableList.copyOf(fileDescriptors);
+    fileFormatDescriptor_ = fileFormatDescriptor;
+    id_ = id;
+    accessLevel_ = accessLevel;
+    if (msPartition != null && msPartition.getParameters() != null) {
+      isMarkedCached_ = HdfsCachingUtil.getCacheDirIdFromParams(
+          msPartition.getParameters()) != null;
+    }
+
     // TODO: instead of raising an exception, we should consider marking this partition
     // invalid and moving on, so that table loading won't fail and user can query other
     // partitions.
-    for (FileDescriptor fileDescriptor: fileDescriptors) {
+    for (FileDescriptor fileDescriptor: fileDescriptors_) {
       String result = checkFileCompressionTypeSupported(fileDescriptor.getFileName());
       if (!result.isEmpty()) {
         throw new RuntimeException(result);
@@ -345,7 +300,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
       HdfsStorageDescriptor fileFormatDescriptor,
       List<HdfsPartition.FileDescriptor> fileDescriptors, TAccessLevel accessLevel) {
     this(table, msPartition, partitionKeyValues, fileFormatDescriptor, fileDescriptors,
-        partitionIdCounter.getAndIncrement(), msPartition != null ?
+        partitionIdCounter_.getAndIncrement(), msPartition != null ?
             msPartition.getSd().getLocation() : table.getLocation(), accessLevel);
   }
 
@@ -396,7 +351,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
    */
   public long getSize() {
     long result = 0;
-    for (HdfsPartition.FileDescriptor fileDescriptor: fileDescriptors) {
+    for (HdfsPartition.FileDescriptor fileDescriptor: fileDescriptors_) {
       result += fileDescriptor.getFileLength();
     }
     return result;
@@ -405,7 +360,7 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
   @Override
   public String toString() {
     return Objects.toStringHelper(this)
-      .add("fileDescriptors", fileDescriptors)
+      .add("fileDescriptors", fileDescriptors_)
       .toString();
   }
 
@@ -441,50 +396,42 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
               clusterCols.size(), exprNodes.size()));
 
       for (int i = 0; i < exprNodes.size(); ++i) {
-        literalExpr.add(TExprNodeToLiteralExpr(
+        literalExpr.add(LiteralExpr.fromThrift(
             exprNodes.get(i), clusterCols.get(i).getType()));
       }
     }
 
-    List<HdfsPartition.FileDescriptor> fileDescriptors = Lists.newArrayList();
+    List<HdfsPartition.FileDescriptor> fileDescriptors_ = Lists.newArrayList();
     if (thriftPartition.isSetFile_desc()) {
       for (THdfsFileDesc desc: thriftPartition.getFile_desc()) {
-        fileDescriptors.add(HdfsPartition.FileDescriptor.fromThrift(desc));
+        fileDescriptors_.add(HdfsPartition.FileDescriptor.fromThrift(desc));
       }
     }
     TAccessLevel accessLevel = thriftPartition.isSetAccess_level() ?
         thriftPartition.getAccess_level() : TAccessLevel.READ_WRITE;
     HdfsPartition partition = new HdfsPartition(table, null, literalExpr, storageDesc,
-        fileDescriptors, id, thriftPartition.getLocation(), accessLevel);
+        fileDescriptors_, id, thriftPartition.getLocation(), accessLevel);
     if (thriftPartition.isSetStats()) {
       partition.setNumRows(thriftPartition.getStats().getNum_rows());
+    }
+    if (thriftPartition.isSetIs_marked_cached()) {
+      partition.isMarkedCached_ = thriftPartition.isIs_marked_cached();
     }
     return partition;
   }
 
-  private static LiteralExpr TExprNodeToLiteralExpr(TExprNode exprNode,
-      ColumnType primitiveType) {
+  /**
+   * Checks that this partition's metadata is well formed. This does not necessarily
+   * mean the partition is supported by Impala.
+   * Throws a CatalogException if there are any errors in the partition metadata.
+   */
+  public void checkWellFormed() throws CatalogException {
     try {
-      switch (exprNode.node_type) {
-        case FLOAT_LITERAL:
-          return (LiteralExpr) (LiteralExpr.create(Double.toString(
-              exprNode.float_literal.value), primitiveType).castTo(primitiveType));
-        case INT_LITERAL:
-          return (LiteralExpr) (LiteralExpr.create(Long.toString(
-              exprNode.int_literal.value), primitiveType).castTo(primitiveType));
-        case STRING_LITERAL:
-          return LiteralExpr.create(exprNode.string_literal.value, primitiveType);
-        case BOOL_LITERAL:
-          return LiteralExpr.create(Boolean.toString(exprNode.bool_literal.value),
-              primitiveType);
-        case NULL_LITERAL:
-          return new NullLiteral();
-        default:
-          throw new UnsupportedOperationException("Unsupported partition key type: " +
-              exprNode.node_type);
-      }
+      // Validate all the partition key/values to ensure you can convert them toThrift()
+      Expr.treesToThrift(getPartitionValues());
     } catch (Exception e) {
-      throw new IllegalStateException("Error creating LiteralExpr: ", e);
+      throw new CatalogException("Partition (" + getPartitionName() +
+          ") has invalid partition column values: ", e);
     }
   }
 
@@ -492,19 +439,21 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
     List<TExpr> thriftExprs = Expr.treesToThrift(getPartitionValues());
 
     THdfsPartition thriftHdfsPart = new THdfsPartition(
-        fileFormatDescriptor.getLineDelim(),
-        fileFormatDescriptor.getFieldDelim(),
-        fileFormatDescriptor.getCollectionDelim(),
-        fileFormatDescriptor.getMapKeyDelim(),
-        fileFormatDescriptor.getEscapeChar(),
-        fileFormatDescriptor.getFileFormat().toThrift(), thriftExprs,
-        fileFormatDescriptor.getBlockSize(), fileFormatDescriptor.getCompression());
-    thriftHdfsPart.setLocation(location);
-    thriftHdfsPart.setStats(new TTableStats(numRows));
-    thriftHdfsPart.setAccess_level(accessLevel);
+        fileFormatDescriptor_.getLineDelim(),
+        fileFormatDescriptor_.getFieldDelim(),
+        fileFormatDescriptor_.getCollectionDelim(),
+        fileFormatDescriptor_.getMapKeyDelim(),
+        fileFormatDescriptor_.getEscapeChar(),
+        fileFormatDescriptor_.getFileFormat().toThrift(), thriftExprs,
+        fileFormatDescriptor_.getBlockSize(), fileFormatDescriptor_.getCompression());
+    thriftHdfsPart.setLocation(location_);
+    thriftHdfsPart.setStats(new TTableStats(numRows_));
+    thriftHdfsPart.setAccess_level(accessLevel_);
+    thriftHdfsPart.setIs_marked_cached(isMarkedCached_);
+    thriftHdfsPart.setId(getId());
     if (includeFileDescriptorMetadata) {
       // Add block location information
-      for (FileDescriptor fd: fileDescriptors) {
+      for (FileDescriptor fd: fileDescriptors_) {
         thriftHdfsPart.addToFile_desc(fd.toThrift());
       }
     }
@@ -517,10 +466,10 @@ public class HdfsPartition implements Comparable<HdfsPartition> {
    */
   @Override
   public int compareTo(HdfsPartition o) {
-    int sizeDiff = partitionKeyValues.size() - o.getPartitionValues().size();
+    int sizeDiff = partitionKeyValues_.size() - o.getPartitionValues().size();
     if (sizeDiff != 0) return sizeDiff;
-    for (int i = 0; i < partitionKeyValues.size(); ++i) {
-      int cmp = partitionKeyValues.get(i).compareTo(o.getPartitionValues().get(i));
+    for (int i = 0; i < partitionKeyValues_.size(); ++i) {
+      int cmp = partitionKeyValues_.get(i).compareTo(o.getPartitionValues().get(i));
       if (cmp != 0) return cmp;
     }
     return 0;

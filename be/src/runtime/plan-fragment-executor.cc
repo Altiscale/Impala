@@ -73,10 +73,10 @@ PlanFragmentExecutor::~PlanFragmentExecutor() {
 Status PlanFragmentExecutor::Prepare(const TExecPlanFragmentParams& request) {
   fragment_sw_.Start();
   const TPlanFragmentExecParams& params = request.params;
-  query_id_ = params.query_id;
+  query_id_ = request.fragment_instance_ctx.query_ctx.query_id;
 
   VLOG_QUERY << "Prepare(): query_id=" << PrintId(query_id_) << " instance_id="
-             << PrintId(params.fragment_instance_id);
+             << PrintId(request.fragment_instance_ctx.fragment_instance_id);
   VLOG(2) << "params:\n" << ThriftDebugString(params);
 
   if (request.__isset.reserved_resource) {
@@ -89,14 +89,14 @@ Status PlanFragmentExecutor::Prepare(const TExecPlanFragmentParams& request) {
     cgroup = exec_env_->cgroups_mgr()->UniqueIdToCgroup(PrintId(query_id_, "_"));
   }
 
-  runtime_state_.reset(new RuntimeState(query_id_, params.fragment_instance_id,
-      request.query_ctxt, cgroup, exec_env_));
+  runtime_state_.reset(
+      new RuntimeState(request.fragment_instance_ctx, cgroup, exec_env_));
 
   // Register after setting runtime_state_ to ensure proper cleanup.
   if (FLAGS_enable_rm && !cgroup.empty() && request.__isset.reserved_resource) {
     bool is_first;
     RETURN_IF_ERROR(exec_env_->cgroups_mgr()->RegisterFragment(
-        params.fragment_instance_id, cgroup, &is_first));
+        request.fragment_instance_ctx.fragment_instance_id, cgroup, &is_first));
     // The first fragment using cgroup sets the cgroup's CPU shares based on the reserved
     // resource.
     if (is_first) {
@@ -131,11 +131,11 @@ Status PlanFragmentExecutor::Prepare(const TExecPlanFragmentParams& request) {
         static_cast<int64_t>(request.reserved_resource.memory_mb) * 1024L * 1024L;
     VLOG_QUERY << "Using query memory limit from resource reservation: "
         << PrettyPrinter::Print(bytes_limit, TCounterType::BYTES);
-  } else if (request.query_ctxt.request.query_options.__isset.mem_limit &&
-      request.query_ctxt.request.query_options.mem_limit > 0) {
-    bytes_limit = request.query_ctxt.request.query_options.mem_limit;
+  } else if (runtime_state_->query_options().__isset.mem_limit &&
+      runtime_state_->query_options().mem_limit > 0) {
+    bytes_limit = runtime_state_->query_options().mem_limit;
     VLOG_QUERY << "Using query memory limit from query options: "
-        << PrettyPrinter::Print(bytes_limit, TCounterType::BYTES);
+               << PrettyPrinter::Print(bytes_limit, TCounterType::BYTES);
   }
 
   DCHECK(!params.request_pool.empty());
@@ -167,13 +167,15 @@ Status PlanFragmentExecutor::Prepare(const TExecPlanFragmentParams& request) {
   RETURN_IF_ERROR(
       DescriptorTbl::Create(obj_pool(), request.desc_tbl, &desc_tbl));
   runtime_state_->set_desc_tbl(desc_tbl);
-  VLOG_QUERY << "descriptor table for fragment=" << params.fragment_instance_id
-      << "\n" << desc_tbl->DebugString();
+  VLOG_QUERY << "descriptor table for fragment="
+             << request.fragment_instance_ctx.fragment_instance_id
+             << "\n" << desc_tbl->DebugString();
 
   // set up plan
   DCHECK(request.__isset.fragment);
   RETURN_IF_ERROR(
       ExecNode::CreateTree(obj_pool(), request.fragment.plan, *desc_tbl, &plan_));
+  runtime_state_->set_fragment_root_id(plan_->id());
 
   if (request.params.__isset.debug_node_id) {
     DCHECK(request.params.__isset.debug_action);
@@ -235,14 +237,14 @@ Status PlanFragmentExecutor::Prepare(const TExecPlanFragmentParams& request) {
 
   row_batch_.reset(new RowBatch(plan_->row_desc(), runtime_state_->batch_size(),
         runtime_state_->instance_mem_tracker()));
-  VLOG(3) << "plan_root=\n" << plan_->DebugString();
+  VLOG(2) << "plan_root=\n" << plan_->DebugString();
   prepared_ = true;
   return Status::OK;
 }
 
 void PlanFragmentExecutor::OptimizeLlvmModule() {
   if (runtime_state_->codegen() == NULL) return;
-  Status status = runtime_state_->codegen()->OptimizeModule();
+  Status status = runtime_state_->codegen()->FinalizeModule();
   if (!status.ok()) {
     stringstream ss;
     ss << "Error with codegen for this query: " << status.GetErrorMsg();
@@ -286,6 +288,8 @@ Status PlanFragmentExecutor::Open() {
     report_thread_started_cv_.wait(l);
     report_thread_active_ = true;
   }
+
+  OptimizeLlvmModule();
 
   Status status = OpenInternal();
   if (!status.ok() && !status.IsCancelled() && !status.IsMemLimitExceeded()) {
@@ -529,8 +533,9 @@ void PlanFragmentExecutor::Close() {
     }
     if (plan_ != NULL) plan_->Close(runtime_state_.get());
     if (sink_.get() != NULL) sink_->Close(runtime_state());
-    BOOST_FOREACH(DiskIoMgr::ReaderContext* reader, *runtime_state_->reader_contexts()) {
-      runtime_state_->io_mgr()->UnregisterReader(reader);
+    BOOST_FOREACH(DiskIoMgr::RequestContext* context,
+        *runtime_state_->reader_contexts()) {
+      runtime_state_->io_mgr()->UnregisterContext(context);
     }
     exec_env_->thread_mgr()->UnregisterPool(runtime_state_->resource_pool());
   }

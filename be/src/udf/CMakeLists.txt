@@ -41,7 +41,7 @@ set (UDF_TEST_LINK_LIBS
   ${Boost_LIBRARIES}
   glogstatic
   gflagsstatic
-  -lboost_date_time-mt
+  -lboost_date_time
   gtest)
   
 ADD_EXECUTABLE(udf-test udf-test.cc)

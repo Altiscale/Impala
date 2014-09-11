@@ -66,8 +66,20 @@ DEFINE_bool(enable_ldap_auth, false,
 DEFINE_string(ldap_uri, "", "The URI of the LDAP server to authenticate users against");
 DEFINE_bool(ldap_tls, false, "If true, use the secure TLS protocol to connect to the LDAP"
     " server");
+DEFINE_string(ldap_ca_certificate, "", "The full path to the certificate file used to"
+    " authenticate the LDAP server's certificate for SSL / TLS connections.");
+DEFINE_bool(ldap_allow_anonymous_binds, false, "(Advanced) If true, LDAP authentication "
+    "with a blank password (an 'anonymous bind') is allowed by Impala.");
 DEFINE_bool(ldap_manual_config, false, "(Advanced) If true, use a custom SASL config file"
     " to configure access to an LDAP server.");
+DEFINE_string(ldap_domain, "", "If set, Impala will try to bind to LDAP with a name of "
+    "the form <userid>@<ldap_domain>");
+DEFINE_string(ldap_baseDN, "", "If set, Impala will try to bind to LDAP with a name of "
+    "the form uid=<userid>,<ldap_baseDN>");
+DEFINE_string(ldap_bind_pattern, "", "If set, Impala will try to bind to LDAP with a name"
+     " of <ldap_bind_pattern>, but where the string #UID is replaced by the user ID. Use"
+     " to control the bind name precisely; do not set --ldap_domain or --ldap_baseDN with"
+     " this option");
 
 namespace impala {
 
@@ -128,11 +140,16 @@ static int SaslLogCallback(void* context, int level,  const char* message) {
 //
 // Note that this method uses ldap_simple_bind_s(), which does *not* provide any security
 // to the connection between Impala and the LDAP server. You must either set --ldap_tls,
-// or --ldap_manual_config; the former uses TLS to secure the transport, the latter allows
-// users to write a standard SASL configuration file for custom setups and will bypass
-// this method.
+// or have a URI which has "ldaps://" as the scheme in order to get a secure connection.
+// Use --ldap_ca_certificate to specify the location of the certificate used to confirm
+// the authenticity of the LDAP server certificate.
 int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
     const char *pass, unsigned passlen, struct propctx *propctx) {
+  if (passlen == 0 && !FLAGS_ldap_allow_anonymous_binds) {
+    // Disable anonymous binds.
+    return SASL_FAIL;
+  }
+
   LDAP* ld;
   int rc = ldap_initialize(&ld, FLAGS_ldap_uri.c_str());
   if (rc != LDAP_SUCCESS) {
@@ -144,6 +161,7 @@ int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
   // Force the LDAP version to 3 to make sure TLS is supported.
   int ldap_ver = 3;
   ldap_set_option(ld, LDAP_OPT_PROTOCOL_VERSION, &ldap_ver);
+
   if (FLAGS_ldap_tls) {
     int tls_rc = ldap_start_tls_s(ld, NULL, NULL);
     if (tls_rc != LDAP_SUCCESS) {
@@ -152,13 +170,32 @@ int SaslLdapCheckPass(sasl_conn_t* conn, void* context, const char* user,
       ldap_unbind(ld);
       return SASL_FAIL;
     }
+    LOG(INFO) << "Started TLS connection with LDAP server: " << FLAGS_ldap_uri;
   }
 
   string pass_str(pass, passlen);
-  rc = ldap_simple_bind_s(ld, user, pass_str.c_str());
+
+  string user_str = user;
+  if (!FLAGS_ldap_domain.empty()) {
+    user_str = Substitute("$0@$1", user_str, FLAGS_ldap_domain);
+  } else if (!FLAGS_ldap_baseDN.empty()) {
+    user_str = Substitute("uid=$0,$1", user_str, FLAGS_ldap_baseDN);
+  } else if (!FLAGS_ldap_bind_pattern.empty()) {
+    user_str = FLAGS_ldap_bind_pattern;
+    replace_all(user_str, "#UID", user);
+  }
+
+  VLOG_QUERY << "Trying simple LDAP bind for: " << user_str;
+
+  rc = ldap_simple_bind_s(ld, user_str.c_str(), pass_str.c_str());
   // Free ld
   ldap_unbind(ld);
-  if (rc != LDAP_SUCCESS) return SASL_FAIL;
+  if (rc != LDAP_SUCCESS) {
+    LOG(WARNING) << "LDAP bind failed: " << ldap_err2string(rc);
+    return SASL_FAIL;
+  }
+
+  VLOG_QUERY << "LDAP bind successful";
 
   return SASL_OK;
 }
@@ -488,6 +525,26 @@ Status LdapAuthProvider::Start() {
   sasl_callbacks_[4].context = NULL;
   sasl_callbacks_[sasl_callbacks_.size() - 1].id = SASL_CB_LIST_END;
 
+  if (!FLAGS_ldap_ca_certificate.empty()) {
+    int set_rc = ldap_set_option(NULL, LDAP_OPT_X_TLS_CACERTFILE,
+        FLAGS_ldap_ca_certificate.c_str());
+    if (set_rc != LDAP_SUCCESS) {
+      return Status(Substitute("Could not set location of LDAP server cert: $0",
+          ldap_err2string(set_rc)));
+    }
+  } else {
+    LOG(INFO) << "No certificate file specified for LDAP, will not check certificate for"
+              <<" authentication";
+    int val = LDAP_OPT_X_TLS_ALLOW;
+    int set_rc = ldap_set_option(NULL, LDAP_OPT_X_TLS_REQUIRE_CERT,
+        reinterpret_cast<void*>(&val));
+    if (set_rc != LDAP_SUCCESS) {
+      return Status(Substitute(
+          "Could not disable certificate requirement for LDAP server: $0",
+          ldap_err2string(set_rc)));
+    }
+  }
+
   return Status::OK;
 }
 
@@ -527,6 +584,21 @@ Status AuthManager::Init() {
   // Client-side uses LDAP if enabled, else Kerberos if FLAGS_principal is set, otherwise
   // a NoAuthProvider.
   if (FLAGS_enable_ldap_auth) {
+    const string err_msg = "--$0 and --$1 are mutually exclusive and should not be set"
+        " together";
+    if (!FLAGS_ldap_domain.empty()) {
+      if (!FLAGS_ldap_baseDN.empty()) {
+        return Status(Substitute(err_msg, "ldap_domain", "ldap_baseDN"));
+      }
+      if (!FLAGS_ldap_bind_pattern.empty()) {
+        return Status(Substitute(err_msg, "ldap_domain", "ldap_bind_pattern"));
+      }
+    } else if (!FLAGS_ldap_baseDN.empty()) {
+      if (!FLAGS_ldap_bind_pattern.empty()) {
+        return Status(Substitute(err_msg, "ldap_baseDN", "ldap_bind_pattern"));
+      }
+    }
+
     client_auth_provider_.reset(new LdapAuthProvider());
     // We only want to register the plugin once for the whole application, so don't
     // register inside the LdapAuthProvider() instructor.

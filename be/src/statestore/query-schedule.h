@@ -50,6 +50,11 @@ struct FragmentExecParams {
   std::vector<TPlanFragmentDestination> destinations;
   std::map<PlanNodeId, int> per_exch_num_senders;
   FragmentScanRangeAssignment scan_range_assignment;
+  // In its role as a data sender, a fragment instance is assigned a "sender id" to
+  // uniquely identify it to a receiver. The id that a particular fragment instance
+  // is assigned ranges from [sender_id_base, sender_id_base + N - 1], where
+  // N = hosts.size (i.e. N = number of fragment instances)
+  int sender_id_base;
 };
 // A QuerySchedule contains all necessary information for a query coordinator to
 // generate fragment execution requests and start query execution. If resource management
@@ -62,8 +67,8 @@ struct FragmentExecParams {
 class QuerySchedule {
  public:
   QuerySchedule(const TUniqueId& query_id, const TQueryExecRequest& request,
-      const TQueryOptions& query_options, RuntimeProfile* summary_profile,
-      RuntimeProfile::EventSequence* query_events);
+      const TQueryOptions& query_options, const std::string& effective_user,
+      RuntimeProfile* summary_profile, RuntimeProfile::EventSequence* query_events);
 
   // Returns OK if reservation_ contains a matching resource for each
   // of the hosts in fragment_exec_params_. Returns an error otherwise.
@@ -72,6 +77,7 @@ class QuerySchedule {
   const TUniqueId& query_id() const { return query_id_; }
   const TQueryExecRequest& request() const { return request_; }
   const TQueryOptions& query_options() const { return query_options_; }
+  const std::string& effective_user() const { return effective_user_; }
   const std::string& request_pool() const { return request_pool_; }
   void set_request_pool(const std::string& pool_name) { request_pool_ = pool_name; }
   bool HasReservation() const { return !reservation_.allocated_resources.empty(); }
@@ -127,7 +133,7 @@ class QuerySchedule {
   const TUniqueId& query_id_;
   const TQueryExecRequest& request_;
   const TQueryOptions& query_options_;
-  bool is_mini_llama_;
+  const std::string effective_user_;
   RuntimeProfile* summary_profile_;
   RuntimeProfile::EventSequence* query_events_;
 

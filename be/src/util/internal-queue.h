@@ -23,8 +23,8 @@ namespace impala {
 
 // Thread safe fifo-queue. This is an internal queue, meaning the links to nodes
 // are maintained in the object itself. This is in contrast to the stl list which
-// allocates a wrapper Node object around the data. Since it's an internal queue, 
-// the list pointers are maintained in the Nodes which is memory owned by the user. 
+// allocates a wrapper Node object around the data. Since it's an internal queue,
+// the list pointers are maintained in the Nodes which is memory owned by the user.
 // The nodes cannot be deallocated while the queue has elements.
 // To use: subclass InternalQueue::Node.
 // The internal structure is a doubly-linked list.
@@ -38,10 +38,11 @@ class InternalQueue {
   struct Node {
    public:
     Node() : parent_queue(NULL), next(NULL), prev(NULL) {}
+    virtual ~Node() {}
 
    private:
     friend class InternalQueue;
-    
+
     // Pointer to the queue this Node is on. NULL if not on any queue.
     InternalQueue* parent_queue;
     Node* next;
@@ -51,7 +52,8 @@ class InternalQueue {
   InternalQueue() : head_(NULL), tail_(NULL), size_(0) {}
 
   // Enqueue node onto the queue's tail. This is O(1).
-  void Enqueue(T* node) {
+  void Enqueue(T* n) {
+    Node* node = (Node*)n;
     DCHECK(node->next == NULL);
     DCHECK(node->prev == NULL);
     DCHECK(node->parent_queue == NULL);
@@ -77,12 +79,12 @@ class InternalQueue {
   // Dequeues an element from the queue's head. Returns NULL if the queue
   // is empty. This is O(1).
   T* Dequeue() {
-    T* result = NULL;
+    Node* result = NULL;
     {
       ScopedSpinLock lock(&lock_);
       if (empty()) return NULL;
       --size_;
-      result = reinterpret_cast<T*>(head_);
+      result = head_;
       head_ = head_->next;
       if (head_ == NULL) {
         tail_ = NULL;
@@ -93,17 +95,18 @@ class InternalQueue {
     DCHECK(result != NULL);
     result->next = result->prev = NULL;
     result->parent_queue = NULL;
-    return result;
+    return reinterpret_cast<T*>(result);
   }
 
   // Removes 'node' from the queue. This is O(1). No-op if node is
   // not on the list.
-  void Remove(T* node) {
+  void Remove(T* n) {
+    Node* node = (Node*)n;
     if (node->parent_queue == NULL) return;
     DCHECK(node->parent_queue == this);
     {
       ScopedSpinLock lock(&lock_);
-      if (node->next == NULL && node->prev == NULL) { 
+      if (node->next == NULL && node->prev == NULL) {
         // Removing only node
         DCHECK(node == head_);
         DCHECK(tail_ == node);
@@ -152,7 +155,7 @@ class InternalQueue {
 
   // Returns if the target is on the queue. This is O(1) and intended to
   // be used for debugging.
-  bool Contains(Node* target) {
+  bool Contains(const T* target) const {
     return target->parent_queue == this;
   }
 

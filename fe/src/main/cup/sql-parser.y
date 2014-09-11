@@ -15,12 +15,14 @@
 package com.cloudera.impala.analysis;
 
 import com.cloudera.impala.catalog.ColumnType;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.RowFormat;
 import com.cloudera.impala.analysis.UnionStmt.UnionOperand;
 import com.cloudera.impala.analysis.UnionStmt.Qualifier;
 import com.cloudera.impala.thrift.TDescribeTableOutputStyle;
 import com.cloudera.impala.thrift.THdfsFileFormat;
 import com.cloudera.impala.thrift.TTablePropertyType;
+import java.math.BigDecimal;
 import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -29,11 +31,16 @@ import java_cup.runtime.Symbol;
 import com.google.common.collect.Lists;
 
 parser code {:
-  private Symbol errorToken;
+  private Symbol errorToken_;
+
+  // Set if the errorToken_ to be printed in the error message has a different name, e.g.
+  // when parsing identifiers instead of defined keywords. This is necessary to avoid
+  // conflicting keywords.
+  private String expectedTokenName_;
 
   // list of expected tokens ids from current parsing state
   // for generating syntax error message
-  private final List<Integer> expectedTokenIds = new ArrayList<Integer>();
+  private final List<Integer> expectedTokenIds_ = new ArrayList<Integer>();
 
   // to avoid reporting trivial tokens as expected tokens in error messages
   private boolean reportExpectedToken(Integer tokenId) {
@@ -64,10 +71,10 @@ parser code {:
 
   // override to save error token
   public void syntax_error(java_cup.runtime.Symbol token) {
-    errorToken = token;
+    errorToken_ = token;
 
     // derive expected tokens from current parsing state
-    expectedTokenIds.clear();
+    expectedTokenIds_.clear();
     int state = ((Symbol)stack.peek()).parse_state;
     // get row of actions table corresponding to current parsing state
     // the row consists of pairs of <tokenId, actionId>
@@ -80,7 +87,7 @@ parser code {:
     for (int i = 0; i < row.length-2; ++i) {
       // get tokenId and skip actionId
       tokenId = row[i++];
-      expectedTokenIds.add(Integer.valueOf(tokenId));
+      expectedTokenIds_.add(Integer.valueOf(tokenId));
     }
   }
 
@@ -100,6 +107,16 @@ parser code {:
    *   id of symbol from SqlParserSymbols on which to fail parsing
    */
   public void parseError(String symbolName, int symbolId) throws Exception {
+    parseError(symbolName, symbolId, null);
+  }
+
+  /**
+   * Same as parseError() above but allows the error token to have a different
+   * name printed as the expected token.
+   */
+  public void parseError(String symbolName, int symbolId, String expectedTokenName)
+      throws Exception {
+    expectedTokenName_ = expectedTokenName;
     Symbol errorToken = getSymbolFactory().newSymbol(symbolName, symbolId,
         ((Symbol) stack.peek()), ((Symbol) stack.peek()), null);
     // Call syntax error to gather information about expected tokens, etc.
@@ -113,42 +130,42 @@ parser code {:
   // with a '^' under the offending token. Assumes
   // that parse() has been called and threw an exception
   public String getErrorMsg(String stmt) {
-    if (errorToken == null || stmt == null) return null;
+    if (errorToken_ == null || stmt == null) return null;
     String[] lines = stmt.split("\n");
     StringBuffer result = new StringBuffer();
-    result.append(getErrorTypeMessage(errorToken.sym) + " in line ");
-    result.append(errorToken.left);
+    result.append(getErrorTypeMessage(errorToken_.sym) + " in line ");
+    result.append(errorToken_.left);
     result.append(":\n");
 
-    // errorToken.left is the line number of error.
-    // errorToken.right is the column number of the error.
-    String errorLine = lines[errorToken.left - 1];
-    // If the error is that additional tokens are expected past the end, errorToken.right
-    // will be past the end of the string.
-    int lastCharIndex = Math.min(errorLine.length(), errorToken.right);
+    // errorToken_.left is the line number of error.
+    // errorToken_.right is the column number of the error.
+    String errorLine = lines[errorToken_.left - 1];
+    // If the error is that additional tokens are expected past the end,
+    // errorToken_.right will be past the end of the string.
+    int lastCharIndex = Math.min(errorLine.length(), errorToken_.right);
     int maxPrintLength = 60;
     int errorLoc = 0;
     if (errorLine.length() <= maxPrintLength) {
       // The line is short. Print the entire line.
       result.append(errorLine);
       result.append('\n');
-      errorLoc = errorToken.right;
+      errorLoc = errorToken_.right;
     } else {
       // The line is too long. Print maxPrintLength/2 characters before the error and
       // after the error.
       int contextLength = maxPrintLength / 2 - 3;
       String leftSubStr;
-      if (errorToken.right > maxPrintLength / 2) {
-        leftSubStr = "..." + errorLine.substring(errorToken.right - contextLength,
+      if (errorToken_.right > maxPrintLength / 2) {
+        leftSubStr = "..." + errorLine.substring(errorToken_.right - contextLength,
             lastCharIndex);
       } else {
-        leftSubStr = errorLine.substring(0, errorToken.right);
+        leftSubStr = errorLine.substring(0, errorToken_.right);
       }
       errorLoc = leftSubStr.length();
       result.append(leftSubStr);
-      if (errorLine.length() - errorToken.right > maxPrintLength / 2) {
-        result.append(errorLine.substring(errorToken.right,
-           errorToken.right + contextLength) + "...");
+      if (errorLine.length() - errorToken_.right > maxPrintLength / 2) {
+        result.append(errorLine.substring(errorToken_.right,
+           errorToken_.right + contextLength) + "...");
       } else {
         result.append(errorLine.substring(lastCharIndex));
       }
@@ -162,35 +179,39 @@ parser code {:
     result.append("^\n");
 
     // only report encountered and expected tokens for syntax errors
-    if (errorToken.sym == SqlParserSymbols.UNMATCHED_STRING_LITERAL ||
-        errorToken.sym == SqlParserSymbols.NUMERIC_OVERFLOW) {
+    if (errorToken_.sym == SqlParserSymbols.UNMATCHED_STRING_LITERAL ||
+        errorToken_.sym == SqlParserSymbols.NUMERIC_OVERFLOW) {
       return result.toString();
     }
 
     // append last encountered token
     result.append("Encountered: ");
     String lastToken =
-      SqlScanner.tokenIdMap.get(Integer.valueOf(errorToken.sym));
+      SqlScanner.tokenIdMap.get(Integer.valueOf(errorToken_.sym));
     if (lastToken != null) {
       result.append(lastToken);
     } else {
-      result.append("Unknown last token with id: " + errorToken.sym);
+      result.append("Unknown last token with id: " + errorToken_.sym);
     }
 
     // append expected tokens
     result.append('\n');
     result.append("Expected: ");
-    String expectedToken = null;
-    Integer tokenId = null;
-    for (int i = 0; i < expectedTokenIds.size(); ++i) {
-      tokenId = expectedTokenIds.get(i);
-      if (reportExpectedToken(tokenId)) {
-       expectedToken = SqlScanner.tokenIdMap.get(tokenId);
-         result.append(expectedToken + ", ");
+    if (expectedTokenName_ == null) {
+      String expectedToken = null;
+      Integer tokenId = null;
+      for (int i = 0; i < expectedTokenIds_.size(); ++i) {
+        tokenId = expectedTokenIds_.get(i);
+        if (reportExpectedToken(tokenId)) {
+          expectedToken = SqlScanner.tokenIdMap.get(tokenId);
+          result.append(expectedToken + ", ");
+        }
       }
+      // remove trailing ", "
+      result.delete(result.length()-2, result.length());
+    } else {
+      result.append(expectedTokenName_);
     }
-    // remove trailing ", "
-    result.delete(result.length()-2, result.length());
     result.append('\n');
 
     return result.toString();
@@ -199,25 +220,25 @@ parser code {:
 
 // List of keywords. Please keep them sorted alphabetically.
 terminal
-  KW_ADD, KW_AGGREGATE, KW_ALL, KW_ALTER, KW_AND, KW_AS, KW_ASC, KW_AVRO, KW_BETWEEN,
-  KW_BIGINT, KW_BINARY, KW_BOOLEAN, KW_BY, KW_CASE, KW_CAST, KW_CHANGE, KW_CHAR,
-  KW_CLOSE_FN, KW_COLUMN, KW_COLUMNS, KW_COMMENT, KW_COMPUTE, KW_CREATE, KW_CROSS,
-  KW_DATA, KW_DATABASE, KW_DATABASES, KW_DATE, KW_DATETIME, KW_DECIMAL, KW_DELIMITED,
-  KW_DESC, KW_DESCRIBE, KW_DISTINCT, KW_DIV, KW_DOUBLE, KW_DROP, KW_ELSE, KW_END,
-  KW_ESCAPED, KW_EXISTS, KW_EXPLAIN, KW_EXTERNAL, KW_FALSE, KW_FIELDS, KW_FILEFORMAT,
-  KW_FINALIZE_FN, KW_FIRST, KW_FLOAT, KW_FORMAT, KW_FORMATTED, KW_FROM, KW_FULL,
-  KW_FUNCTION, KW_FUNCTIONS, KW_GROUP, KW_HAVING, KW_IF, KW_IN, KW_INIT_FN, KW_INNER,
-  KW_INPATH, KW_INSERT, KW_INT, KW_INTERMEDIATE, KW_INTERVAL, KW_INTO, KW_INVALIDATE,
-  KW_IS, KW_JOIN, KW_LAST, KW_LEFT, KW_LIKE, KW_LIMIT, KW_LINES, KW_LOAD, KW_LOCATION,
-  KW_MERGE_FN, KW_METADATA, KW_NOT, KW_NULL, KW_NULLS, KW_OFFSET, KW_ON, KW_OR,
-  KW_ORDER, KW_OUTER, KW_OVERWRITE, KW_PARQUET, KW_PARQUETFILE, KW_PARTITION,
-  KW_PARTITIONED, KW_PREPARE_FN, KW_RCFILE, KW_REFRESH, KW_REGEXP, KW_RENAME,
-  KW_REPLACE, KW_RETURNS, KW_RIGHT, KW_RLIKE, KW_ROW, KW_SCHEMA, KW_SCHEMAS, KW_SELECT,
-  KW_SEMI, KW_SEQUENCEFILE, KW_SERDEPROPERTIES, KW_SERIALIZE_FN, KW_SET, KW_SHOW,
-  KW_SMALLINT, KW_STORED, KW_STRAIGHT_JOIN, KW_STRING, KW_SYMBOL, KW_TABLE, KW_TABLES,
-  KW_TBLPROPERTIES, KW_TERMINATED, KW_TEXTFILE, KW_THEN, KW_TIMESTAMP, KW_TINYINT,
-  KW_STATS, KW_TO, KW_TRUE, KW_UNION, KW_UPDATE_FN, KW_USE, KW_USING, KW_VALUES,
-  KW_VIEW, KW_WHEN, KW_WHERE, KW_WITH;
+  KW_ADD, KW_AGGREGATE, KW_ALL, KW_ALTER, KW_AND, KW_API_VERSION, KW_AS, KW_ASC, KW_AVRO,
+  KW_BETWEEN, KW_BIGINT, KW_BINARY, KW_BOOLEAN, KW_BY, KW_CACHED, KW_CASE, KW_CAST,
+  KW_CHANGE, KW_CHAR, KW_CLASS, KW_CLOSE_FN, KW_COLUMN, KW_COLUMNS, KW_COMMENT,
+  KW_COMPUTE, KW_CREATE, KW_CROSS, KW_DATA, KW_DATABASE, KW_DATABASES, KW_DATE,
+  KW_DATETIME, KW_DECIMAL, KW_DELIMITED, KW_DESC, KW_DESCRIBE, KW_DISTINCT, KW_DIV,
+  KW_DOUBLE, KW_DROP, KW_ELSE, KW_END, KW_ESCAPED, KW_EXISTS, KW_EXPLAIN, KW_EXTERNAL,
+  KW_FALSE, KW_FIELDS, KW_FILEFORMAT, KW_FINALIZE_FN, KW_FIRST, KW_FLOAT, KW_FORMAT,
+  KW_FORMATTED, KW_FROM, KW_FULL, KW_FUNCTION, KW_FUNCTIONS, KW_GROUP, KW_HAVING, KW_IF,
+  KW_IN, KW_INIT_FN, KW_INNER, KW_INPATH, KW_INSERT, KW_INT, KW_INTERMEDIATE, KW_INTERVAL,
+  KW_INTO, KW_INVALIDATE, KW_IS, KW_JOIN, KW_LAST, KW_LEFT, KW_LIKE, KW_LIMIT, KW_LINES,
+  KW_LOAD, KW_LOCATION, KW_MERGE_FN, KW_METADATA, KW_NOT, KW_NULL, KW_NULLS, KW_OFFSET,
+  KW_ON, KW_OR, KW_ORDER, KW_OUTER, KW_OVERWRITE, KW_PARQUET, KW_PARQUETFILE,
+  KW_PARTITION, KW_PARTITIONED, KW_PARTITIONS, KW_PREPARE_FN, KW_PRODUCED, KW_RCFILE,
+  KW_REFRESH, KW_REGEXP, KW_RENAME, KW_REPLACE, KW_RETURNS, KW_RIGHT, KW_RLIKE, KW_ROW,
+  KW_SCHEMA, KW_SCHEMAS, KW_SELECT, KW_SEMI, KW_SEQUENCEFILE, KW_SERDEPROPERTIES,
+  KW_SERIALIZE_FN, KW_SET, KW_SHOW, KW_SMALLINT, KW_STORED, KW_STRAIGHT_JOIN, KW_STRING,
+  KW_SYMBOL, KW_TABLE, KW_TABLES, KW_TBLPROPERTIES, KW_TERMINATED, KW_TEXTFILE, KW_THEN,
+  KW_TIMESTAMP, KW_TINYINT, KW_STATS, KW_TO, KW_TRUE,KW_UNCACHED, KW_UNION, KW_UPDATE_FN,
+  KW_USE, KW_USING, KW_VALUES, KW_VIEW, KW_WHEN, KW_WHERE, KW_WITH;
 
 terminal COMMA, DOT, DOTDOTDOT, STAR, LPAREN, RPAREN, LBRACKET, RBRACKET,
   DIVIDE, MOD, ADD, SUBTRACT;
@@ -226,7 +247,7 @@ terminal EQUAL, NOT, LESSTHAN, GREATERTHAN;
 terminal String IDENT;
 terminal String NUMERIC_OVERFLOW;
 terminal BigInteger INTEGER_LITERAL;
-terminal Double FLOATINGPOINT_LITERAL;
+terminal BigDecimal DECIMAL_LITERAL;
 terminal String STRING_LITERAL;
 terminal String UNMATCHED_STRING_LITERAL;
 
@@ -248,6 +269,7 @@ nonterminal List<UnionOperand> values_operand_list;
 nonterminal UseStmt use_stmt;
 nonterminal ShowTablesStmt show_tables_stmt;
 nonterminal ShowDbsStmt show_dbs_stmt;
+nonterminal ShowPartitionsStmt show_partitions_stmt;
 nonterminal ShowStatsStmt show_stats_stmt;
 nonterminal String show_pattern;
 nonterminal DescribeStmt describe_stmt;
@@ -279,7 +301,8 @@ nonterminal OrderByElement order_by_element;
 nonterminal Boolean opt_order_param;
 nonterminal Boolean opt_nulls_order_param;
 nonterminal Expr opt_offset_param;
-nonterminal LimitElement opt_limit_clause;
+nonterminal LimitElement opt_limit_offset_clause;
+nonterminal Expr opt_limit_clause, opt_offset_clause;
 nonterminal Expr cast_expr, case_else_clause;
 nonterminal LiteralExpr literal;
 nonterminal CaseExpr case_expr;
@@ -300,6 +323,9 @@ nonterminal ColumnType column_type;
 nonterminal Expr sign_chain_expr;
 nonterminal InsertStmt insert_stmt;
 nonterminal StatementBase explain_stmt;
+// Optional partition spec
+nonterminal PartitionSpec opt_partition_spec;
+// Required partition spec
 nonterminal PartitionSpec partition_spec;
 nonterminal ArrayList<PartitionKeyValue> partition_clause;
 nonterminal ArrayList<PartitionKeyValue> static_partition_key_value_list;
@@ -316,14 +342,20 @@ nonterminal DropTableOrViewStmt drop_tbl_or_view_stmt;
 nonterminal CreateDbStmt create_db_stmt;
 nonterminal CreateTableAsSelectStmt create_tbl_as_select_stmt;
 nonterminal CreateTableLikeStmt create_tbl_like_stmt;
+nonterminal CreateTableLikeFileStmt create_tbl_like_file_stmt;
 nonterminal CreateTableStmt create_tbl_stmt;
 nonterminal CreateViewStmt create_view_stmt;
+nonterminal CreateDataSrcStmt create_data_src_stmt;
+nonterminal DropDataSrcStmt drop_data_src_stmt;
+nonterminal ShowDataSrcsStmt show_data_srcs_stmt;
 nonterminal ColumnDesc column_def, view_column_def;
 nonterminal ArrayList<ColumnDesc> column_def_list, view_column_def_list;
 nonterminal ArrayList<ColumnDesc> partition_column_defs, view_column_defs;
 // Options for DDL commands - CREATE/DROP/ALTER
+nonterminal HdfsCachingOp cache_op_val;
 nonterminal String comment_val;
 nonterminal Boolean external_val;
+nonterminal String opt_init_string_val;
 nonterminal THdfsFileFormat file_format_val;
 nonterminal THdfsFileFormat file_format_create_table_val;
 nonterminal Boolean if_exists_val;
@@ -347,6 +379,11 @@ nonterminal String optional_kw_column;
 // Used to simplify commands where KW_TABLE is optional
 nonterminal String opt_kw_table;
 nonterminal Boolean overwrite_val;
+
+// Used to parse 'SOURCE' and 'SOURCES' as identifiers rather than keywords. Throws a
+// parse exception if the identifier is not SOURCE/SOURCES.
+nonterminal Boolean source_ident;
+nonterminal Boolean sources_ident;
 
 // For Create/Drop/Show function ddl
 nonterminal FunctionArgs function_def_args;
@@ -401,10 +438,14 @@ stmt ::=
   {: RESULT = show_tables; :}
   | show_dbs_stmt:show_dbs
   {: RESULT = show_dbs; :}
+  | show_partitions_stmt:show_partitions
+  {: RESULT = show_partitions; :}
   | show_stats_stmt:show_stats
   {: RESULT = show_stats; :}
   | show_functions_stmt:show_functions
   {: RESULT = show_functions; :}
+  | show_data_srcs_stmt:show_data_srcs
+  {: RESULT = show_data_srcs; :}
   | show_create_tbl_stmt:show_create_tbl
   {: RESULT = show_create_tbl; :}
   | describe_stmt:describe
@@ -419,10 +460,14 @@ stmt ::=
   {: RESULT = create_tbl_as_select; :}
   | create_tbl_like_stmt:create_tbl_like
   {: RESULT = create_tbl_like; :}
+  | create_tbl_like_file_stmt:create_tbl_like_file
+  {: RESULT = create_tbl_like_file; :}
   | create_tbl_stmt:create_tbl
   {: RESULT = create_tbl; :}
   | create_view_stmt:create_view
   {: RESULT = create_view; :}
+  | create_data_src_stmt:create_data_src
+  {: RESULT = create_data_src; :}
   | create_db_stmt:create_db
   {: RESULT = create_db; :}
   | create_udf_stmt:create_udf
@@ -435,6 +480,8 @@ stmt ::=
   {: RESULT = drop_tbl; :}
   | drop_function_stmt:drop_function
   {: RESULT = drop_function; :}
+  | drop_data_src_stmt:drop_data_src
+  {: RESULT = drop_data_src; :}
   | explain_stmt:explain
   {: RESULT = explain; :}
   | load_stmt: load
@@ -445,7 +492,7 @@ stmt ::=
 
 load_stmt ::=
   KW_LOAD KW_DATA KW_INPATH STRING_LITERAL:path overwrite_val:overwrite KW_INTO KW_TABLE
-  table_name:table partition_spec:partition
+  table_name:table opt_partition_spec:partition
   {: RESULT = new LoadDataStmt(table, new HdfsUri(path), overwrite, partition); :}
   ;
 
@@ -527,10 +574,10 @@ alter_tbl_stmt ::=
   LPAREN column_def_list:col_defs RPAREN
   {: RESULT = new AlterTableAddReplaceColsStmt(table, col_defs, replace); :}
   | KW_ALTER KW_TABLE table_name:table KW_ADD if_not_exists_val:if_not_exists
-    partition_spec:partition location_val:location
+    partition_spec:partition location_val:location cache_op_val:cache_op
   {:
     RESULT = new AlterTableAddPartitionStmt(table, partition,
-        location, if_not_exists);
+        location, if_not_exists, cache_op);
   :}
   | KW_ALTER KW_TABLE table_name:table KW_DROP optional_kw_column IDENT:col_name
   {: RESULT = new AlterTableDropColStmt(table, col_name); :}
@@ -540,17 +587,26 @@ alter_tbl_stmt ::=
   | KW_ALTER KW_TABLE table_name:table KW_DROP if_exists_val:if_exists
     partition_spec:partition
   {: RESULT = new AlterTableDropPartitionStmt(table, partition, if_exists); :}
-  | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET KW_FILEFORMAT
+  | KW_ALTER KW_TABLE table_name:table opt_partition_spec:partition KW_SET KW_FILEFORMAT
     file_format_val:file_format
   {: RESULT = new AlterTableSetFileFormatStmt(table, partition, file_format); :}
-  | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET
+  | KW_ALTER KW_TABLE table_name:table opt_partition_spec:partition KW_SET
     KW_LOCATION STRING_LITERAL:location
   {: RESULT = new AlterTableSetLocationStmt(table, partition, new HdfsUri(location)); :}
   | KW_ALTER KW_TABLE table_name:table KW_RENAME KW_TO table_name:new_table
   {: RESULT = new AlterTableOrViewRenameStmt(table, new_table, true); :}
-  | KW_ALTER KW_TABLE table_name:table partition_spec:partition KW_SET
+  | KW_ALTER KW_TABLE table_name:table opt_partition_spec:partition KW_SET
     table_property_type:target LPAREN properties_map:properties RPAREN
   {: RESULT = new AlterTableSetTblProperties(table, partition, target, properties); :}
+  | KW_ALTER KW_TABLE table_name:table opt_partition_spec:partition KW_SET
+    cache_op_val:cache_op
+  {:
+    // Ensure a parser error is thrown for ALTER statements if no cache op is specified.
+    if (cache_op == null) {
+      parser.parseError("set", SqlParserSymbols.KW_SET);
+    }
+    RESULT = new AlterTableSetCachedStmt(table, partition, cache_op);
+  :}
   ;
 
 table_property_type ::=
@@ -595,18 +651,32 @@ create_tbl_like_stmt ::=
   :}
   ;
 
+create_tbl_like_file_stmt ::=
+  KW_CREATE external_val:external KW_TABLE if_not_exists_val:if_not_exists
+  table_name:table KW_LIKE file_format_val:schema_file_format
+  STRING_LITERAL:schema_location partition_column_defs:partition_col_defs
+  comment_val:comment row_format_val:row_format serde_properties:serde_props
+  file_format_create_table_val:file_format location_val:location cache_op_val:cache_op
+  tbl_properties:tbl_props
+  {:
+    RESULT = new CreateTableLikeFileStmt(table, schema_file_format,
+        new HdfsUri(schema_location), partition_col_defs, external, comment, row_format,
+        file_format, location, cache_op, if_not_exists, tbl_props, serde_props);
+  :}
+  ;
+
 create_tbl_as_select_stmt ::=
   KW_CREATE external_val:external KW_TABLE if_not_exists_val:if_not_exists
   table_name:table comment_val:comment row_format_val:row_format
   serde_properties:serde_props file_format_create_table_val:file_format
-  location_val:location tbl_properties:tbl_props
+  location_val:location cache_op_val:cache_op tbl_properties:tbl_props
   KW_AS query_stmt:query
   {:
     // Initialize with empty List of columns and partition columns. The
     // columns will be added from the query statement during analysis
     CreateTableStmt create_stmt = new CreateTableStmt(table, new ArrayList<ColumnDesc>(),
         new ArrayList<ColumnDesc>(), external, comment, row_format,
-        file_format, location, if_not_exists, tbl_props, serde_props);
+        file_format, location, cache_op, if_not_exists, tbl_props, serde_props);
     RESULT = new CreateTableAsSelectStmt(create_stmt, query);
   :}
   ;
@@ -616,10 +686,23 @@ create_tbl_stmt ::=
   table_name:table LPAREN column_def_list:col_defs RPAREN
   partition_column_defs:partition_col_defs comment_val:comment
   row_format_val:row_format serde_properties:serde_props
-  file_format_create_table_val:file_format location_val:location tbl_properties:tbl_props
+  file_format_create_table_val:file_format location_val:location cache_op_val:cache_op
+  tbl_properties:tbl_props
   {:
     RESULT = new CreateTableStmt(table, col_defs, partition_col_defs, external, comment,
-        row_format, file_format, location, if_not_exists, tbl_props, serde_props);
+        row_format, file_format, location, cache_op, if_not_exists, tbl_props,
+        serde_props);
+  :}
+  | KW_CREATE external_val:external KW_TABLE if_not_exists_val:if_not_exists
+    table_name:table LPAREN column_def_list:col_defs RPAREN
+    KW_PRODUCED KW_BY KW_DATA source_ident:is_source_id IDENT:data_src_name
+    opt_init_string_val:init_string comment_val:comment
+  {:
+    // Need external_val in the grammar to avoid shift/reduce conflict with other
+    // CREATE TABLE statements.
+    if (external) parser.parseError("external", SqlParserSymbols.KW_EXTERNAL);
+    RESULT = new CreateTableDataSrcStmt(table, col_defs, data_src_name, init_string,
+        comment, if_not_exists);
   :}
   ;
 
@@ -648,6 +731,15 @@ create_uda_stmt ::=
   :}
   ;
 
+cache_op_val ::=
+  KW_CACHED KW_IN STRING_LITERAL:pool_name
+  {: RESULT = new HdfsCachingOp(pool_name); :}
+  | KW_UNCACHED
+  {: RESULT = new HdfsCachingOp(); :}
+  | /* empty */
+  {: RESULT = null; :}
+  ;
+
 comment_val ::=
   KW_COMMENT STRING_LITERAL:comment
   {: RESULT = comment; :}
@@ -658,6 +750,13 @@ comment_val ::=
 location_val ::=
   KW_LOCATION STRING_LITERAL:location
   {: RESULT = new HdfsUri(location); :}
+  | /* empty */
+  {: RESULT = null; :}
+  ;
+
+opt_init_string_val ::=
+  LPAREN STRING_LITERAL:init_string RPAREN
+  {: RESULT = init_string; :}
   | /* empty */
   {: RESULT = null; :}
   ;
@@ -794,6 +893,38 @@ create_view_stmt ::=
   :}
   ;
 
+create_data_src_stmt ::=
+  KW_CREATE KW_DATA source_ident:is_source_id
+  if_not_exists_val:if_not_exists IDENT:data_src_name
+  KW_LOCATION STRING_LITERAL:location
+  KW_CLASS STRING_LITERAL:class_name
+  KW_API_VERSION STRING_LITERAL:api_version
+  {:
+    RESULT = new CreateDataSrcStmt(data_src_name, new HdfsUri(location), class_name,
+        api_version, if_not_exists);
+  :}
+  ;
+
+source_ident ::=
+  IDENT:ident
+  {:
+    if (!ident.toUpperCase().equals("SOURCE")) {
+      parser.parseError("identifier", SqlParserSymbols.IDENT, "SOURCE");
+    }
+    RESULT = true;
+  :}
+  ;
+
+sources_ident ::=
+  IDENT:ident
+  {:
+    if (!ident.toUpperCase().equals("SOURCES")) {
+      parser.parseError("identifier", SqlParserSymbols.IDENT, "SOURCES");
+    }
+    RESULT = true;
+  :}
+  ;
+
 view_column_defs ::=
   LPAREN view_column_def_list:view_col_defs RPAREN
   {: RESULT = view_col_defs; :}
@@ -851,6 +982,11 @@ drop_function_stmt ::=
   {: RESULT = new DropFunctionStmt(fn_name, fn_args, if_exists); :}
   ;
 
+drop_data_src_stmt ::=
+  KW_DROP KW_DATA source_ident:is_source_id if_exists_val:if_exists IDENT:data_src_name
+  {: RESULT = new DropDataSrcStmt(data_src_name, if_exists); :}
+  ;
+
 db_or_schema_kw ::=
   KW_DATABASE
   | KW_SCHEMA
@@ -895,6 +1031,11 @@ partition_key_value_list ::=
 partition_spec ::=
   KW_PARTITION LPAREN static_partition_key_value_list:list RPAREN
   {: RESULT = new PartitionSpec(list); :}
+  ;
+
+opt_partition_spec ::=
+  partition_spec:partition_spec
+  {: RESULT = partition_spec; :}
   | /* Empty */
   {: RESULT = null; :}
   ;
@@ -1091,11 +1232,12 @@ with_table_ref_list ::=
 union_with_order_by_or_limit ::=
     union_operand_list:operands
     KW_ORDER KW_BY order_by_elements:orderByClause
+    opt_offset_param:offsetExpr
   {:
     if (operands.size() == 1) {
       parser.parseError("order", SqlParserSymbols.KW_ORDER);
     }
-    RESULT = new UnionStmt(operands, orderByClause, null);
+    RESULT = new UnionStmt(operands, orderByClause, new LimitElement(null, offsetExpr));
   :}
   |
     union_operand_list:operands
@@ -1154,15 +1296,15 @@ union_op ::=
 values_stmt ::=
   KW_VALUES values_operand_list:operands
   order_by_clause:orderByClause
-  opt_limit_clause:limitClause
+  opt_limit_offset_clause:limitOffsetClause
   {:
-    RESULT = new ValuesStmt(operands, orderByClause, limitClause);
+    RESULT = new ValuesStmt(operands, orderByClause, limitOffsetClause);
   :}
   | KW_VALUES LPAREN values_operand_list:operands RPAREN
     order_by_clause:orderByClause
-    opt_limit_clause:limitClause
+    opt_limit_offset_clause:limitOffsetClause
   {:
-    RESULT = new ValuesStmt(operands, orderByClause, limitClause);
+    RESULT = new ValuesStmt(operands, orderByClause, limitOffsetClause);
   :}
   ;
 
@@ -1212,6 +1354,11 @@ show_stats_stmt ::=
   {: RESULT = new ShowStatsStmt(table, true); :}
   ;
 
+show_partitions_stmt ::=
+  KW_SHOW KW_PARTITIONS table_name:table
+  {: RESULT = new ShowPartitionsStmt(table); :}
+  ;
+
 show_functions_stmt ::=
   KW_SHOW opt_is_aggregate_fn:is_aggregate KW_FUNCTIONS
   {: RESULT = new ShowFunctionsStmt(null, null, is_aggregate); :}
@@ -1222,6 +1369,13 @@ show_functions_stmt ::=
   | KW_SHOW opt_is_aggregate_fn:is_aggregate KW_FUNCTIONS KW_IN IDENT:db
       show_pattern:showPattern
   {: RESULT = new ShowFunctionsStmt(db, showPattern, is_aggregate); :}
+  ;
+
+show_data_srcs_stmt ::=
+  KW_SHOW KW_DATA sources_ident:is_sources_id
+  {: RESULT = new ShowDataSrcsStmt(); :}
+  | KW_SHOW KW_DATA sources_ident:is_sources_id show_pattern:showPattern
+  {: RESULT = new ShowDataSrcsStmt(showPattern); :}
   ;
 
 show_pattern ::=
@@ -1260,10 +1414,10 @@ select_stmt ::=
     group_by_clause:groupingExprs
     having_clause:havingPredicate
     order_by_clause:orderByClause
-    opt_limit_clause:limitClause
+    opt_limit_offset_clause:limitOffsetClause
   {:
     RESULT = new SelectStmt(selectList, tableRefList, wherePredicate, groupingExprs,
-                            havingPredicate, orderByClause, limitClause);
+                            havingPredicate, orderByClause, limitOffsetClause);
   :}
   ;
 
@@ -1414,7 +1568,7 @@ table_ref ::=
 
 inline_view_ref ::=
   LPAREN query_stmt:query RPAREN alias_clause:alias
-  {: RESULT = new InlineViewRef(alias, query); :}
+  {: RESULT = new InlineViewRef(null, alias, query); :}
   ;
 
 base_table_ref ::=
@@ -1554,9 +1708,21 @@ opt_offset_param ::=
   {: RESULT = null; :}
   ;
 
-opt_limit_clause ::=
-  KW_LIMIT expr:limitExpr opt_offset_param:offsetExpr
+opt_limit_offset_clause ::=
+  opt_limit_clause:limitExpr opt_offset_clause:offsetExpr
   {: RESULT = new LimitElement(limitExpr, offsetExpr); :}
+  ;
+
+opt_limit_clause ::=
+  KW_LIMIT expr:limitExpr
+  {: RESULT = limitExpr; :}
+  | /* empty */
+  {: RESULT = null; :}
+  ;
+
+opt_offset_clause ::=
+  KW_OFFSET expr:offsetExpr
+  {: RESULT = offsetExpr; :}
   | /* empty */
   {: RESULT = null; :}
   ;
@@ -1608,7 +1774,7 @@ sign_chain_expr ::=
     // integer literals require analysis to set their type, so the instance check below
     // is not equivalent to e.getType().isNumericType()
     if (e.isLiteral() &&
-       (e instanceof IntLiteral || e instanceof FloatLiteral)) {
+       (e instanceof IntLiteral || e instanceof DecimalLiteral)) {
       ((LiteralExpr)e).swapSign();
       RESULT = e;
     } else {
@@ -1721,8 +1887,8 @@ timestamp_arithmetic_expr ::=
 literal ::=
   INTEGER_LITERAL:l
   {: RESULT = new IntLiteral(l); :}
-  | FLOATINGPOINT_LITERAL:l
-  {: RESULT = new FloatLiteral(l); :}
+  | DECIMAL_LITERAL:l
+  {: RESULT = new DecimalLiteral(l); :}
   | STRING_LITERAL:l
   {: RESULT = new StringLiteral(l); :}
   | KW_TRUE

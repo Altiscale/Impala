@@ -160,8 +160,10 @@ class TestWideTable(ImpalaTestSuite):
     super(TestWideTable, cls).add_test_dimensions()
     cls.TestMatrix.add_constraint(
       lambda v: v.get_value('table_format').file_format != 'hbase')
-
     cls.TestMatrix.add_dimension(TestDimension("num_cols", *cls.NUM_COLS))
+    # To cut down on test execution time, only run in exhaustive.
+    if cls.exploration_strategy() != 'exhaustive':
+      cls.TestMatrix.add_constraint(lambda v: False)
 
   def test_wide_table(self, vector):
     NUM_COLS = vector.get_value('num_cols')
@@ -176,8 +178,10 @@ class TestWideTable(ImpalaTestSuite):
     result = self.client.execute("select * from %s" % TABLE_NAME)
 
     types = parse_column_types(result.schema)
-    expected = QueryTestResult(expected_result, types, order_matters=False)
-    actual = QueryTestResult(parse_result_rows(result), types, order_matters=False)
+    labels = parse_column_labels(result.schema)
+    expected = QueryTestResult(expected_result, types, labels, order_matters=False)
+    actual = QueryTestResult(parse_result_rows(result), types, labels,
+        order_matters=False)
     assert expected == actual
 
 class TestParquet(ImpalaTestSuite):

@@ -138,7 +138,7 @@ public class ArithmeticExpr extends Expr {
   void castChild(int childIdx, ColumnType targetType) throws AnalysisException {
     ColumnType t = getChild(childIdx).getType();
     if (t.matchesType(targetType)) return;
-    if (targetType.isDecimal()) targetType = t.getMinResolutionDecimal();
+    if (targetType.isDecimal() && !t.isNull()) targetType = t.getMinResolutionDecimal();
     castChild(targetType, childIdx);
   }
 
@@ -155,22 +155,27 @@ public class ArithmeticExpr extends Expr {
       }
     }
 
+    ColumnType t0 = getChild(0).getType();
     // bitnot is the only unary op, deal with it here
     if (op_ == Operator.BITNOT) {
-      type_ = getChild(0).getType();
-      fn_ = getBuiltinFunction(analyzer, op_.getName(), collectChildReturnTypes(),
-          CompareMode.IS_SUPERTYPE_OF);
-      if (fn_ == null) {
-        throw new AnalysisException("Bitwise operations only allowed on fixed-point " +
+      // Special case ~NULL to resolve to TYPE_INT.
+      if (!t0.isNull() && !t0.isIntegerType()) {
+        throw new AnalysisException("Bitwise operations only allowed on integer " +
             "types: " + toSql());
       }
-      Preconditions.checkState(type_.equals(fn_.getReturnType()) || type_.isNull());
+      if (t0.isNull()) castChild(0, ColumnType.INT);
+      fn_ = getBuiltinFunction(analyzer, op_.getName(), collectChildReturnTypes(),
+          CompareMode.IS_SUPERTYPE_OF);
+      Preconditions.checkNotNull(fn_);
+      castForFunctionCall();
+      type_ = fn_.getReturnType();
       return;
     }
 
     Preconditions.checkState(children_.size() == 2); // only bitnot is unary
-    ColumnType t1 = getChild(0).getType();
-    ColumnType t2 = getChild(1).getType();
+    convertNumericLiteralsFromDecimal(analyzer);
+    t0 = getChild(0).getType();
+    ColumnType t1 = getChild(1).getType();
 
     String fnName = op_.getName();
     switch (op_) {
@@ -179,19 +184,19 @@ public class ArithmeticExpr extends Expr {
       case DIVIDE:
       case MULTIPLY:
       case MOD:
-        type_ = TypesUtil.getArithmeticResultType(t1, t2, op_);
+        type_ = TypesUtil.getArithmeticResultType(t0, t1, op_);
         break;
 
       case INT_DIVIDE:
       case BITAND:
       case BITOR:
       case BITXOR:
-        if ((!t1.isNull() & !t1.isIntegerType()) ||
-            (!t2.isNull() && !t2.isIntegerType())) {
+        if ((!t0.isNull() & !t0.isIntegerType()) ||
+            (!t1.isNull() && !t1.isIntegerType())) {
           throw new AnalysisException("Invalid non-integer argument to operation '" +
               op_.toString() + "': " + this.toSql());
         }
-        type_ = ColumnType.getAssignmentCompatibleType(t1, t2);
+        type_ = ColumnType.getAssignmentCompatibleType(t0, t1);
         // the result is always an integer or null
         Preconditions.checkState(type_.isIntegerType() || type_.isNull());
         break;
@@ -206,9 +211,17 @@ public class ArithmeticExpr extends Expr {
     // Use MATH_MOD function operator for floating-point modulo.
     // TODO remove this when we have operators implemented using the UDF interface
     // and we can resolve this just using function overloading.
-    if ((t1.isFloatingPointType() || t2.isFloatingPointType()) &&
+    if ((t0.isFloatingPointType() || t1.isFloatingPointType()) &&
         op_ == ArithmeticExpr.Operator.MOD) {
       fnName = "fmod";
+    }
+
+    // In this case, both the children are null types, so we'll just default to
+    // the INT version of the operator. This prevents the BE from seeing NULL_TYPE.
+    if (type_.isNull()) {
+      Preconditions.checkState(getChild(0).type_.isNull());
+      Preconditions.checkState(getChild(1).type_.isNull());
+      type_ = ColumnType.INT;
     }
 
     castChild(0, type_);
@@ -218,7 +231,7 @@ public class ArithmeticExpr extends Expr {
         CompareMode.IS_SUPERTYPE_OF);
     if (fn_ == null) {
       Preconditions.checkState(false, String.format("No match " +
-          "for '%s' with operand types %s and %s", toSql(), t1, t2));
+          "for '%s' with operand types %s and %s", toSql(), t0, t1));
     }
   }
 }

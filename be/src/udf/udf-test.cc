@@ -17,6 +17,7 @@
 #include <boost/date_time/posix_time/posix_time.hpp>
 
 #include "common/logging.h"
+#include "runtime/multi-precision.h"
 #include "testutil/test-udfs.h"
 #include "udf/udf-test-harness.h"
 
@@ -209,6 +210,36 @@ TEST(UdfTest, TestTimestampVal) {
     TimeToString, t2, "2003-03-15 00:00:05")));
 }
 
+TEST(UdfTest, TestDecimalVal) {
+  DecimalVal d1(static_cast<int32_t>(1));
+  DecimalVal d2(static_cast<int32_t>(-1));
+  DecimalVal d3(static_cast<int64_t>(1));
+  DecimalVal d4(static_cast<int64_t>(-1));
+  DecimalVal d5(static_cast<int128_t>(1));
+  DecimalVal d6(static_cast<int128_t>(-1));
+  DecimalVal null1 = DecimalVal::null();
+  DecimalVal null2 = DecimalVal::null();
+
+  // 1 != -1
+  EXPECT_NE(d1, d2);
+  EXPECT_NE(d3, d4);
+  EXPECT_NE(d5, d6);
+
+  // 1 == 1
+  EXPECT_EQ(d1, d3);
+  EXPECT_EQ(d1, d5);
+  EXPECT_EQ(d3, d5);
+
+  // -1 == -1
+  EXPECT_EQ(d2, d4);
+  EXPECT_EQ(d2, d6);
+  EXPECT_EQ(d4, d6);
+
+  // nulls
+  EXPECT_EQ(null1, null2);
+  EXPECT_NE(null1, d1);
+}
+
 TEST(UdfTest, TestVarArgs) {
   vector<StringVal> input;
   input.push_back(StringVal("Hello"));
@@ -228,19 +259,16 @@ TEST(UdfTest, TestVarArgs) {
 }
 
 TEST(UdfTest, MemTest) {
-  scoped_ptr<BigIntVal> bytes_arg(new BigIntVal(1000));
-  vector<AnyVal*> constant_args;
-  constant_args.push_back(bytes_arg.get());
+  BigIntVal bytes_arg(1000);
 
   EXPECT_TRUE((UdfTestHarness::ValidateUdf<BigIntVal, BigIntVal>(
-      ::MemTest, *bytes_arg, *bytes_arg, ::MemTestPrepare, ::MemTestClose,
-      constant_args)));
+      ::MemTest, bytes_arg, bytes_arg, ::MemTestPrepare, ::MemTestClose)));
 
   EXPECT_FALSE((UdfTestHarness::ValidateUdf<BigIntVal, BigIntVal>(
-      ::MemTest, *bytes_arg, *bytes_arg, ::MemTestPrepare, NULL, constant_args)));
+      ::MemTest, bytes_arg, bytes_arg, ::MemTestPrepare, NULL)));
 
   EXPECT_FALSE((UdfTestHarness::ValidateUdf<BigIntVal, BigIntVal>(
-      ::DoubleFreeTest, *bytes_arg, *bytes_arg)));
+      ::DoubleFreeTest, bytes_arg, bytes_arg)));
 
 }
 

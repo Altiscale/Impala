@@ -14,6 +14,8 @@
 
 package com.cloudera.impala.catalog;
 
+import static org.junit.Assert.fail;
+
 import java.util.Map;
 
 import junit.framework.Assert;
@@ -22,6 +24,9 @@ import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import com.cloudera.impala.analysis.LiteralExpr;
+import com.cloudera.impala.common.AnalysisException;
+import com.cloudera.impala.common.ImpalaException;
 import com.cloudera.impala.thrift.ImpalaInternalServiceConstants;
 import com.cloudera.impala.thrift.TAccessLevel;
 import com.cloudera.impala.thrift.THBaseTable;
@@ -29,6 +34,7 @@ import com.cloudera.impala.thrift.THdfsPartition;
 import com.cloudera.impala.thrift.THdfsTable;
 import com.cloudera.impala.thrift.TTable;
 import com.cloudera.impala.thrift.TTableType;
+import com.google.common.collect.Lists;
 
 /**
  * Test suite to verify proper conversion of Catalog objects to/from Thrift structs.
@@ -199,12 +205,29 @@ public class CatalogObjectToFromThriftTest {
   }
 
   @Test
-  public void TestTableLoadingErrors() throws DatabaseNotFoundException,
-      TableNotFoundException, TableLoadingException {
+  public void TestTableLoadingErrors() throws ImpalaException {
     Table table = catalog_.getOrLoadTable("functional", "hive_index_tbl");
     TTable thriftTable = table.toThrift();
     Assert.assertEquals(thriftTable.tbl_name, "hive_index_tbl");
     Assert.assertEquals(thriftTable.db_name, "functional");
+
+    table = catalog_.getOrLoadTable("functional", "alltypes");
+    HdfsTable hdfsTable = (HdfsTable) table;
+    // Get a partition from the table.
+    HdfsPartition part =
+        hdfsTable.getPartitions().get(hdfsTable.getPartitions().size() - 1);
+
+    // Create a dummy partition with an invalid decimal type.
+    try {
+      HdfsPartition dummyPart = new HdfsPartition(hdfsTable, part.getMetaStorePartition(),
+        Lists.newArrayList(LiteralExpr.create("1.1", ColumnType.createDecimalType(1, 0)),
+            LiteralExpr.create("1.1", ColumnType.createDecimalType(1, 0))),
+        null, Lists.<HdfsPartition.FileDescriptor>newArrayList(),
+        TAccessLevel.READ_WRITE);
+      fail("Expected metadata to be malformed.");
+    } catch (AnalysisException e) {
+      Assert.assertTrue(e.getMessage().contains("invalid DECIMAL(1,0) value: 1.1"));
+    }
   }
 
   @Test

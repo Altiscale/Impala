@@ -50,7 +50,7 @@ void* StringFunctions::Substring(Expr* e, TupleRow* row) {
   if (fixed_pos < 0) fixed_pos = str->len + fixed_pos + 1;
   T max_len = str->len - fixed_pos + 1;
   T fixed_len = (len == NULL ? max_len : ::min(*len, max_len));
-  if (fixed_pos != 0 && fixed_pos <= str->len && fixed_len > 0) {
+  if (fixed_pos > 0 && fixed_pos <= str->len && fixed_len > 0) {
     e->result_.string_val = str->Substring(fixed_pos - 1, fixed_len);
   } else {
     e->result_.string_val = StringValue();
@@ -328,7 +328,7 @@ void* StringFunctions::Translate(Expr* e, TupleRow* row) {
         }
         matched_src = true;
         break;
-      } 
+      }
     }
     if (!matched_src) e->result_.string_val.ptr[result_len++] = str->ptr[i];
   }
@@ -374,11 +374,14 @@ void* StringFunctions::Rtrim(Expr* e, TupleRow* row) {
   DCHECK_EQ(e->GetNumChildren(), 1);
   StringValue* str = reinterpret_cast<StringValue*>(e->children()[0]->GetValue(row));
   if (str == NULL) return NULL;
+  if (str->len == 0) return str;
+
   // Find new ending position.
   int32_t end = str->len - 1;
   while (end > 0 && str->ptr[end] == ' ') {
     --end;
   }
+  DCHECK_GE(end, 0);
   e->result_.string_val.ptr = str->ptr;
   e->result_.string_val.len = (str->ptr[end] == ' ') ? end : end + 1;
   return &e->result_.string_val;

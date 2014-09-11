@@ -64,13 +64,6 @@
   <name>hive.stats.jdbcdriver</name>
   <value>org.postgresql.Driver</value>
 </property>
-
-<!--  Enforce the execution of Metastore SQL via Datanucleus to work around HIVE-5264. -->
-<property>
-  <name>hive.metastore.try.direct.sql</name>
-  <value>false</value>
-</property>
-
 <property>
   <name>datanucleus.fixedDatastore</name>
   <value>false</value>
@@ -125,12 +118,9 @@
   <name>dfs.replication</name>
   <value>3</value>
 </property>
-
-<!--  Change back to NOSASL when HIVE-4232 is fixed.
-      With NONE, Hive uses the plain SASL transport. -->
 <property>
   <name>hive.server2.authentication</name>
-  <value>NONE</value>
+  <value>NOSASL</value>
 </property>
 
 <property>

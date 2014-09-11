@@ -5,7 +5,7 @@ select * from (select * from functional.alltypessmall) a where id < 5
    partitions=4/4 size=6.32KB
    predicates: functional.alltypessmall.id < 5
 ---- DISTRIBUTEDPLAN
-01:EXCHANGE [PARTITION=UNPARTITIONED]
+01:EXCHANGE [UNPARTITIONED]
 |
 00:SCAN HDFS [functional.alltypessmall]
    partitions=4/4 size=6.32KB
@@ -26,7 +26,7 @@ select * from (select * from functional.alltypessmall limit 10) a where id < 5 l
 |  predicates: functional.alltypessmall.id < 5
 |  limit: 5
 |
-02:EXCHANGE [PARTITION=UNPARTITIONED]
+02:EXCHANGE [UNPARTITIONED]
 |  limit: 10
 |
 00:SCAN HDFS [functional.alltypessmall]
@@ -40,7 +40,7 @@ from (select * from functional.alltypessmall order by id limit 10) a
 where id < 5 limit 5
 ---- PLAN
 02:SELECT
-|  predicates: functional.alltypessmall.id < 5
+|  predicates: id < 5
 |  limit: 5
 |
 01:TOP-N [LIMIT=10]
@@ -50,13 +50,12 @@ where id < 5 limit 5
    partitions=4/4 size=6.32KB
 ---- DISTRIBUTEDPLAN
 02:SELECT
-|  predicates: functional.alltypessmall.id < 5
+|  predicates: id < 5
 |  limit: 5
 |
-04:TOP-N [LIMIT=10]
+03:MERGING-EXCHANGE [UNPARTITIONED]
 |  order by: id ASC
-|
-03:EXCHANGE [PARTITION=UNPARTITIONED]
+|  limit: 10
 |
 01:TOP-N [LIMIT=10]
 |  order by: id ASC
@@ -91,20 +90,18 @@ where a.id < 5 limit 5
    partitions=24/24 size=478.45KB
    predicates: functional.alltypes.id < 5
 ---- DISTRIBUTEDPLAN
-10:EXCHANGE [PARTITION=UNPARTITIONED]
+09:EXCHANGE [UNPARTITIONED]
 |  limit: 5
 |
 04:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: functional.alltypes.id = id
 |  limit: 5
 |
-|--09:EXCHANGE [BROADCAST]
-|  |  limit: 5
+|--08:EXCHANGE [BROADCAST]
 |  |
-|  08:TOP-N [LIMIT=5]
+|  07:MERGING-EXCHANGE [UNPARTITIONED]
 |  |  order by: count(*) ASC
-|  |
-|  07:EXCHANGE [PARTITION=UNPARTITIONED]
+|  |  limit: 5
 |  |
 |  03:TOP-N [LIMIT=5]
 |  |  order by: count(*) ASC
@@ -113,7 +110,7 @@ where a.id < 5 limit 5
 |  |  output: sum(count(*))
 |  |  group by: id
 |  |
-|  05:EXCHANGE [PARTITION=HASH(id)]
+|  05:EXCHANGE [HASH(id)]
 |  |
 |  02:AGGREGATE
 |  |  output: count(*)
@@ -152,7 +149,7 @@ where id < 5 limit 5
 |  predicates: a.id < 5
 |  limit: 5
 |
-05:EXCHANGE [PARTITION=UNPARTITIONED]
+05:EXCHANGE [UNPARTITIONED]
 |  limit: 10
 |
 02:HASH JOIN [INNER JOIN, BROADCAST]
@@ -190,7 +187,7 @@ limit 5
 01:SELECT
 |  predicates: functional.alltypessmall.id < 5
 |
-03:EXCHANGE [PARTITION=UNPARTITIONED]
+03:EXCHANGE [UNPARTITIONED]
 |  limit: 10
 |
 00:SCAN HDFS [functional.alltypessmall]
@@ -230,7 +227,7 @@ limit 5
 03:SELECT
 |  predicates: a.id < 5
 |
-06:EXCHANGE [PARTITION=UNPARTITIONED]
+06:EXCHANGE [UNPARTITIONED]
 |  limit: 10
 |
 02:HASH JOIN [INNER JOIN, BROADCAST]
@@ -260,15 +257,14 @@ from functional.alltypes
 00:SCAN HDFS [functional.alltypes]
    partitions=24/24 size=478.45KB
 ---- DISTRIBUTEDPLAN
-05:EXCHANGE [PARTITION=UNPARTITIONED]
+05:EXCHANGE [UNPARTITIONED]
 |
 02:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: functional.alltypes.id = id
 |
 |--04:EXCHANGE [BROADCAST]
-|  |  limit: 10
 |  |
-|  03:EXCHANGE [PARTITION=UNPARTITIONED]
+|  03:EXCHANGE [UNPARTITIONED]
 |  |  limit: 10
 |  |
 |  01:SCAN HDFS [functional.alltypessmall]
@@ -296,18 +292,16 @@ from functional.alltypes
 00:SCAN HDFS [functional.alltypes]
    partitions=24/24 size=478.45KB
 ---- DISTRIBUTEDPLAN
-07:EXCHANGE [PARTITION=UNPARTITIONED]
+06:EXCHANGE [UNPARTITIONED]
 |
 03:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: functional.alltypes.id = id
 |
-|--06:EXCHANGE [BROADCAST]
-|  |  limit: 10
+|--05:EXCHANGE [BROADCAST]
 |  |
-|  05:TOP-N [LIMIT=10]
+|  04:MERGING-EXCHANGE [UNPARTITIONED]
 |  |  order by: id ASC
-|  |
-|  04:EXCHANGE [PARTITION=UNPARTITIONED]
+|  |  limit: 10
 |  |
 |  02:TOP-N [LIMIT=10]
 |  |  order by: id ASC
@@ -331,7 +325,7 @@ order by a.id
 limit 5
 ---- PLAN
 05:TOP-N [LIMIT=5]
-|  order by: a.id ASC
+|  order by: id ASC
 |
 04:HASH JOIN [INNER JOIN]
 |  hash predicates: functional.alltypes.id = a.id
@@ -350,21 +344,19 @@ limit 5
    partitions=24/24 size=478.45KB
    predicates: functional.alltypes.id < 5
 ---- DISTRIBUTEDPLAN
-10:TOP-N [LIMIT=5]
-|  order by: a.id ASC
-|
-09:EXCHANGE [PARTITION=UNPARTITIONED]
+09:MERGING-EXCHANGE [UNPARTITIONED]
+|  order by: id ASC
+|  limit: 5
 |
 05:TOP-N [LIMIT=5]
-|  order by: a.id ASC
+|  order by: id ASC
 |
 04:HASH JOIN [INNER JOIN, BROADCAST]
 |  hash predicates: functional.alltypes.id = a.id
 |
 |--08:EXCHANGE [BROADCAST]
-|  |  limit: 10
 |  |
-|  07:EXCHANGE [PARTITION=UNPARTITIONED]
+|  07:EXCHANGE [UNPARTITIONED]
 |  |  limit: 10
 |  |
 |  03:HASH JOIN [INNER JOIN, BROADCAST]
@@ -397,13 +389,13 @@ order by a.id
 limit 5
 ---- PLAN
 06:TOP-N [LIMIT=5]
-|  order by: a.id ASC
+|  order by: id ASC
 |
 05:HASH JOIN [INNER JOIN]
-|  hash predicates: functional.alltypes.id = a.id
+|  hash predicates: functional.alltypes.id = id
 |
 |--04:TOP-N [LIMIT=10]
-|  |  order by: a.int_col ASC
+|  |  order by: int_col ASC
 |  |
 |  03:HASH JOIN [INNER JOIN]
 |  |  hash predicates: a.id = functional.alltypestiny.id
@@ -418,27 +410,24 @@ limit 5
    partitions=24/24 size=478.45KB
    predicates: functional.alltypes.id < 5
 ---- DISTRIBUTEDPLAN
-12:TOP-N [LIMIT=5]
-|  order by: a.id ASC
-|
-11:EXCHANGE [PARTITION=UNPARTITIONED]
+10:MERGING-EXCHANGE [UNPARTITIONED]
+|  order by: id ASC
+|  limit: 5
 |
 06:TOP-N [LIMIT=5]
-|  order by: a.id ASC
+|  order by: id ASC
 |
 05:HASH JOIN [INNER JOIN, BROADCAST]
-|  hash predicates: functional.alltypes.id = a.id
+|  hash predicates: functional.alltypes.id = id
 |
-|--10:EXCHANGE [BROADCAST]
+|--09:EXCHANGE [BROADCAST]
+|  |
+|  08:MERGING-EXCHANGE [UNPARTITIONED]
+|  |  order by: int_col ASC
 |  |  limit: 10
 |  |
-|  09:TOP-N [LIMIT=10]
-|  |  order by: a.int_col ASC
-|  |
-|  08:EXCHANGE [PARTITION=UNPARTITIONED]
-|  |
 |  04:TOP-N [LIMIT=10]
-|  |  order by: a.int_col ASC
+|  |  order by: int_col ASC
 |  |
 |  03:HASH JOIN [INNER JOIN, BROADCAST]
 |  |  hash predicates: a.id = functional.alltypestiny.id
@@ -461,28 +450,28 @@ select x.id from (
 order by x.id
 limit 100 offset 4
 ---- PLAN
-02:TOP-N [LIMIT=100]
-|  order by: x.id ASC
+02:TOP-N [LIMIT=100 OFFSET=4]
+|  order by: id ASC
 |
-01:TOP-N [LIMIT=5]
+01:TOP-N [LIMIT=5 OFFSET=5]
 |  order by: id ASC
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=10/10 size=743.67KB
+   partitions=11/11 size=814.73KB
 ---- DISTRIBUTEDPLAN
-02:TOP-N [LIMIT=100]
-|  order by: x.id ASC
-|
-04:TOP-N [LIMIT=5]
+02:TOP-N [LIMIT=100 OFFSET=4]
 |  order by: id ASC
 |
-03:EXCHANGE [PARTITION=UNPARTITIONED]
+03:MERGING-EXCHANGE [UNPARTITIONED]
+|  offset: 5
+|  order by: id ASC
+|  limit: 5
 |
 01:TOP-N [LIMIT=10]
 |  order by: id ASC
 |
 00:SCAN HDFS [functional.alltypesagg]
-   partitions=10/10 size=743.67KB
+   partitions=11/11 size=814.73KB
 ====
 # Test value transfers for outer-joined inline views with a limit.
 # Value transfer a.id->b.id is illegal due to the limit in b.

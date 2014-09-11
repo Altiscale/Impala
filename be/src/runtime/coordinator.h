@@ -60,6 +60,7 @@ class TRowBatch;
 class TPlanExecRequest;
 class TRuntimeProfileTree;
 class RuntimeProfile;
+class TablePrinter;
 
 // Query coordinator: handles execution of plan fragments on remote nodes, given
 // a TQueryExecRequest. As part of that, it handles all interactions with the
@@ -140,6 +141,10 @@ class Coordinator {
   RuntimeState* runtime_state();
   const RowDescriptor& row_desc() const;
 
+  // Only valid after Exec(). Returns runtime_state()->query_mem_tracker() if there
+  // is a coordinator fragment, or query_mem_tracker_ (initialized in Exec()) otherwise.
+  MemTracker* query_mem_tracker();
+
   // Get cumulative profile aggregated over all fragments of the query.
   // This is a snapshot of the current state of execution and will change in
   // the future if not all fragments have finished execution.
@@ -148,7 +153,7 @@ class Coordinator {
   const TUniqueId& query_id() const { return query_id_; }
 
   // This is safe to call only after Wait()
-  const PartitionRowCount& partition_row_counts() { return partition_row_counts_; }
+  const PartitionStatusMap& per_partition_status() { return per_partition_status_; }
 
   // Gathers all updates to the catalog required once this query has completed execution.
   // Returns true if a catalog update is required, false otherwise.
@@ -162,6 +167,11 @@ class Coordinator {
 
   // Returns query_status_.
   Status GetStatus();
+
+  const TExecSummary& exec_summary() const { return exec_summary_; }
+
+  // Print the exec summary as a formatted table.
+  std::string PrintExecSummary() const;
 
  private:
   class BackendExecState;
@@ -181,7 +191,7 @@ class Coordinator {
 
   // copied from TQueryExecRequest; constant across all fragments
   TDescriptorTable desc_tbl_;
-  TQueryContext query_ctxt_;
+  TQueryCtx query_ctx_;
 
   // copied from TQueryExecRequest, governs when to call ReportQuerySummary
   TStmtType::type stmt_type_;
@@ -231,6 +241,12 @@ class Coordinator {
   // execution state of coordinator fragment
   boost::scoped_ptr<PlanFragmentExecutor> executor_;
 
+  // Query mem tracker for this coordinator initialized in Exec(). Only valid if there
+  // is no coordinator fragment (i.e. executor_ == NULL). If executor_ is not NULL,
+  // this->runtime_state()->query_mem_tracker() returns the query mem tracker.
+  // (See this->query_mem_tracker())
+  boost::shared_ptr<MemTracker> query_mem_tracker_;
+
   // owned by plan root, which resides in runtime_state_'s pool
   const RowDescriptor* row_desc_;
 
@@ -263,13 +279,10 @@ class Coordinator {
   // taken from the coordinator fragment: only one of the two can legitimately produce
   // updates.
 
-  // The set of partitions that have been written to or updated, along with the number of
-  // rows written (may be 0). For unpartitioned tables, the empty string denotes the
-  // entire table.
-  PartitionRowCount partition_row_counts_;
-
-  // Per partition insert stats.
-  PartitionInsertStats partition_insert_stats_;
+  // The set of partitions that have been written to or updated by all backends, along
+  // with statistics such as the number of rows written (may be 0). For unpartitioned
+  // tables, the empty string denotes the entire table.
+  PartitionStatusMap per_partition_status_;
 
   // The set of files to move after an INSERT query has run, in (src, dest) form. An empty
   // string for the destination means that a file is to be deleted.
@@ -277,6 +290,12 @@ class Coordinator {
 
   // Object pool owned by the coordinator. Any executor will have its own pool.
   boost::scoped_ptr<ObjectPool> obj_pool_;
+
+  // Execution summary for this query.
+  TExecSummary exec_summary_;
+
+  // A mapping of plan node ids to index into exec_summary_.nodes
+  boost::unordered_map<TPlanNodeId, int> plan_node_id_to_summary_map_;
 
   // Aggregate counters for the entire query.
   boost::scoped_ptr<RuntimeProfile> query_profile_;
@@ -387,6 +406,10 @@ class Coordinator {
   // Moves all temporary staging files to their final destinations.
   Status FinalizeSuccessfulInsert();
 
+  // Initializes the structures in runtime profile and exec_summary_. Must be
+  // called before RPCs to start remote fragments.
+  void InitExecProfile(const TQueryExecRequest& request);
+
   // Update fragment profile information from a backend exec state.
   // This is called repeatedly from UpdateFragmentExecStatus(),
   // and also at the end of the query from ReportQuerySummary().
@@ -403,20 +426,31 @@ class Coordinator {
   // a query -- remote fragments' profiles must not be updated while this is running.
   void ReportQuerySummary();
 
-  // Builds a map from a path in Hdfs to a pair (newly_created, permissions). Used to
-  // determine what the permissions of newly created directories should be if permission
-  // inheritance is enabled (and not called otherwise). The PermissionCache argument is
-  // used to avoid repeatedly calling hdfsGetPathInfo() on the same path. The caller
-  // (FinalizeSuccessfulInsert()) will iterate over the contents of the map after
-  // BuildPermissionCache() has been called for all created partitions and change the
-  // permissions for all directories for which newly_created == true.
-  //
-  // The permissions value is set to the permission of the lowest ancestor of path_str
-  // that actually exists.
-  typedef boost::unordered_map<std::string, std::pair<bool, short> > PermissionCache;
-  void BuildPermissionCache(hdfsFS fs, const std::string& path_str,
-      PermissionCache* permissions_cache);
+  // Populates the summary execution stats from the profile. Can only be called when the
+  // query is done.
+  // TODO: we should be able to call this and get live updating stats.
+  void UpdateExecSummary(RuntimeProfile* profile);
 
+  // Helper function for PrintExecSummary() that walks the exec summary recursively.
+  // Output for this node is appended to *result. Each value in *result should contain
+  // the statistics for a single exec summary node.
+  // node_idx is an in/out parameter. It is called with the idx (into exec_summary_.nodes)
+  // for the current node and on return, will contain the id of the next node.
+  void PrintExecSummary(int indent_level, bool is_child_fragment, int* node_idx,
+      std::vector<std::vector<std::string> >* result) const;
+
+  // Determines what the permissions of directories created by INSERT statements should be
+  // if permission inheritance is enabled. Populates a map from all prefixes of path_str
+  // (including the full path itself) which is a path in Hdfs, to pairs (does_not_exist,
+  // permissions), where does_not_exist is true if the path does not exist in Hdfs. If
+  // does_not_exist is true, permissions is set to the permissions of the most immediate
+  // ancestor of the path that does exist, i.e. the permissions that the path should
+  // inherit when created. Otherwise permissions is set to the actual permissions of the
+  // path. The PermissionCache argument is also used to cache the output across repeated
+  // calls, to avoid repeatedly calling hdfsGetPathInfo() on the same path.
+  typedef boost::unordered_map<std::string, std::pair<bool, short> > PermissionCache;
+  void PopulatePathPermissionCache(hdfsFS fs, const std::string& path_str,
+      PermissionCache* permissions_cache);
 };
 
 }

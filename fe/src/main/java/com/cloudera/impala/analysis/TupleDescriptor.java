@@ -17,9 +17,6 @@ package com.cloudera.impala.analysis;
 import java.util.ArrayList;
 import java.util.List;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import com.cloudera.impala.catalog.ColumnStats;
 import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.catalog.Table;
@@ -30,11 +27,17 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 
 public class TupleDescriptor {
-  private final static Logger LOG = LoggerFactory.getLogger(TupleDescriptor.class);
   private final TupleId id_;
-  private String alias_;
   private final ArrayList<SlotDescriptor> slots_;
-  private Table table_;  // underlying table, if there is one
+
+  // Underlying table, if there is one.
+  private Table table_;
+
+  // Explicit or fully-qualified implicit alias.
+  private String alias_;
+
+  // True if alias_ is an explicit alias.
+  private boolean hasExplicitAlias_;
 
   // if false, this tuple doesn't need to be materialized
   private boolean isMaterialized_ = true;
@@ -72,7 +75,11 @@ public class TupleDescriptor {
   public boolean getIsMaterialized() { return isMaterialized_; }
   public void setIsMaterialized(boolean value) { isMaterialized_ = value; }
   public String getAlias() { return alias_; }
-  public void setAlias(String alias) { alias_ = alias; }
+  public boolean hasExplicitAlias() { return hasExplicitAlias_; }
+  public void setAlias(String alias, boolean isExplicit) {
+    alias_ = alias;
+    hasExplicitAlias_ = isExplicit;
+  }
 
   public String debugString() {
     String tblStr = (table_ == null ? "null" : table_.getFullName());
@@ -122,18 +129,16 @@ public class TupleDescriptor {
     // populate slotsBySize; also compute avgSerializedSize
     int numNullableSlots = 0;
     for (SlotDescriptor d: slots_) {
+      if (!d.isMaterialized()) continue;
       ColumnStats stats = d.getStats();
-      // TODO: fix this, we don't need to serialize non-materialized slots
       if (stats.hasAvgSerializedSize()) {
         avgSerializedSize_ += d.getStats().getAvgSerializedSize();
       } else {
         // TODO: for computed slots, try to come up with stats estimates
         avgSerializedSize_ += d.getType().getSlotSize();
       }
-      if (d.isMaterialized()) {
-        slotsBySize.get(d.getType().getSlotSize()).add(d);
-        if (d.getIsNullable()) ++numNullableSlots;
-      }
+      slotsBySize.get(d.getType().getSlotSize()).add(d);
+      if (d.getIsNullable()) ++numNullableSlots;
     }
     // we shouldn't have anything of size 0
     Preconditions.checkState(slotsBySize.get(0).isEmpty());
@@ -155,6 +160,7 @@ public class TupleDescriptor {
       }
 
       for (SlotDescriptor d: slotsBySize.get(slotSize)) {
+        Preconditions.checkState(d.isMaterialized());
         d.setByteSize(slotSize);
         d.setByteOffset(offset);
         d.setSlotIdx(slotIdx++);

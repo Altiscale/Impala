@@ -54,10 +54,10 @@ struct TQueryOptions {
 
   8: optional i32 max_io_buffers = 0              // Deprecated in 1.1
   9: optional bool allow_unsupported_formats = 0
-  10: optional i64 default_order_by_limit = -1
+  10: optional i64 default_order_by_limit = -1    // Deprecated in 1.4
   11: optional string debug_action = ""
   12: optional i64 mem_limit = 0
-  13: optional bool abort_on_default_limit_exceeded = 0
+  13: optional bool abort_on_default_limit_exceeded = 0 // Deprecated in 1.4
   14: optional CatalogObjects.THdfsCompression parquet_compression_codec =
       CatalogObjects.THdfsCompression.SNAPPY
   15: optional i32 hbase_caching = 0
@@ -81,6 +81,9 @@ struct TQueryOptions {
   // 1. disable preferring to schedule to cached replicas
   // 2. disable the cached read path.
   23: optional bool disable_cached_reads = 0
+
+  // test hook to disable topn on the outermost select block.
+  24: optional bool disable_outermost_topn = 0
 }
 
 // Impala currently has two types of sessions: Beeswax and HiveServer2
@@ -103,8 +106,8 @@ struct TSessionState {
   // The user to whom this session belongs
   2: required string connected_user
 
-  // If set, the user we are impersonating for the current session
-  6: optional string impersonated_user;
+  // If set, the user we are delegating for the current session
+  6: optional string delegated_user;
 
   // Client network address
   4: required Types.TNetworkAddress network_address
@@ -121,22 +124,49 @@ struct TClientRequest {
 
 // Context of this query, including the client request, session state and
 // global query parameters needed for consistent expr evaluation (e.g., now()).
-struct TQueryContext {
+// TODO: Separate into FE/BE initialized vars.
+struct TQueryCtx {
   // Client request containing stmt to execute and query options.
   1: required TClientRequest request
 
+  // A globally unique id assigned to the entire query in the BE.
+  2: required Types.TUniqueId query_id
+
   // Session state including user.
-  2: required TSessionState session
+  3: required TSessionState session
 
   // String containing a timestamp set as the query submission time.
-  3: required string now_string
+  4: required string now_string
 
   // Process ID of the impalad to which the user is connected.
-  4: required i32 pid
+  5: required i32 pid
+
+  // Initiating coordinator.
+  // TODO: determine whether we can get this somehow via the Thrift rpc mechanism.
+  6: optional Types.TNetworkAddress coord_address
 
   // List of tables missing relevant table and/or column stats. Used for
   // populating query-profile fields consumed by CM as well as warning messages.
-  5: optional list<CatalogObjects.TTableName> tables_missing_stats
+  7: optional list<CatalogObjects.TTableName> tables_missing_stats
+}
+
+// Context of a fragment instance, including its unique id, the total number
+// of fragment instances, the query context, the coordinator address, etc.
+struct TPlanFragmentInstanceCtx {
+  // context of the query this fragment instance belongs to
+  1: required TQueryCtx query_ctx
+
+  // the globally unique fragment instance id
+  2: required Types.TUniqueId fragment_instance_id
+
+  // ordinal of this fragment instance, range [0, num_fragment_instances)
+  3: required i32 fragment_instance_idx
+
+  // total number of instances of this fragment
+  4: required i32 num_fragment_instances
+
+  // backend number assigned by coord to identify backend
+  5: required i32 backend_num
 }
 
 // A scan range plus the parameters needed to execute that scan.
@@ -158,34 +188,30 @@ struct TPlanFragmentDestination {
 // Parameters for a single execution instance of a particular TPlanFragment
 // TODO: for range partitioning, we also need to specify the range boundaries
 struct TPlanFragmentExecParams {
-  // a globally unique id assigned to the entire query
-  1: required Types.TUniqueId query_id
-
-  // a globally unique id assigned to this particular execution instance of
-  // a TPlanFragment
-  2: required Types.TUniqueId fragment_instance_id
-
   // initial scan ranges for each scan node in TPlanFragment.plan_tree
-  3: required map<Types.TPlanNodeId, list<TScanRangeParams>> per_node_scan_ranges
+  1: required map<Types.TPlanNodeId, list<TScanRangeParams>> per_node_scan_ranges
 
   // number of senders for ExchangeNodes contained in TPlanFragment.plan_tree;
   // needed to create a DataStreamRecvr
-  4: required map<Types.TPlanNodeId, i32> per_exch_num_senders
+  2: required map<Types.TPlanNodeId, i32> per_exch_num_senders
 
   // Output destinations, one per output partition.
   // The partitioning of the output is specified by
   // TPlanFragment.output_sink.output_partition.
   // The number of output partitions is destinations.size().
-  5: list<TPlanFragmentDestination> destinations
+  3: list<TPlanFragmentDestination> destinations
 
   // Debug options: perform some action in a particular phase of a particular node
-  6: optional Types.TPlanNodeId debug_node_id
-  7: optional PlanNodes.TExecNodePhase debug_phase
-  8: optional PlanNodes.TDebugAction debug_action
+  4: optional Types.TPlanNodeId debug_node_id
+  5: optional PlanNodes.TExecNodePhase debug_phase
+  6: optional PlanNodes.TDebugAction debug_action
 
   // The pool to which this request has been submitted. Used to update pool statistics
   // for admission control.
-  9: optional string request_pool;
+  7: optional string request_pool
+
+  // Id of this fragment in its role as a sender.
+  8: optional i32 sender_id
 }
 
 // Service Protocol Details
@@ -209,25 +235,15 @@ struct TExecPlanFragmentParams {
   // required in V1
   4: optional TPlanFragmentExecParams params
 
-  // Initiating coordinator.
-  // TODO: determine whether we can get this somehow via the Thrift rpc mechanism.
-  // required in V1
-  5: optional Types.TNetworkAddress coord
-
-  // backend number assigned by coord to identify backend
-  // required in V1
-  6: optional i32 backend_num
-
-  // Context of this query, including query options, session state and
-  // global query parameters needed for consistent expr evaluation (e.g., now()).
-  // required in V1
-  7: optional TQueryContext query_ctxt
+  // Context of this fragment, including its instance id, the total number fragment
+  // instances, the query context, etc.
+  5: optional TPlanFragmentInstanceCtx fragment_instance_ctx
 
   // Resource reservation to run this plan fragment in.
-  8: optional Llama.TAllocatedResource reserved_resource
+  6: optional Llama.TAllocatedResource reserved_resource
 
   // Address of local node manager (used for expanding resource allocations)
-  9: optional Types.TNetworkAddress local_resource_address
+  7: optional Types.TNetworkAddress local_resource_address
 }
 
 struct TExecPlanFragmentResult {
@@ -248,22 +264,33 @@ struct TInsertStats {
   2: optional TParquetInsertStats parquet_stats
 }
 
+const string ROOT_PARTITION_KEY = ''
+
+// Per-partition statistics and metadata resulting from INSERT queries.
+struct TInsertPartitionStatus {
+  // The id of the partition written to (may be -1 if the partition is created by this
+  // query). See THdfsTable.partitions.
+  1: optional i64 id
+
+  // The number of rows appended to this partition
+  2: optional i64 num_appended_rows
+
+  // Detailed statistics gathered by table writers for this partition
+  3: optional TInsertStats stats
+}
+
 // The results of an INSERT query, sent to the coordinator as part of
 // TReportExecStatusParams
 struct TInsertExecStatus {
-  // Number of rows appended by an INSERT, per-partition.
-  // The keys represent partitions to create, coded as k1=v1/k2=v2/k3=v3..., with the
-  // root in an unpartitioned table being the empty string.
-  // The target table name is recorded in the corresponding TQueryExecRequest
-  1: optional map<string, i64> num_appended_rows
-
   // A map from temporary absolute file path to final absolute destination. The
   // coordinator performs these updates after the query completes.
-  2: required map<string, string> files_to_move;
+  1: required map<string, string> files_to_move;
 
-  // Stats from running the insert, per-partition. The keys are coded the
-  // same way as with num_appended_rows.
-  3: optional map<string, TInsertStats> insert_stats
+  // Per-partition details, used in finalization and reporting.
+  // The keys represent partitions to create, coded as k1=v1/k2=v2/k3=v3..., with the
+  // root's key in an unpartitioned table being ROOT_PARTITION_KEY.
+  // The target table name is recorded in the corresponding TQueryExecRequest
+  2: optional map<string, TInsertPartitionStatus> per_partition_status
 }
 
 struct TReportExecStatusParams {
@@ -272,7 +299,7 @@ struct TReportExecStatusParams {
   // required in V1
   2: optional Types.TUniqueId query_id
 
-  // passed into ExecPlanFragment() as TExecPlanFragmentParams.backend_num
+  // passed into ExecPlanFragment() as TPlanFragmentInstanceCtx.backend_num
   // required in V1
   3: optional i32 backend_num
 
@@ -329,8 +356,8 @@ struct TTransmitDataParams {
   // required in V1
   2: optional Types.TUniqueId dest_fragment_instance_id
 
-  // for debugging purposes; currently ignored
-  //3: optional Types.TUniqueId src_fragment_instance_id
+  // Id of this fragment in its role as a sender.
+  3: optional i32 sender_id
 
   // required in V1
   4: optional Types.TPlanNodeId dest_node_id
@@ -361,11 +388,13 @@ struct TResolveRequestPoolParams {
 
 // Returned by RequestPoolService.resolveRequestPool()
 struct TResolveRequestPoolResult {
-  // Actual pool to use, as determined by the pool allocation policy.
-  1: required string resolved_pool
+  // Actual pool to use, as determined by the pool allocation policy. Not set
+  // if no pool was resolved.
+  1: optional string resolved_pool
 
-  // True if the user has access to submit requests to the resolved_pool.
-  2: required bool has_access
+  // True if the user has access to submit requests to the resolved_pool. Not set
+  // if no pool was resolved.
+  2: optional bool has_access
 
   3: optional Status.TStatus status
 }

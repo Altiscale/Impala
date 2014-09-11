@@ -3,6 +3,7 @@
 # Impala tests for queries that query metadata and set session settings
 import logging
 import pytest
+from tests.beeswax.impala_beeswax import ImpalaBeeswaxException
 from subprocess import call
 from tests.common.test_vector import *
 from tests.common.impala_test_suite import *
@@ -10,6 +11,13 @@ from tests.common.impala_test_suite import *
 # TODO: For these tests to pass, all table metadata must be created exhaustively.
 # the tests should be modified to remove that requirement.
 class TestMetadataQueryStatements(ImpalaTestSuite):
+
+  CREATE_DATA_SRC_STMT = ("CREATE DATA SOURCE %s "
+      "LOCATION '/test-warehouse/data-sources/test-data-source.jar' "
+      "CLASS 'com.cloudera.impala.extdatasource.AllTypesDataSource' API_VERSION 'V1'")
+  DROP_DATA_SRC_STMT = "DROP DATA SOURCE IF EXISTS %s"
+  TEST_DATA_SRC_NAMES = ["show_test_ds1", "show_test_ds2"]
+
   @classmethod
   def get_workload(self):
     return 'functional-query'
@@ -17,12 +25,26 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
   @classmethod
   def add_test_dimensions(cls):
     super(TestMetadataQueryStatements, cls).add_test_dimensions()
+    sync_ddl_opts = [0, 1]
+    if cls.exploration_strategy() != 'exhaustive':
+      # Cut down on test runtime by only running with SYNC_DDL=1
+      sync_ddl_opts = [0]
+
     cls.TestMatrix.add_dimension(create_exec_option_dimension(
         cluster_sizes=ALL_NODES_ONLY,
         disable_codegen_options=[False],
         batch_sizes=[0],
-        sync_ddl=[0, 1]))
+        sync_ddl=sync_ddl_opts))
     cls.TestMatrix.add_dimension(create_uncompressed_text_dimension(cls.get_workload()))
+
+  def __drop_data_sources(self):
+    for name in self.TEST_DATA_SRC_NAMES:
+      self.client.execute(self.DROP_DATA_SRC_STMT % (name,))
+
+  def __create_data_sources(self):
+    self.__drop_data_sources()
+    for name in self.TEST_DATA_SRC_NAMES:
+      self.client.execute(self.CREATE_DATA_SRC_STMT % (name,))
 
   def setup_method(self, method):
     self.cleanup_db('hive_test_db')
@@ -32,6 +54,14 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
 
   def test_show(self, vector):
     self.run_test_case('QueryTest/show', vector)
+
+  @pytest.mark.execute_serially
+  def test_show_data_sources(self, vector):
+    try:
+      self.__create_data_sources()
+      self.run_test_case('QueryTest/show-data-sources', vector)
+    finally:
+      self.__drop_data_sources()
 
   def test_show_stats(self, vector):
     self.run_test_case('QueryTest/show-stats', vector)
@@ -72,7 +102,13 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
     call(["hive", "-e", "CREATE DATABASE %s" % db_name])
 
     # Run 'invalidate metadata <table name>' when the parent database does not exist.
-    self.client.execute("invalidate metadata %s.%s"  % (db_name, tbl_name))
+    try:
+      self.client.execute("invalidate metadata %s.%s"  % (db_name, tbl_name))
+      assert 0, 'Expected to fail'
+    except ImpalaBeeswaxException as e:
+      assert "TableNotFoundException: Table not found: %s.%s"\
+          % (db_name, tbl_name) in str(e)
+
     result = self.client.execute("show databases")
     assert db_name not in result.data
 
@@ -128,7 +164,13 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
     assert int(result) == 5
 
     # Run 'invalidate metadata <table name>' when no table exists with that name.
-    self.client.execute("invalidate metadata %s.%s"  % (db_name, tbl_name + '2'))
+    try:
+      self.client.execute("invalidate metadata %s.%s"  % (db_name, tbl_name + '2'))
+      assert 0, 'Expected to fail'
+    except ImpalaBeeswaxException as e:
+      assert "TableNotFoundException: Table not found: %s.%s"\
+          % (db_name, tbl_name + '2') in str(e)
+
     result = self.client.execute("show tables in %s" % db_name);
     assert len(result.data) == 1
     assert tbl_name in result.data
@@ -150,7 +192,13 @@ class TestMetadataQueryStatements(ImpalaTestSuite):
 
     # Should be able to call invalidate multiple times on the same table when the table
     # does not exist.
-    self.client.execute("invalidate metadata %s.%s"  % (db_name, tbl_name))
+    try:
+      self.client.execute("invalidate metadata %s.%s"  % (db_name, tbl_name))
+      assert 0, 'Expected to fail'
+    except ImpalaBeeswaxException as e:
+      assert "TableNotFoundException: Table not found: %s.%s"\
+          % (db_name, tbl_name) in str(e)
+
     result = self.client.execute("show tables in %s" % db_name)
     assert tbl_name + '2' in result.data
     assert tbl_name not in result.data

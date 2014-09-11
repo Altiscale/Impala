@@ -28,6 +28,7 @@ import org.apache.hive.service.cli.thrift.TGetTablesReq;
 import org.apache.sentry.provider.file.HadoopGroupResourceAuthorizationProvider;
 import org.apache.sentry.provider.file.LocalGroupResourceAuthorizationProvider;
 import org.apache.sentry.provider.file.ResourceAuthorizationProvider;
+import org.junit.After;
 import org.junit.Test;
 
 import com.cloudera.impala.authorization.AuthorizationConfig;
@@ -46,7 +47,7 @@ import com.cloudera.impala.testutil.TestUtils;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
 import com.cloudera.impala.thrift.TMetadataOpcode;
 import com.cloudera.impala.thrift.TNetworkAddress;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TQueryCtx;
 import com.cloudera.impala.thrift.TResultSet;
 import com.cloudera.impala.thrift.TSessionState;
 import com.google.common.base.Preconditions;
@@ -73,12 +74,22 @@ public class AuthorizationTest {
       LocalGroupResourceAuthorizationProvider.class.getName());
   private final static ImpaladCatalog catalog_ =
       new ImpaladTestCatalog(authzConfig_);
-  private final static TQueryContext queryCtxt_ =
+  private final static TQueryCtx queryCtx_ =
         TestUtils.createQueryContext(Catalog.DEFAULT_DB, USER.getName());
   private final static AnalysisContext analysisContext_ =
-      new AnalysisContext(catalog_, queryCtxt_);
+      new AnalysisContext(catalog_, queryCtx_);
   private final static Frontend fe_ =
       new Frontend(authzConfig_, new ImpaladTestCatalog(authzConfig_));
+
+  @After
+  public void TestTPCHCleanup() throws AuthorizationException, AnalysisException {
+    // Failure to cleanup TPCH can cause:
+    // TestDropDatabase(com.cloudera.impala.analysis.AuthorizationTest):
+    // Cannot drop non-empty database: tpch
+    if (catalog_.getDb("tpch").numFunctions() != 0) {
+      fail("Failed to clean up functions in tpch.");
+    }
+  }
 
   @Test
   public void TestSelect() throws AuthorizationException, AnalysisException {
@@ -384,6 +395,12 @@ public class AuthorizationTest {
 
     AuthzError("create table _impala_builtins.tbl(i int)",
         "Cannot modify system database.");
+
+    // Check that create like file follows authorization rules for HDFS files
+    AuthzError("create table tpch.table_DNE like parquet "
+        + "'hdfs://localhost:20500/test-warehouse/alltypes'",
+        "User 'test_user' does not have privileges to access: "
+        + "hdfs://localhost:20500/test-warehouse/alltypes");
   }
 
   @Test
@@ -578,6 +595,13 @@ public class AuthorizationTest {
     AuthzOk("ALTER TABLE functional_seq_snap.alltypes PARTITION(year=2009, month=1) " +
         "SET LOCATION 'hdfs://localhost:20500/test-warehouse/new_table'");
 
+    try {
+      AuthzOk("ALTER TABLE functional_seq_snap.alltypes SET CACHED IN 'testPool'");
+      fail("Expected AnalysisException");
+    } catch (AnalysisException e) {
+      Assert.assertEquals(e.getMessage(), "HDFS caching is not supported on CDH4");
+    }
+
     // Alter table and set location to a path the user does not have access to.
     AuthzError("ALTER TABLE functional_seq_snap.alltypes SET LOCATION " +
         "'hdfs://localhost:20500/test-warehouse/no_access'",
@@ -762,7 +786,7 @@ public class AuthorizationTest {
   public void TestLoad() throws AuthorizationException, AnalysisException {
     // User has permission on table and URI.
     AuthzOk("load data inpath 'hdfs://localhost:20500/test-warehouse/tpch.lineitem'" +
-    		" into table functional.alltypes partition(month=10, year=2009)");
+        " into table functional.alltypes partition(month=10, year=2009)");
 
     // User does not have permission on table.
     AuthzError("load data inpath 'hdfs://localhost:20500/test-warehouse/tpch.lineitem'" +
@@ -825,17 +849,17 @@ public class AuthorizationTest {
       Assert.assertEquals(e.getMessage(), "Database does not exist: newdb");
     }
 
-    // Show table/column stats.
-    String[] statsQuals = new String[] { "table", "column" };
+    // Show partitions and show table/column stats.
+    String[] statsQuals = new String[] { "partitions", "table stats", "column stats" };
     for (String qual: statsQuals) {
-      AuthzOk(String.format("show %s stats functional.alltypesagg", qual));
-      AuthzOk(String.format("show %s stats functional.alltypes", qual));
+      AuthzOk(String.format("show %s functional.alltypesagg", qual));
+      AuthzOk(String.format("show %s functional.alltypes", qual));
       // User does not have access to db/table.
-      AuthzError(String.format("show %s stats nodb.tbl", qual),
+      AuthzError(String.format("show %s nodb.tbl", qual),
           "User '%s' does not have privileges to access: nodb.tbl");
-      AuthzError(String.format("show %s stats functional.badtbl", qual),
+      AuthzError(String.format("show %s functional.badtbl", qual),
           "User '%s' does not have privileges to access: functional.badtbl");
-      AuthzError(String.format("show %s stats functional_rc.alltypes", qual),
+      AuthzError(String.format("show %s functional_rc.alltypes", qual),
           "User '%s' does not have privileges to access: functional_rc.alltypes");
     }
   }
@@ -898,13 +922,13 @@ public class AuthorizationTest {
     TResultSet resp = fe_.execHiveServer2MetadataOp(req);
     assertEquals(4, resp.rows.size());
     assertEquals("alltypes",
-        resp.rows.get(0).colVals.get(2).stringVal.toLowerCase());
+        resp.rows.get(0).colVals.get(2).string_val.toLowerCase());
     assertEquals(
-        "alltypesagg", resp.rows.get(1).colVals.get(2).stringVal.toLowerCase());
+        "alltypesagg", resp.rows.get(1).colVals.get(2).string_val.toLowerCase());
     assertEquals(
-        "complex_view", resp.rows.get(2).colVals.get(2).stringVal.toLowerCase());
+        "complex_view", resp.rows.get(2).colVals.get(2).string_val.toLowerCase());
     assertEquals(
-        "view_view", resp.rows.get(3).colVals.get(2).stringVal.toLowerCase());
+        "view_view", resp.rows.get(3).colVals.get(2).string_val.toLowerCase());
   }
 
   @Test
@@ -921,7 +945,7 @@ public class AuthorizationTest {
     assertEquals(expectedDbs.size(), resp.rows.size());
     for (int i = 0; i < resp.rows.size(); ++i) {
       assertEquals(expectedDbs.get(i),
-          resp.rows.get(i).colVals.get(0).stringVal.toLowerCase());
+          resp.rows.get(i).colVals.get(0).string_val.toLowerCase());
     }
   }
 
@@ -1053,12 +1077,21 @@ public class AuthorizationTest {
     catalog_.addFunction(new ScalarFunction(new FunctionName("tpch", "f"),
         new ArrayList<ColumnType>(), ColumnType.INT, null, null, null, null));
 
-    AuthzError(context, "select default.f()",
-        "User '%s' does not have privileges to access: default",
-        currentUser);
-    // Couldn't create tpch.f() but can run it.
-    AuthzOk(context, "select tpch.f()");
-    AuthzOk(adminContext, "drop function tpch.f()");
+    try {
+      AuthzError(context, "select default.f()",
+          "User '%s' does not have privileges to access: default",
+          currentUser);
+      // Couldn't create tpch.f() but can run it.
+      AuthzOk(context, "select tpch.f()");
+      AuthzOk(adminContext, "drop function tpch.f()");
+    } finally {
+      // Other tests don't expect tpch to contain functions
+      // Specifically, if these functions are not cleaned up, TestDropDatabase() will fail
+      catalog_.removeFunction(new ScalarFunction(new FunctionName("default", "f"),
+          new ArrayList<ColumnType>(), ColumnType.INT, null, null, null, null));
+      catalog_.removeFunction(new ScalarFunction(new FunctionName("tpch", "f"),
+          new ArrayList<ColumnType>(), ColumnType.INT, null, null, null, null));
+    }
   }
 
   @Test

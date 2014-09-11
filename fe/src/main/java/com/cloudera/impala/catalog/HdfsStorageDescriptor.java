@@ -58,8 +58,6 @@ public class HdfsStorageDescriptor {
       "org.apache.hadoop.hive.serde2.avro.AvroSerDe", // (avro)
       "org.apache.hadoop.hive.serde2.columnar.ColumnarSerDe", // (rc)
       "parquet.hive.serde.ParquetHiveSerDe", // (parquet - legacy)
-      // TODO: Verify the following Parquet SerDe works with Impala and add
-      // support for the new input/output format classes. See CDH-17085.
       "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe"); // (parquet)
 
   private final static Logger LOG = LoggerFactory.getLogger(HdfsStorageDescriptor.class);
@@ -171,7 +169,7 @@ public class HdfsStorageDescriptor {
   /**
    * Thrown when constructing an HdfsStorageDescriptor from an invalid/unsupported
    * metastore storage descriptor.
-   * TODO: Should we have different exception types for unsupported vs invalid metadata?
+   * TODO: Get rid of this class.
    */
   public static class InvalidStorageDescriptorException extends CatalogException {
     // Mandatory since Exception implements Serialisable
@@ -179,6 +177,9 @@ public class HdfsStorageDescriptor {
     public InvalidStorageDescriptorException(String s) { super(s); }
     public InvalidStorageDescriptorException(Exception ex) {
       super(ex.getMessage(), ex);
+    }
+    public InvalidStorageDescriptorException(String msg, Throwable cause) {
+      super(msg, cause);
     }
   }
 

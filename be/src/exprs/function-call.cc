@@ -27,7 +27,7 @@ using namespace boost;
 namespace impala {
 
 FunctionCall::FunctionCall(const TExprNode& node)
-  : Expr(node), regex_(NULL) {
+  : Expr(node), regex_(NULL), scale_(0) {
 }
 
 Status FunctionCall::Prepare(RuntimeState* state, const RowDescriptor& row_desc) {
@@ -43,7 +43,7 @@ Status FunctionCall::Prepare(RuntimeState* state, const RowDescriptor& row_desc)
     result_.timestamp_val = *(state->now());
   } else if (name == "pid") {
     DCHECK(state != NULL);
-    result_.int_val = state->query_ctxt().pid;
+    result_.int_val = state->query_ctx().pid;
   } else if (name == "user") {
     // Set username from runtime state.
     DCHECK(state != NULL);
@@ -51,7 +51,7 @@ Status FunctionCall::Prepare(RuntimeState* state, const RowDescriptor& row_desc)
   } else if (name == "current_database") {
     // Set current database from the session.
     DCHECK(state != NULL);
-    result_.SetStringVal(state->query_ctxt().session.database);
+    result_.SetStringVal(state->query_ctx().session.database);
   } else if (name == "unix_timestamp" || name == "from_unixtime") {
     if (children_.size() < 2) return Status::OK;
     if (children_[1]->IsConstant()) {
@@ -59,6 +59,14 @@ Status FunctionCall::Prepare(RuntimeState* state, const RowDescriptor& row_desc)
       if (fmt != NULL && fmt->len > 0) SetDateTimeFormatCtx(fmt);
     } else {
       SetDateTimeFormatCtx(NULL);
+    }
+  } else if (name == "truncate" || name == "round") {
+    // round/truncate() for decimal take an optional second argument.
+    if (type().type == TYPE_DECIMAL && children_.size() == 2) {
+      DCHECK(children_[1]->IsConstant());
+      int32_t* scale = reinterpret_cast<int32_t*>(children_[1]->GetValue(NULL));
+      DCHECK(scale != NULL) << DebugString();
+      scale_ = *scale;
     }
   }
   return Status::OK;

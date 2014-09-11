@@ -28,8 +28,10 @@ add_library(Exec STATIC
   catalog-op-executor.cc
   cross-join-node.cc
   data-sink.cc
+  data-source-scan-node.cc
   delimited-text-parser.cc
   exec-node.cc
+  external-data-source-executor.cc
   exchange-node.cc
   hash-join-node.cc
   hash-join-node-ir.cc
@@ -53,11 +55,13 @@ add_library(Exec STATIC
   hbase-scan-node.cc
   hbase-table-scanner.cc
   blocking-join-node.cc
-  merge-node.cc
+  union-node.cc
   read-write-util.cc
   scan-node.cc
   scanner-context.cc
   select-node.cc
+  sort-exec-exprs.cc
+  sort-node.cc
   text-converter.cc
   topn-node.cc
 )

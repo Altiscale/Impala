@@ -39,9 +39,9 @@
 #include "util/time.h"
 #include "util/uid-util.h"
 #include "runtime/coordinator.h"
-#include "runtime/primitive-type.h"
-#include "runtime/timestamp-value.h"
 #include "runtime/runtime-state.h"
+#include "runtime/timestamp-value.h"
+#include "runtime/types.h"
 
 namespace impala {
 
@@ -88,12 +88,10 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   ImpalaServer(ExecEnv* exec_env);
   ~ImpalaServer();
 
-  Frontend* frontend() { return frontend_.get(); }
-
   // ImpalaService rpcs: Beeswax API (implemented in impala-beeswax-server.cc)
   virtual void query(beeswax::QueryHandle& query_handle, const beeswax::Query& query);
   virtual void executeAndWait(beeswax::QueryHandle& query_handle,
-      const beeswax::Query& query, const beeswax::LogContextId& client_ctxt);
+      const beeswax::Query& query, const beeswax::LogContextId& client_ctx);
   virtual void explain(beeswax::QueryExplanation& query_explanation,
       const beeswax::Query& query);
   virtual void fetch(beeswax::Results& query_results,
@@ -128,6 +126,10 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
 
   // TODO: Need to implement HiveServer2 version of GetRuntimeProfile
   virtual void GetRuntimeProfile(std::string& profile_output,
+      const beeswax::QueryHandle& query_id);
+
+  // TODO: Need to implement HiveServer2 version of GetExecSummary
+  virtual void GetExecSummary(impala::TExecSummary& result,
       const beeswax::QueryHandle& query_id);
 
   // Performs a full catalog metadata reset, invalidating all table and database metadata.
@@ -201,10 +203,11 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   virtual void TransmitData(
       TTransmitDataResult& return_val, const TTransmitDataParams& params);
 
+  // Generates a unique id for this query and sets it in the given query context.
   // Prepares the given query context by populating fields required for evaluating
   // certain expressions, such as now(), pid(), etc. Should be called before handing
   // the query context to the frontend for query compilation.
-  static void PrepareQueryContext(TQueryContext* query_ctxt);
+  static void PrepareQueryContext(TQueryCtx* query_ctx);
 
   // Returns the ImpalaQueryOptions enum for the given "key". Input is case in-sensitive.
   // Return -1 if the input is an invalid option.
@@ -348,12 +351,12 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // session_state is a ptr to the session running this query.
   // query_session_state is a snapshot of session state that changes when the
   // query was run. (e.g. default database).
-  Status Execute(TQueryContext* query_ctxt,
+  Status Execute(TQueryCtx* query_ctx,
                  boost::shared_ptr<SessionState> session_state,
                  boost::shared_ptr<QueryExecState>* exec_state);
 
   // Implements Execute() logic, but doesn't unregister query on error.
-  Status ExecuteInternal(const TQueryContext& query_ctxt,
+  Status ExecuteInternal(const TQueryCtx& query_ctx,
                          boost::shared_ptr<SessionState> session_state,
                          bool* registered_exec_state,
                          boost::shared_ptr<QueryExecState>* exec_state);
@@ -392,6 +395,9 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // readable string.
   Status GetRuntimeProfileStr(const TUniqueId& query_id, bool base64_encoded,
       std::stringstream* output);
+
+  // Returns the exec summary for this query.
+  Status GetExecSummary(const TUniqueId& query_id, TExecSummary* result);
 
   // Webserver callback. Retrieves Hadoop confs from frontend and writes them to output
   void RenderHadoopConfigs(const Webserver::ArgumentMap& args, std::stringstream* output);
@@ -472,7 +478,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // Must be called with query_exec_state_map_lock_ held
   void ArchiveQuery(const QueryExecState& query);
 
-  // Checks whether the given user is allowed to impersonate as the specified do_as_user.
+  // Checks whether the given user is allowed to delegate as the specified do_as_user.
   // Returns OK if the authorization suceeds, otherwise returns an status with details
   // on why the failure occurred.
   Status AuthorizeProxyUser(const std::string& user, const std::string& do_as_user);
@@ -488,8 +494,10 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
     // Query id
     TUniqueId id;
 
-    // User that ran the query
-    std::string user;
+    // Queries are run and authorized on behalf of the effective_user.
+    // If there is no delegated user, this will be the connected user. Otherwise, it
+    // will be set to the delegated user.
+    std::string effective_user;
 
     // default db for this query
     std::string default_db;
@@ -518,6 +526,9 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
     // Start and end time of the query
     TimestampValue start_time, end_time;
 
+    // Summary of execution for this query.
+    TExecSummary exec_summary;
+
     // Initialise from an exec_state. If copy_profile is true, print the query
     // profile to a string and copy that into this.profile (which is expensive),
     // otherwise leave this.profile empty.
@@ -541,7 +552,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // Beeswax private methods
 
   // Helper functions to translate between Beeswax and Impala structs
-  Status QueryToTQueryContext(const beeswax::Query& query, TQueryContext* query_ctxt);
+  Status QueryToTQueryContext(const beeswax::Query& query, TQueryCtx* query_ctx);
   void TUniqueIdToQueryHandle(const TUniqueId& query_id, beeswax::QueryHandle* handle);
   void QueryHandleToTUniqueId(const beeswax::QueryHandle& handle, TUniqueId* query_id);
 
@@ -587,7 +598,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
       apache::hive::service::cli::thrift::THandleIdentifier* handle);
   Status TExecuteStatementReqToTQueryContext(
       const apache::hive::service::cli::thrift::TExecuteStatementReq execute_request,
-      TQueryContext* query_ctxt);
+      TQueryCtx* query_ctx);
   static void TColumnValueToHiveServer2TColumnValue(const TColumnValue& value,
       const TColumnType& type,
       apache::hive::service::cli::thrift::TColumnValue* hs2_col_val);
@@ -678,9 +689,6 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   // If audit event logging is enabled, wakes once every 5s to flush audit events to disk
   boost::scoped_ptr<Thread> audit_event_logger_flush_thread_;
 
-  // A Frontend proxy, used both for planning and for catalog requests.
-  boost::scoped_ptr<Frontend> frontend_;
-
   // global, per-server state
   ExecEnv* exec_env_;  // not owned
 
@@ -723,7 +731,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
     // Connected user for this session, i.e. the user which originated this session.
     std::string connected_user;
 
-    // The user to impersonate. Empty for no impersonation.
+    // The user to delegate to. Empty for no delegation.
     std::string do_as_user;
 
     // Client network address
@@ -897,7 +905,7 @@ class ImpalaServer : public ImpalaServiceIf, public ImpalaHiveServer2ServiceIf,
   int64_t min_subscriber_catalog_topic_version_;
 
   // Map of short usernames of authorized proxy users to the set of user(s) they are
-  // allowed to impersonate. Populated by parsing the --authorized_proxy_users_config
+  // allowed to delegate to. Populated by parsing the --authorized_proxy_users_config
   // flag.
   typedef boost::unordered_map<std::string, boost::unordered_set<std::string> >
       ProxyUserMap;

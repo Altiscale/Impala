@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# encoding=utf-8
 # Copyright 2012 Cloudera Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +18,7 @@ import os
 import logging
 import pytest
 import shlex
+import sys
 from time import sleep
 from subprocess import Popen, PIPE, call
 from tests.common.impala_cluster import ImpalaCluster
@@ -26,7 +28,6 @@ DEFAULT_QUERY = 'select 1'
 TEST_DB = "tmp_shell"
 TEST_TBL = "tbl1"
 QUERY_FILE_PATH = os.path.join(os.environ['IMPALA_HOME'], 'tests', 'shell')
-
 
 class TestImpalaShell(object):
   """A set of sanity tests for the Impala shell commandiline parameters.
@@ -149,7 +150,7 @@ class TestImpalaShell(object):
     args = ('-q "set abort_on_error=false;'
         ' select count(*) from functional_seq_snap.bad_seq_snap" --quiet')
     result = run_impala_shell_cmd(args)
-    assert 'ERRORS:' in result.stderr
+    assert 'WARNINGS:' in result.stderr
     assert 'Bad synchronization marker' in result.stderr
     assert 'Expected: ' in result.stderr
     assert 'Actual: ' in result.stderr
@@ -185,12 +186,55 @@ class TestImpalaShell(object):
     # with
     args = '-q "with t1 as (select 1) select * from t1"'
     run_impala_shell_cmd(args)
+    # set
+    # spaces around the = sign
+    args = '-q "set default_order_by_limit  =   10"'
+    run_impala_shell_cmd(args)
+    # no spaces around the = sign
+    args = '-q "set default_order_by_limit=10"'
+    run_impala_shell_cmd(args)
+    # test query options displayed
+    args = '-q "set"'
+    result_set = run_impala_shell_cmd(args)
+    assert 'MEM_LIMIT: [0]' in result_set.stdout
+    # test values displayed after setting value
+    args = '-q "set mem_limit=1g;set"'
+    result_set = run_impala_shell_cmd(args)
+    # single list means one instance of mem_limit in displayed output
+    assert 'MEM_LIMIT: 1g' in result_set.stdout
+    assert 'MEM_LIMIT: [0]' not in result_set.stdout
+    # Negative tests for set
+    # use : instead of =
+    args = '-q "set default_order_by_limit:10"'
+    run_impala_shell_cmd(args, expect_success=False)
+    # use 2 = signs
+    args = '-q "set default_order_by_limit=10=50"'
+    run_impala_shell_cmd(args, expect_success=False)
     # describe and desc should return the same result.
     args = '-q "describe %s.%s" -B' % (TEST_DB, TEST_TBL)
     result_describe = run_impala_shell_cmd(args)
     args = '-q "desc %s.%s" -B' % (TEST_DB, TEST_TBL)
     result_desc = run_impala_shell_cmd(args)
     assert result_describe.stdout == result_desc.stdout
+
+  @pytest.mark.execute_serially
+  def test_summary(self):
+    args = "-q 'select count(*) from functional.alltypes; summary;'"
+    result_set = run_impala_shell_cmd(args)
+    assert "03:AGGREGATE" in result_set.stdout
+
+    args = "-q 'summary;'"
+    result_set = run_impala_shell_cmd(args)
+    assert "Could not retrieve summary for query" in result_set.stderr
+
+    args = "-q 'show tables; summary;'"
+    result_set = run_impala_shell_cmd(args)
+    assert "Summary not available" in result_set.stderr
+
+    # Test queries without an exchange
+    args = "-q 'select 1; summary;'"
+    result_set = run_impala_shell_cmd(args)
+    assert "00:UNION" in result_set.stdout
 
   @pytest.mark.execute_serially
   def test_queries_closed(self):
@@ -209,6 +253,36 @@ class TestImpalaShell(object):
     assert get_shell_cmd_result(p).rc == 0
     assert 0 == impalad.get_num_in_flight_queries()
 
+  @pytest.mark.execute_serially
+  def test_get_log_once(self):
+    """Test that get_log() is always called exactly once."""
+    # Query with fetch
+    args = '-q "select * from functional.alltypeserror"'
+    result = run_impala_shell_cmd(args)
+    assert result.stderr.count('WARNINGS') == 1
+
+    # Insert query (doesn't fetch)
+    INSERT_TBL = "alltypes_get_log"
+    DROP_ARGS = '-q "drop table if exists %s.%s"' % (TEST_DB, INSERT_TBL)
+    run_impala_shell_cmd(DROP_ARGS)
+    args = '-q "create table %s.%s like functional.alltypeserror"' % (TEST_DB, INSERT_TBL)
+    run_impala_shell_cmd(args)
+    args = '-q "insert overwrite %s.%s partition(year, month)' \
+           'select * from functional.alltypeserror"' % (TEST_DB, INSERT_TBL)
+    result = run_impala_shell_cmd(args)
+    assert result.stderr.count('WARNINGS') == 1
+    run_impala_shell_cmd(DROP_ARGS)
+
+  @pytest.mark.execute_serially
+  def test_international_characters(self):
+    """Sanity test to ensure that the shell can read international characters."""
+    RUSSIAN_CHARS = (u"А, Б, В, Г, Д, Е, Ё, Ж, З, И, Й, К, Л, М, Н, О, П, Р,"
+                     u"С, Т, У, Ф, Х, Ц,Ч, Ш, Щ, Ъ, Ы, Ь, Э, Ю, Я")
+    args = """-B -q "select '%s'" """ % RUSSIAN_CHARS
+    result = run_impala_shell_cmd(args.encode('utf-8'))
+    assert 'UnicodeDecodeError' not in result.stderr
+    assert RUSSIAN_CHARS.encode('utf-8') in result.stdout
+
 class ImpalaShellResult(object):
   def __init__(self):
     self.rc = 0
@@ -219,8 +293,8 @@ class ImpalaShellResult(object):
 def run_impala_shell_cmd(shell_args, expect_success=True):
   """Runs the Impala shell on the commandline.
 
-  shell_args is a string which represents the commandline options.
-  returns the process return code, stdout and stderr.
+  'shell_args' is a string which represents the commandline options.
+  Returns a ImpalaShellResult.
   """
   cmd = "%s %s" % (SHELL_CMD, shell_args)
   p = Popen(shlex.split(cmd), shell=False, stdout=PIPE, stderr=PIPE)

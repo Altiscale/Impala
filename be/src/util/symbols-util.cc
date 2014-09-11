@@ -133,6 +133,9 @@ static void AppendAnyValType(int namespace_id, const ColumnType& type, stringstr
     case TYPE_TIMESTAMP:
       AppendMangledToken("TimestampVal", s);
       break;
+    case TYPE_DECIMAL:
+      AppendMangledToken("DecimalVal", s);
+      break;
     default:
       DCHECK(false) << "NYI: " << type.DebugString();
   }
@@ -234,9 +237,6 @@ string SymbolsUtil::ManglePrepareOrCloseFunction(const string& fn_name) {
   // is seen, we output the raw token string and store the index ("seq_id"). The
   // next time we see the same token, we output the index instead.
   int seq_id = 0;
-
-  // Sequence id for the impala_udf namespace token
-  int impala_udf_seq_id = -1;
 
   stringstream ss;
   ss << MANGLE_PREFIX;

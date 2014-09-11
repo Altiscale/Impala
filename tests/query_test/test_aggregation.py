@@ -41,12 +41,13 @@ class TestAggregation(ImpalaTestSuite):
 
   @classmethod
   def is_valid_vector(cls, vector):
-    # Reduce execution time when exploration strategy is 'core'
-    if cls.exploration_strategy() == 'core':
-      if vector.get_value('exec_option')['batch_size'] != 0: return False
-
     data_type, agg_func = vector.get_value('data_type'), vector.get_value('agg_func')
     file_format = vector.get_value('table_format').file_format
+    if file_format not in ['parquet']: return False
+
+    if cls.exploration_strategy() == 'core':
+      # Reduce execution time when exploration strategy is 'core'
+      if vector.get_value('exec_option')['batch_size'] != 0: return False
 
     # Avro doesn't have timestamp type
     if file_format == 'avro' and data_type == 'timestamp':
@@ -59,7 +60,8 @@ class TestAggregation(ImpalaTestSuite):
 
   def test_aggregation(self, vector):
     data_type, agg_func = (vector.get_value('data_type'), vector.get_value('agg_func'))
-    query = 'select %s(%s_col) from alltypesagg' % (agg_func, data_type)
+    query = 'select %s(%s_col) from alltypesagg where day is not null' % (agg_func,
+        data_type)
     result = self.execute_scalar(query, vector.get_value('exec_option'),
                                  table_format=vector.get_value('table_format'))
     if 'int' in data_type:
@@ -69,5 +71,6 @@ class TestAggregation(ImpalaTestSuite):
     if vector.get_value('data_type') == 'timestamp' and\
        vector.get_value('agg_func') == 'avg':
       return
-    query = 'select %s(DISTINCT(%s_col)) from alltypesagg' % (agg_func, data_type)
+    query = 'select %s(DISTINCT(%s_col)) from alltypesagg where day is not null' % (
+        agg_func, data_type)
     result = self.execute_scalar(query, vector.get_value('exec_option'))

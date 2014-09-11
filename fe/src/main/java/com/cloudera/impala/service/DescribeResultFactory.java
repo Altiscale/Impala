@@ -54,11 +54,11 @@ public class DescribeResultFactory {
     // Get description of all the table's columns (includes partition columns).
     for (Column column: table.getColumnsInHiveOrder()) {
       TColumnValue colNameCol = new TColumnValue();
-      colNameCol.setStringVal(column.getName());
+      colNameCol.setString_val(column.getName());
       TColumnValue dataTypeCol = new TColumnValue();
-      dataTypeCol.setStringVal(column.getType().toString().toLowerCase());
+      dataTypeCol.setString_val(column.getType().toString().toLowerCase());
       TColumnValue commentCol = new TColumnValue();
-      commentCol.setStringVal(column.getComment() != null ? column.getComment() : "");
+      commentCol.setString_val(column.getComment() != null ? column.getComment() : "");
       descResult.results.add(
           new TResultRow(Lists.newArrayList(colNameCol, dataTypeCol, commentCol)));
     }
@@ -94,7 +94,7 @@ public class DescribeResultFactory {
     StringBuilder sb = new StringBuilder();
     // First add all the columns (includes partition columns).
     sb.append(MetaDataFormatUtils.getAllColumnsInformation(msTable.getSd().getCols(),
-        msTable.getPartitionKeys(), true));
+        msTable.getPartitionKeys()));
     // Add the extended table metadata information.
     sb.append(MetaDataFormatUtils.getTableInformation(hiveTable));
 
@@ -105,10 +105,10 @@ public class DescribeResultFactory {
       TResultRow resultRow = new TResultRow();
       for (int i = 0; i < NUM_DESC_FORMATTED_RESULT_COLS; ++i) {
         TColumnValue colVal = new TColumnValue();
-        colVal.setStringVal(null);
+        colVal.setString_val(null);
         if (columns.length > i) {
           // Add the column value.
-          colVal.setStringVal(columns[i]);
+          colVal.setString_val(columns[i]);
         }
         resultRow.addToColVals(colVal);
       }

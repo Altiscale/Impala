@@ -46,6 +46,14 @@ class TestQueries(ImpalaTestSuite):
     vector.get_value('exec_option')['num_nodes'] = 1
     self.run_test_case('QueryTest/distinct-estimate', vector)
 
+  def test_data_source_tables(self, vector):
+    # The test table is only created in uncompressed text format, so the test only works
+    # on 'text/none'
+    table_format = vector.get_value('table_format')
+    if table_format.file_format != 'text' or table_format.compression_codec != 'none':
+      pytest.skip()
+    self.run_test_case('QueryTest/data-source-tables', vector)
+
   def test_scan_range(self, vector):
     self.run_test_case('QueryTest/hdfs-partitions', vector)
 
@@ -60,6 +68,15 @@ class TestQueries(ImpalaTestSuite):
   def test_top_n(self, vector):
     if vector.get_value('table_format').file_format == 'hbase':
       pytest.xfail(reason="IMPALA-283 - select count(*) produces inconsistent results")
+    # QueryTest/top-n is also run in test_sort with disable_outermost_topn = 1
+    self.run_test_case('QueryTest/top-n', vector)
+
+  def test_sort(self, vector):
+    if vector.get_value('table_format').file_format == 'hbase':
+      pytest.xfail(reason="IMPALA-283 - select count(*) produces inconsistent results")
+    vector.get_value('exec_option')['disable_outermost_topn'] = 1
+    self.run_test_case('QueryTest/sort', vector)
+    # We can get the sort tests for free from the top-n file
     self.run_test_case('QueryTest/top-n', vector)
 
   def test_empty(self, vector):

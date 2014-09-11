@@ -40,7 +40,6 @@ import com.cloudera.impala.analysis.SelectStmt;
 import com.cloudera.impala.analysis.SlotDescriptor;
 import com.cloudera.impala.analysis.SlotId;
 import com.cloudera.impala.analysis.SlotRef;
-import com.cloudera.impala.analysis.SortInfo;
 import com.cloudera.impala.analysis.TableRef;
 import com.cloudera.impala.analysis.TupleDescriptor;
 import com.cloudera.impala.analysis.TupleId;
@@ -49,6 +48,8 @@ import com.cloudera.impala.analysis.UnionStmt.UnionOperand;
 import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.ColumnStats;
 import com.cloudera.impala.catalog.ColumnType;
+import com.cloudera.impala.catalog.DataSourceTable;
+import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.HdfsTable;
 import com.cloudera.impala.common.IdGenerator;
 import com.cloudera.impala.common.ImpalaException;
@@ -81,6 +82,9 @@ public class Planner {
   // Estimate of the overhead imposed by storing data in a hash tbl;
   // used for determining whether a broadcast join is feasible.
   public final static double HASH_TBL_SPACE_OVERHEAD = 1.1;
+
+  // The maximum fraction of remaining memory that a sort node can use during execution.
+  public final static double SORT_MEM_MAX_FRACTION = 0.80;
 
   private final IdGenerator<PlanNodeId> nodeIdGenerator_ = PlanNodeId.createGenerator();
   private final IdGenerator<PlanFragmentId> fragmentIdGenerator_ =
@@ -118,8 +122,8 @@ public class Planner {
       analyzer.materializeSlots(queryStmt.getBaseTblResultExprs());
     }
 
-    PlanNode singleNodePlan =
-        createQueryPlan(queryStmt, analyzer, queryOptions.getDefault_order_by_limit());
+    PlanNode singleNodePlan = createQueryPlan(queryStmt, analyzer,
+        queryOptions.isDisable_outermost_topn());
     Preconditions.checkNotNull(singleNodePlan);
     LOG.trace("desctbl: " + analyzer.getDescTbl().debugString());
 
@@ -131,12 +135,12 @@ public class Planner {
       fragments.add(new PlanFragment(
           fragmentIdGenerator_.getNextId(), singleNodePlan, DataPartition.UNPARTITIONED));
     } else {
-      // For inserts or CTAS, unless there is a limit clause, leave the root fragment
-      // partitioned, otherwise merge everything into a single coordinator fragment,
-      // so we can pass it back to the client.
+      // For inserts or CTAS, unless there is a limit or offset clause, leave the root
+      // fragment partitioned, otherwise merge everything into a single coordinator
+      // fragment, so we can pass it back to the client.
       boolean isPartitioned = false;
       if ((analysisResult.isInsertStmt() || analysisResult.isCreateTableAsSelectStmt())
-          && !queryStmt.hasLimitClause()) {
+          && !queryStmt.hasLimit() && !queryStmt.hasOffset()) {
         isPartitioned = true;
       }
       LOG.debug("create plan fragments");
@@ -168,7 +172,7 @@ public class Planner {
 
     LOG.debug("finalize plan fragments");
     for (PlanFragment fragment: fragments) {
-      fragment.finalize(analyzer, !queryOptions.allow_unsupported_formats);
+      fragment.finalize(analyzer);
     }
 
     Collections.reverse(fragments);
@@ -191,10 +195,10 @@ public class Planner {
       hasHeader = true;
     }
     // Append warning about tables missing stats.
-    if (request.query_ctxt.isSetTables_missing_stats() &&
-        !request.query_ctxt.getTables_missing_stats().isEmpty()) {
+    if (request.query_ctx.isSetTables_missing_stats() &&
+        !request.query_ctx.getTables_missing_stats().isEmpty()) {
       List<String> tableNames = Lists.newArrayList();
-      for (TTableName tableName: request.query_ctxt.getTables_missing_stats()) {
+      for (TTableName tableName: request.query_ctx.getTables_missing_stats()) {
         tableNames.add(tableName.db_name + "." + tableName.table_name);
       }
       str.append("WARNING: The following tables are missing relevant table " +
@@ -259,15 +263,16 @@ public class Planner {
           perNodeMemLimit, fragments, analyzer);
     } else if (root instanceof SelectNode) {
       result = createSelectNodeFragment((SelectNode) root, childFragments, analyzer);
-    } else if (root instanceof MergeNode) {
-      result = createMergeNodeFragment((MergeNode) root, childFragments, fragments,
+    } else if (root instanceof UnionNode) {
+      result = createUnionNodeFragment((UnionNode) root, childFragments, fragments,
           analyzer);
     } else if (root instanceof AggregationNode) {
       result = createAggregationFragment(
           (AggregationNode) root, childFragments.get(0), fragments, analyzer);
     } else if (root instanceof SortNode) {
       result =
-          createTopnFragment((SortNode) root, childFragments.get(0), fragments, analyzer);
+          createOrderByFragment((SortNode) root, childFragments.get(0), fragments,
+              analyzer);
     } else {
       throw new InternalException(
           "Cannot create plan fragment for this node type: " + root.getExplainString());
@@ -407,7 +412,7 @@ public class Planner {
     // compacts the data. No reason to do it again at the rhs root node.
     rightChildFragment.getPlanRoot().setCompactData(false);
     node.setChild(0, leftChildFragment.getPlanRoot());
-    connectChildFragment(analyzer, node, 1, leftChildFragment, rightChildFragment);
+    connectChildFragment(analyzer, node, 1, rightChildFragment);
     leftChildFragment.setPlanRoot(node);
     return leftChildFragment;
   }
@@ -507,7 +512,7 @@ public class Planner {
       // the join; the build input is provided by an ExchangeNode, which is the
       // destination of the rightChildFragment's output
       node.setChild(0, leftChildFragment.getPlanRoot());
-      connectChildFragment(analyzer, node, 1, leftChildFragment, rightChildFragment);
+      connectChildFragment(analyzer, node, 1, rightChildFragment);
       leftChildFragment.setPlanRoot(node);
       return leftChildFragment;
     } else {
@@ -542,7 +547,7 @@ public class Planner {
           Expr.cloneList(rhsJoinExprs, null));
       if (lhsHasCompatPartition) {
         node.setChild(0, leftChildFragment.getPlanRoot());
-        connectChildFragment(analyzer, node, 1, leftChildFragment, rightChildFragment);
+        connectChildFragment(analyzer, node, 1, rightChildFragment);
         rightChildFragment.setOutputPartition(rhsJoinPartition);
         leftChildFragment.setPlanRoot(node);
         return leftChildFragment;
@@ -553,7 +558,7 @@ public class Planner {
           Expr.cloneList(lhsJoinExprs, null));
       if (rhsHasCompatPartition) {
         node.setChild(1, rightChildFragment.getPlanRoot());
-        connectChildFragment(analyzer, node, 0, rightChildFragment, leftChildFragment);
+        connectChildFragment(analyzer, node, 0, leftChildFragment);
         leftChildFragment.setOutputPartition(lhsJoinPartition);
         rightChildFragment.setPlanRoot(node);
         return rightChildFragment;
@@ -588,72 +593,70 @@ public class Planner {
   }
 
   /**
-   * Creates an unpartitioned fragment that merges the outputs of all of its children
-   * (with a single ExchangeNode), corresponding to the 'mergeNode' of the
-   * non-distributed plan.
-   * Each of the child fragments receives a MergeNode as a new plan root (with
-   * the child fragment's plan tree as its only input), so that each child
-   * fragment's output is mapped onto the MergeNode's result tuple id_.
-   * TODO: if this is implementing a UNION DISTINCT, the parent of the mergeNode
-   * is a duplicate-removing AggregationNode, which might make sense to apply
-   * to the children as well, in order to reduce the amount of data that needs
-   * to be sent to the parent; augment the planner to decide whether that would
-   * reduce the runtime.
-   * TODO: since the fragment that does the merge is unpartitioned, it can absorb
-   * all child fragments that are also unpartitioned
+   * Returns a new fragment with a UnionNode as its root. The data partition of the
+   * returned fragment and how the data of the child fragments is consumed depends on the
+   * data partitions of the child fragments:
+   * - All child fragments are unpartitioned or partitioned: The returned fragment has an
+   *   UNPARTITIONED or RANDOM data partition, respectively. The UnionNode absorbs the
+   *   plan trees of all child fragments.
+   * - Mixed partitioned/unpartitioned child fragments: The returned fragment is
+   *   RANDOM partitioned. The plan trees of all partitioned child fragments are absorbed
+   *   into the UnionNode. All unpartitioned child fragments are connected to the
+   *   UnionNode via a RANDOM exchange, and remain unchanged otherwise.
    */
-  private PlanFragment createMergeNodeFragment(MergeNode mergeNode,
+  private PlanFragment createUnionNodeFragment(UnionNode unionNode,
       ArrayList<PlanFragment> childFragments, ArrayList<PlanFragment> fragments,
       Analyzer analyzer) throws InternalException, AuthorizationException {
-    Preconditions.checkState(mergeNode.getChildren().size() == childFragments.size());
+    Preconditions.checkState(unionNode.getChildren().size() == childFragments.size());
 
-    // A MergeNode could have no children or constant selects if all of its operands
+    // A UnionNode could have no children or constant selects if all of its operands
     // were dropped because of constant predicates that evaluated to false.
-    if (mergeNode.getChildren().isEmpty()) {
+    if (unionNode.getChildren().isEmpty()) {
       return new PlanFragment(
-          fragmentIdGenerator_.getNextId(), mergeNode, DataPartition.UNPARTITIONED);
+          fragmentIdGenerator_.getNextId(), unionNode, DataPartition.UNPARTITIONED);
     }
 
-    // create an ExchangeNode to perform the merge operation of mergeNode;
-    // the ExchangeNode retains the generic PlanNode parameters of mergeNode
-    ExchangeNode exchNode = new ExchangeNode(nodeIdGenerator_.getNextId());
-    PlanFragment parentFragment = new PlanFragment(fragmentIdGenerator_.getNextId(),
-        exchNode, DataPartition.UNPARTITIONED);
-    exchNode.setFragment(parentFragment);
+    Preconditions.checkState(!childFragments.isEmpty());
+    int numUnpartitionedChildFragments = 0;
+    for (int i = 0; i < childFragments.size(); ++i) {
+      if (!childFragments.get(i).isPartitioned()) ++numUnpartitionedChildFragments;
+    }
 
-    // we don't expect to be parallelizing a MergeNode that was inserted solely
-    // to evaluate conjuncts_ (ie, that doesn't explicitly materialize its output)
-    Preconditions.checkState(mergeNode.getTupleIds().size() == 1);
+    // If all child fragments are unpartitioned, return a single unpartitioned fragment
+    // with a UnionNode that merges all child fragments.
+    if (numUnpartitionedChildFragments == childFragments.size()) {
+      // Absorb the plan trees of all childFragments into unionNode.
+      for (int i = 0; i < childFragments.size(); ++i) {
+        unionNode.setChild(i, childFragments.get(i).getPlanRoot());
+      }
+      PlanFragment unionFragment = new PlanFragment(fragmentIdGenerator_.getNextId(),
+          unionNode, DataPartition.UNPARTITIONED);
+      unionNode.init(analyzer);
+      // All child fragments have been absorbed into unionFragment.
+      fragments.removeAll(childFragments);
+      return unionFragment;
+    }
 
+    // There is at least one partitioned child fragment.
     for (int i = 0; i < childFragments.size(); ++i) {
       PlanFragment childFragment = childFragments.get(i);
-      MergeNode childMergeNode =
-          new MergeNode(
-              nodeIdGenerator_.getNextId(), mergeNode, i, childFragment.getPlanRoot());
-      childMergeNode.init(analyzer);
-      childFragment.setPlanRoot(childMergeNode);
-      childFragment.setDestination(exchNode);
-      exchNode.addChild(childMergeNode, true);
+      if (childFragment.isPartitioned()) {
+        // Absorb the plan trees of all partitioned child fragments into unionNode.
+        unionNode.setChild(i, childFragment.getPlanRoot());
+        fragments.remove(childFragment);
+      } else {
+        // Connect the unpartitioned child fragments to unionNode via a random exchange.
+        connectChildFragment(analyzer, unionNode, i, childFragment);
+        childFragment.setOutputPartition(DataPartition.RANDOM);
+      }
     }
 
-    // Add an unpartitioned child fragment with a MergeNode for the constant exprs.
-    if (!mergeNode.getConstExprLists().isEmpty()) {
-      MergeNode childMergeNode = MergeNode.createConstIntermediateMerge(
-          nodeIdGenerator_.getNextId(), mergeNode);
-      childMergeNode.init(analyzer);
-      // Clear original constant exprs to make sure nobody else picks them up.
-      mergeNode.getConstExprLists().clear();
-      PlanFragment childFragment = new PlanFragment(fragmentIdGenerator_.getNextId(),
-          childMergeNode, DataPartition.UNPARTITIONED);
-      childFragment.setPlanRoot(childMergeNode);
-      childFragment.setDestination(exchNode);
-      childFragments.add(childFragment);
-      fragments.add(childFragment);
-      exchNode.addChild(childMergeNode, true);
-    }
-    exchNode.init(analyzer);
-
-    return parentFragment;
+    // Fragment contains the UnionNode that consumes the data of all child fragments.
+    PlanFragment unionFragment = new PlanFragment(fragmentIdGenerator_.getNextId(),
+        unionNode, DataPartition.RANDOM);
+    unionNode.reorderOperands(analyzer);
+    unionNode.init(analyzer);
+    return unionFragment;
   }
 
   /**
@@ -676,8 +679,7 @@ public class Planner {
    * input from childFragment.
    */
   private void connectChildFragment(Analyzer analyzer, PlanNode node, int childIdx,
-      PlanFragment parentFragment, PlanFragment childFragment)
-      throws InternalException, AuthorizationException {
+      PlanFragment childFragment) throws InternalException, AuthorizationException {
     ExchangeNode exchangeNode = new ExchangeNode(nodeIdGenerator_.getNextId());
     exchangeNode.addChild(childFragment.getPlanRoot(), false);
     exchangeNode.init(analyzer);
@@ -686,11 +688,9 @@ public class Planner {
   }
 
   /**
-   * Returns a fragment containing a single ExchangeNode that consumes the output
-   * of all childFragments. Sets the destination of childFragments to the new parent
-   * and the output partition of the childFragments to that of the new parent.
-   * Creates the ExchangeNode inside parentFragment if one was provided (not null),
-   * otherwise creates a new parent fragment.
+   * Create a new fragment containing a single ExchangeNode that consumes the output
+   * of childFragment, set the destination of childFragment to the new parent
+   * and the output partition of childFragment to that of the new parent.
    * TODO: the output partition of a child isn't necessarily the same as the data
    * partition of the receiving parent (if there is more materialization happening
    * in the parent, such as during distinct aggregation). Do we care about the data
@@ -698,97 +698,41 @@ public class Planner {
    * correct for the input).
    */
   private PlanFragment createParentFragment(
-      Analyzer analyzer, List<PlanFragment> childFragments,
-      DataPartition parentPartition, PlanFragment parentFragment)
+      Analyzer analyzer, PlanFragment childFragment, DataPartition parentPartition)
       throws InternalException, AuthorizationException {
     ExchangeNode exchangeNode = new ExchangeNode(nodeIdGenerator_.getNextId());
-    for (PlanFragment childFragment: childFragments) {
-      exchangeNode.addChild(childFragment.getPlanRoot(), false);
-      childFragment.setDestination(exchangeNode);
-      childFragment.setOutputPartition(parentPartition);
-    }
-    if (parentFragment == null) {
-      parentFragment = new PlanFragment(fragmentIdGenerator_.getNextId(),
-          exchangeNode, parentPartition);
-    } else {
-      parentFragment.setPlanRoot(exchangeNode);
-      parentFragment.setDataPartition(parentPartition);
-    }
+    exchangeNode.addChild(childFragment.getPlanRoot(), false);
     exchangeNode.init(analyzer);
+    PlanFragment parentFragment = new PlanFragment(fragmentIdGenerator_.getNextId(),
+        exchangeNode, parentPartition);
+    childFragment.setDestination(exchangeNode);
+    childFragment.setOutputPartition(parentPartition);
     return parentFragment;
-  }
-
-  /**
-   * Populates childFragments. If fragment is unpartitioned and its root is an
-   * ExchangeNode without a limit, then childFragments contains all the child
-   * fragments of the exchange and this function returns true. Otherwise
-   * childFragments simply contains the given fragment and this function
-   * returns false.
-   * Used for distributing operations (e.g., agg, topn) over union branches.
-   */
-  private boolean getUnionInputs(
-      PlanFragment fragment, List<PlanFragment> childFragments) {
-    PlanNode root = fragment.getPlanRoot();
-    if (fragment.isPartitioned() || !(root instanceof ExchangeNode) || root.hasLimit()) {
-      childFragments.add(fragment);
-      return false;
-    }
-    ExchangeNode childPlanRoot = (ExchangeNode) fragment.getPlanRoot();
-    for (PlanNode p: childPlanRoot.getChildren()) {
-      childFragments.add(p.getFragment());
-    }
-    return true;
-  }
-
-  /**
-   * Makes 'root' the new plan root for all fragments. Uses the original root
-   * for the first fragment and clones root for the remaining fragments.
-   */
-  private void addPlanRoots(List<PlanFragment> fragments, PlanNode root,
-      Analyzer analyzer) {
-    for (int i = 0; i < fragments.size(); ++i) {
-      PlanNode newRoot = root;
-      if (i != 0) newRoot = root.clone(nodeIdGenerator_.getNextId());
-      newRoot.getChildren().clear();
-      newRoot.addChild(fragments.get(i).getPlanRoot());
-      newRoot.unsetLimit();
-      newRoot.computeStats(analyzer);
-      fragments.get(i).addPlanRoot(newRoot);
-    }
   }
 
   /**
    * Returns a fragment that materializes the aggregation result of 'node'.
    * If the child fragment is partitioned, the result fragment will be partitioned on
    * the grouping exprs of 'node'.
-   * To handle distributed aggregation over unions, we extract the children of
-   * childFragment if it contains an unpartitioned ExchangeNode, and use those as the
-   * child fragments on which to perform local aggregation.
    * If 'node' is phase 1 of a 2-phase DISTINCT aggregation, this will simply
-   * add 'node' to the child fragment(s) and return the childFragment; the new
+   * add 'node' to the child fragment and return the child fragment; the new
    * fragment will be created by the subsequent call of createAggregationFragment()
    * for the phase 2 AggregationNode.
    */
   private PlanFragment createAggregationFragment(AggregationNode node,
       PlanFragment childFragment, ArrayList<PlanFragment> fragments, Analyzer analyzer)
       throws InternalException, AuthorizationException {
-    List<PlanFragment> childFragments = Lists.newArrayList();
-    PlanFragment parentAggFragment = null;
-    if (getUnionInputs(childFragment, childFragments)) {
-      // Use childFragment for merge aggregation if we unwrapped an exchange.
-      parentAggFragment = childFragment;
-    }
-    if (parentAggFragment == null && !childFragment.isPartitioned()) {
-        // nothing to distribute; do full aggregation directly within childFragment
-        childFragment.addPlanRoot(node);
-        return childFragment;
+    if (!childFragment.isPartitioned()) {
+      // nothing to distribute; do full aggregation directly within childFragment
+      childFragment.addPlanRoot(node);
+      return childFragment;
     }
 
     if (node.getAggInfo().isDistinctAgg()) {
       // 'node' is phase 1 of a DISTINCT aggregation; the actual agg fragment
       // will get created in the next createAggregationFragment() call
       // for the parent AggregationNode
-      addPlanRoots(childFragments, node, analyzer);
+      childFragment.addPlanRoot(node);
       return childFragment;
     }
 
@@ -800,18 +744,14 @@ public class Planner {
           && ((AggregationNode)(node.getChild(0))).getAggInfo().isDistinctAgg();
 
     if (!isDistinct) {
+      // the original aggregation goes into the child fragment,
+      // merge aggregation into a parent fragment
+      childFragment.addPlanRoot(node);
       // if there is a limit, we need to transfer it from the pre-aggregation
-      // node to the merge aggregation node in the parent; remember the limit here
-      // because addPlanRoots() will unset the limit of the pre-aggregation
+      // node in the child fragment to the merge aggregation node in the parent
       long limit = node.getLimit();
-      // the original aggregation goes into all child fragments,
-      // merge aggregation into a single parent fragment
-      addPlanRoots(childFragments, node, analyzer);
-      for (PlanFragment f: childFragments) {
-        Preconditions.checkState(f.getPlanRoot() instanceof AggregationNode);
-        AggregationNode childPlanFoot = (AggregationNode) f.getPlanRoot();
-        childPlanFoot.unsetNeedsFinalize();
-      }
+      node.unsetLimit();
+      node.unsetNeedsFinalize();
 
       DataPartition parentPartition = null;
       if (hasGrouping) {
@@ -829,10 +769,9 @@ public class Planner {
         parentPartition = DataPartition.UNPARTITIONED;
       }
 
-      // place a merge aggregation step in a new fragment, or an existing
-      // parentAggFragment if we are aggregating over a union
-      PlanFragment mergeFragment = createParentFragment(analyzer, childFragments,
-          parentPartition, parentAggFragment);
+      // place a merge aggregation step in a new fragment
+      PlanFragment mergeFragment =
+          createParentFragment(analyzer, childFragment, parentPartition);
       AggregationNode mergeAggNode =
           new AggregationNode(
             nodeIdGenerator_.getNextId(), mergeFragment.getPlanRoot(),
@@ -853,8 +792,8 @@ public class Planner {
     }
 
     Preconditions.checkState(isDistinct);
-    // The first-phase aggregation node is already in the child fragments.
-    Preconditions.checkState(node.getChild(0) == childFragments.get(0).getPlanRoot());
+    // The first-phase aggregation node is already in the child fragment.
+    Preconditions.checkState(node.getChild(0) == childFragment.getPlanRoot());
 
     DataPartition mergePartition = null;
     if (hasGrouping) {
@@ -887,10 +826,9 @@ public class Planner {
           new DataPartition(TPartitionType.HASH_PARTITIONED, partitionExprs);
     }
 
-    // place a merge aggregation step for the 1st phase in parentAggFragment or a new
-    // fragment, depending on whether we unwrapped an exchange
-    PlanFragment mergeFragment = createParentFragment(analyzer, childFragments,
-        mergePartition, parentAggFragment);
+    // place a merge aggregation step for the 1st phase in a new fragment
+    PlanFragment mergeFragment =
+        createParentFragment(analyzer, childFragment, mergePartition);
     AggregateInfo mergeAggInfo =
         ((AggregationNode)(node.getChild(0))).getAggInfo().getMergeAggInfo();
     AggregationNode mergeAggNode =
@@ -906,14 +844,12 @@ public class Planner {
 
     if (!hasGrouping) {
       // place the merge aggregation of the 2nd phase in an unpartitioned fragment;
-      // add preceding merge fragment at end; remove mergeFragment because it may have
-      // already been added if we are aggregating over a union
-      fragments.remove(mergeFragment);
+      // add preceding merge fragment at end
       fragments.add(mergeFragment);
 
       node.unsetNeedsFinalize();
-      mergeFragment = createParentFragment(analyzer,
-          Lists.newArrayList(mergeFragment), DataPartition.UNPARTITIONED, null);
+      mergeFragment =
+          createParentFragment(analyzer, mergeFragment, DataPartition.UNPARTITIONED);
       mergeAggInfo = node.getAggInfo().getMergeAggInfo();
       mergeAggNode =
           new AggregationNode(
@@ -928,76 +864,79 @@ public class Planner {
   }
 
   /**
-   * Returns a fragment that outputs the result of 'node'.
-   * - adds the top-n computation to the child fragment(s)
-   * - if the child fragment is partitioned creates a new unpartitioned fragment that
-   *   merges the output of the child and does another top-n computation
-   * - for a top-n over a union, the child fragment is unpartitioned and only contains an
-   *   ExchangeNoode; adds local top-n nodes to the children of the exchange, and then
-   *   merges the output in childFragment with another top-n
+   * Returns a new unpartitioned fragment that materializes the result of the given
+   * SortNode. If the child fragment is partitioned, returns a new fragment with a
+   * sort-merging exchange that merges the results of the partitioned sorts.
+   * The offset and limit are adjusted in the child and parent plan nodes to produce
+   * the correct result.
    */
-  private PlanFragment createTopnFragment(SortNode node,
+  private PlanFragment createOrderByFragment(SortNode node,
       PlanFragment childFragment, ArrayList<PlanFragment> fragments, Analyzer analyzer)
       throws InternalException, AuthorizationException {
-    List<PlanFragment> childFragments = Lists.newArrayList();
-    PlanFragment mergeFragment = null;
-    if (getUnionInputs(childFragment, childFragments)) {
-      mergeFragment = childFragment;
-    }
-    if (mergeFragment == null && !childFragment.isPartitioned()) {
-      childFragment.addPlanRoot(node);
-      return childFragment;
-    }
+    node.setChild(0, childFragment.getPlanRoot());
+    childFragment.addPlanRoot(node);
+    if (!childFragment.isPartitioned()) return childFragment;
+
     // Remember original offset and limit.
+    boolean hasLimit = node.hasLimit();
     long limit = node.getLimit();
     long offset = node.getOffset();
-    addPlanRoots(childFragments, node, analyzer);
 
-    // we're doing top-n in a single unpartitioned new fragment
-    // that merges the output of childFragment
-    mergeFragment = createParentFragment(analyzer, childFragments,
-        DataPartition.UNPARTITIONED, mergeFragment);
-    // insert sort node that repeats the childrens' sort
-    PlanNode exchNode = mergeFragment.getPlanRoot();
-    SortNode mergeNode = (SortNode) node.clone(nodeIdGenerator_.getNextId());
-    mergeNode.addChild(exchNode);
-    // the merging exchange node must not apply the limit (that's done by the
-    // merging top-n)
+    // Create a new fragment for a sort-merging exchange.
+    PlanFragment mergeFragment = createParentFragment(analyzer, childFragment,
+        DataPartition.UNPARTITIONED);
+    ExchangeNode exchNode = (ExchangeNode) mergeFragment.getPlanRoot();
+
+    // Set limit, offset and merge parameters in the exchange node.
     exchNode.unsetLimit();
+    if (hasLimit) exchNode.setLimit(limit);
+    exchNode.setMergeInfo(node.getSortInfo(), offset);
 
-    // If there is an offset_, it must be applied at the top-n. Child nodes do not apply
-    // the offset_, and instead must keep at least (limit+offset_) rows so that the top-n
-    // node does not miss any rows that should be in the top-n.
-    for (PlanFragment f: childFragments) {
-      SortNode childSortNode = (SortNode) f.getPlanRoot();
+    // Child nodes should not process the offset. If there is a limit,
+    // the child nodes need only return (offset + limit) rows.
+    SortNode childSortNode = (SortNode) childFragment.getPlanRoot();
+    Preconditions.checkState(node == childSortNode);
+    if (hasLimit) {
       childSortNode.unsetLimit();
-      childSortNode.setLimit(limit + ((offset > 0) ? offset : 0));
-      childSortNode.setOffset(0);
-      childSortNode.init(analyzer);
+      childSortNode.setLimit(limit + offset);
     }
-    // Set limit and offset in merge node.
-    mergeNode.setLimit(limit);
-    mergeNode.setOffset(offset);
-    mergeNode.init(analyzer);
-    Preconditions.checkState(mergeNode.hasValidStats());
-    mergeFragment.setPlanRoot(mergeNode);
+    childSortNode.setOffset(0);
+    childSortNode.computeStats(analyzer);
     exchNode.computeStats(analyzer);
 
     return mergeFragment;
   }
 
   /**
-   * Create plan tree for single-node execution.
+   * Create plan tree for single-node execution. Generates PlanNodes for the
+   * Select/Project/Join/Union [All]/Group by/Having/Order by clauses of the query stmt.
    */
-  private PlanNode createQueryPlan(
-      QueryStmt stmt, Analyzer analyzer, long defaultOrderByLimit)
+  private PlanNode createQueryPlan(QueryStmt stmt, Analyzer analyzer, boolean disableTopN)
       throws ImpalaException {
+    PlanNode root;
     if (stmt instanceof SelectStmt) {
-      return createSelectPlan((SelectStmt) stmt, analyzer, defaultOrderByLimit);
+      root = createSelectPlan((SelectStmt) stmt, analyzer);
     } else {
       Preconditions.checkState(stmt instanceof UnionStmt);
-      return createUnionPlan(analyzer, (UnionStmt) stmt);
+      root = createUnionPlan((UnionStmt) stmt, analyzer);
     }
+
+    if (stmt.evaluateOrderBy()) {
+      long limit = stmt.getLimit();
+      // TODO: External sort could be used for very large limits
+      // not just unlimited order-by
+      boolean useTopN = stmt.hasLimit() && !disableTopN;
+      root = new SortNode(nodeIdGenerator_.getNextId(), root, stmt.getSortInfo(),
+          useTopN, stmt.getOffset());
+      Preconditions.checkState(root.hasValidStats());
+      root.setLimit(limit);
+      root.init(analyzer);
+    } else {
+      root.setLimit(stmt.getLimit());
+      root.computeStats(analyzer);
+    }
+
+    return root;
   }
 
   /**
@@ -1191,7 +1130,6 @@ public class Planner {
     return root;
   }
 
-
   /**
    * Return a plan with joins in the order of refPlans (= FROM clause order).
    */
@@ -1215,13 +1153,10 @@ public class Planner {
   /**
    * Create tree of PlanNodes that implements the Select/Project/Join/Group by/Having
    * of the selectStmt query block.
-   * @throws NotImplementedException if selectStmt contains Order By clause w/o Limit
-   *   and the query options don't contain a default limit
    */
-  private PlanNode createSelectPlan(
-      SelectStmt selectStmt, Analyzer analyzer, long defaultOrderByLimit)
+  private PlanNode createSelectPlan(SelectStmt selectStmt, Analyzer analyzer)
       throws ImpalaException {
-    // no from clause -> materialize the select's exprs with a MergeNode
+    // no from clause -> materialize the select's exprs with a UnionNode
     if (selectStmt.getTableRefs().isEmpty()) {
       return createConstantSelectPlan(selectStmt, analyzer);
     }
@@ -1271,14 +1206,6 @@ public class Planner {
       Preconditions.checkNotNull(root);
     }
 
-    if (selectStmt.getSortInfo() != null
-        && selectStmt.getLimit() == -1 && defaultOrderByLimit == -1) {
-      // TODO: only use topN if the memory footprint is expected to be low;
-      // how to account for strings?
-      throw new NotImplementedException(
-          "ORDER BY without LIMIT currently not supported");
-    }
-
     if (root != null) {
       // add unassigned conjuncts_ before aggregation
       // (scenario: agg input comes from an inline view which wasn't able to
@@ -1306,41 +1233,14 @@ public class Planner {
       root.assignConjuncts(analyzer);
     }
 
-    root = addOrderByLimit(
-        analyzer, root, selectStmt.getSortInfo(), selectStmt.getLimit(),
-        defaultOrderByLimit, selectStmt.getOffset());
-
     // All the conjuncts_ should be assigned at this point.
     // TODO: Re-enable this check here and/or elswehere.
     //Preconditions.checkState(!analyzer.hasUnassignedConjuncts());
-
     return root;
   }
 
   /**
-   * Returns a SortNode with 'root' as its input if sortInfo != null, otherwise
-   * just sets the limit.
-   */
-  private PlanNode addOrderByLimit(Analyzer analyzer, PlanNode root,
-      SortInfo sortInfo, long limit, long defaultOrderByLimit, long offset)
-      throws InternalException, AuthorizationException {
-    if (sortInfo != null) {
-      Preconditions.checkState(limit != -1 || defaultOrderByLimit != -1);
-      boolean isDefaultLimit = (limit == -1);
-      root = new SortNode(nodeIdGenerator_.getNextId(), root, sortInfo, true,
-          isDefaultLimit, offset);
-      Preconditions.checkState(root.hasValidStats());
-      root.setLimit(limit != -1 ? limit : defaultOrderByLimit);
-      root.init(analyzer);
-    } else {
-      root.setLimit(limit);
-      root.computeStats(analyzer);
-    }
-    return root;
-  }
-
-  /**
-  * Returns a MergeNode that materializes the exprs of the constant selectStmt.
+  * Returns a UnionNode that materializes the exprs of the constant selectStmt.
   * Replaces the resultExprs of the selectStmt with SlotRefs into the materialized tuple.
   */
   private PlanNode createConstantSelectPlan(SelectStmt selectStmt, Analyzer analyzer)
@@ -1351,9 +1251,9 @@ public class Planner {
     // Create tuple descriptor for materialized tuple.
     TupleDescriptor tupleDesc = analyzer.getDescTbl().createTupleDescriptor();
     tupleDesc.setIsMaterialized(true);
-    MergeNode mergeNode = new MergeNode(nodeIdGenerator_.getNextId(), tupleDesc.getId());
+    UnionNode unionNode = new UnionNode(nodeIdGenerator_.getNextId(), tupleDesc.getId());
     // Analysis guarantees that selects without a FROM clause only have constant exprs.
-    mergeNode.addConstExprList(Lists.newArrayList(resultExprs));
+    unionNode.addConstExprList(Lists.newArrayList(resultExprs));
 
     // Replace the select stmt's resultExprs with SlotRefs into tupleDesc.
     for (int i = 0; i < resultExprs.size(); ++i) {
@@ -1366,9 +1266,9 @@ public class Planner {
       resultExprs.set(i, slotRef);
     }
     tupleDesc.computeMemLayout();
-    // MergeNode.init() needs tupleDesc to have been initialized
-    mergeNode.init(analyzer);
-    return mergeNode;
+    // UnionNode.init() needs tupleDesc to have been initialized
+    unionNode.init(analyzer);
+    return unionNode;
   }
 
   /**
@@ -1445,7 +1345,8 @@ public class Planner {
     // On-clause of an outer join may be pushed into the inline view as well.
     List<Expr> unassigned =
         analyzer.getUnassignedConjuncts(inlineViewRef.getId().asList(), true);
-    if (!inlineViewRef.getViewStmt().hasLimitClause()) {
+    if (!inlineViewRef.getViewStmt().hasLimit()
+        && !inlineViewRef.getViewStmt().hasOffset()) {
       // check if we can evaluate them
       List<Expr> preds = Lists.newArrayList();
       for (Expr e: unassigned) {
@@ -1458,8 +1359,10 @@ public class Planner {
       List<Expr> viewPredicates = Expr.cloneList(preds, inlineViewRef.getSmap());
 
       // "migrate" conjuncts_ by marking them as assigned and re-registering them with
-      // new ids
-      analyzer.markConjunctsAssigned(viewPredicates);
+      // new ids.
+      // Mark pre-substitution conjuncts as assigned, since the ids of the new exprs may
+      // have changed.
+      analyzer.markConjunctsAssigned(preds);
       analyzer.registerConjuncts(viewPredicates);
     }
 
@@ -1467,7 +1370,7 @@ public class Planner {
     // materialized
     analyzer.materializeSlots(Expr.cloneList(unassigned, inlineViewRef.getBaseTblSmap()));
 
-    // Turn a constant select into a MergeNode that materializes the exprs.
+    // Turn a constant select into a UnionNode that materializes the exprs.
     // TODO: unify this with createConstantSelectPlan(), this is basically the
     // same thing
     QueryStmt viewStmt = inlineViewRef.getViewStmt();
@@ -1478,17 +1381,17 @@ public class Planner {
         Preconditions.checkState(inlineViewRef.getMaterializedTupleIds().size() == 1);
         // we need to materialize all slots of our inline view tuple
         analyzer.getTupleDesc(inlineViewRef.getId()).materializeSlots();
-        MergeNode mergeNode = new MergeNode(nodeIdGenerator_.getNextId(),
+        UnionNode unionNode = new UnionNode(nodeIdGenerator_.getNextId(),
             inlineViewRef.getMaterializedTupleIds().get(0));
-        mergeNode.setTblRefIds(Lists.newArrayList(inlineViewRef.getId()));
-        mergeNode.getConstExprLists().add(selectStmt.getBaseTblResultExprs());
-        mergeNode.init(analyzer);
-        return mergeNode;
+        unionNode.setTblRefIds(Lists.newArrayList(inlineViewRef.getId()));
+        unionNode.addConstExprList(selectStmt.getBaseTblResultExprs());
+        unionNode.init(analyzer);
+        return unionNode;
       }
     }
 
     PlanNode rootNode =
-        createQueryPlan(inlineViewRef.getViewStmt(), inlineViewRef.getAnalyzer(), -1);
+        createQueryPlan(inlineViewRef.getViewStmt(), inlineViewRef.getAnalyzer(), false);
     // TODO: we should compute the "physical layout" of the view's descriptor, so that
     // the avg row size is availble during optimization; however, that means we need to
     // select references to its resultExprs from the enclosing scope(s)
@@ -1513,9 +1416,15 @@ public class Planner {
           (HdfsTable)tblRef.getTable());
       scanNode.init(analyzer);
       return scanNode;
-    } else {
+    } else if (tblRef.getTable() instanceof DataSourceTable) {
+      scanNode = new DataSourceScanNode(nodeIdGenerator_.getNextId(), tblRef.getDesc());
+      scanNode.init(analyzer);
+      return scanNode;
+    } else if (tblRef.getTable() instanceof HBaseTable) {
       // HBase table
       scanNode = new HBaseScanNode(nodeIdGenerator_.getNextId(), tblRef.getDesc());
+    } else {
+      throw new InternalException("Invalid table ref class: " + tblRef.getClass());
     }
     // TODO: move this to HBaseScanNode.init();
     Preconditions.checkState(scanNode instanceof HBaseScanNode);
@@ -1714,38 +1623,38 @@ public class Planner {
 
   /**
    * Create a plan tree corresponding to 'unionOperands' for the given unionStmt.
-   * The individual operands' plan trees are attached to a single MergeNode.
+   * The individual operands' plan trees are attached to a single UnionNode.
    */
-  private MergeNode createUnionMergePlan(
+  private UnionNode createUnionPlan(
       Analyzer analyzer, UnionStmt unionStmt, List<UnionOperand> unionOperands)
       throws ImpalaException {
-    MergeNode mergeNode =
-        new MergeNode(nodeIdGenerator_.getNextId(), unionStmt.getTupleId());
+    UnionNode unionNode =
+        new UnionNode(nodeIdGenerator_.getNextId(), unionStmt.getTupleId());
     for (UnionOperand op: unionOperands) {
       QueryStmt queryStmt = op.getQueryStmt();
       if (op.isDropped()) continue;
       if (queryStmt instanceof SelectStmt) {
         SelectStmt selectStmt = (SelectStmt) queryStmt;
         if (selectStmt.getTableRefs().isEmpty()) {
-          mergeNode.addConstExprList(selectStmt.getBaseTblResultExprs());
+          unionNode.addConstExprList(selectStmt.getBaseTblResultExprs());
           continue;
         }
       }
-      PlanNode opPlan = createQueryPlan(queryStmt, analyzer, -1);
-      mergeNode.addChild(opPlan, op.getQueryStmt().getBaseTblResultExprs());
+      PlanNode opPlan = createQueryPlan(queryStmt, analyzer, false);
+      unionNode.addChild(opPlan, op.getQueryStmt().getBaseTblResultExprs());
     }
-    mergeNode.init(analyzer);
-    return mergeNode;
+    unionNode.init(analyzer);
+    return unionNode;
   }
 
   /**
    * Returns plan tree for unionStmt:
-   * - distinctOperands' plan trees are collected in a single MergeNode
+   * - distinctOperands' plan trees are collected in a single UnionNode
    *   and duplicates removed via distinct aggregation
    * - the output of that plus the allOperands' plan trees are collected in
-   *   another MergeNode which materializes the result of unionStmt
+   *   another UnionNode which materializes the result of unionStmt
    */
-  private PlanNode createUnionPlan(Analyzer analyzer, UnionStmt unionStmt)
+  private PlanNode createUnionPlan(UnionStmt unionStmt, Analyzer analyzer )
       throws ImpalaException {
     // Turn unassigned predicates for unionStmt's tupleId_ into predicates for
     // the individual operands.
@@ -1767,7 +1676,7 @@ public class Planner {
           continue;
         }
         // Evaluate constant conjunct and drop operand if it evals to false.
-        if (!FeSupport.EvalPredicate(opConjunct, analyzer.getQueryContext())) {
+        if (!FeSupport.EvalPredicate(opConjunct, analyzer.getQueryCtx())) {
           op.drop();
           break;
         }
@@ -1782,7 +1691,7 @@ public class Planner {
     PlanNode result = null;
     // create DISTINCT tree
     if (unionStmt.hasDistinctOps()) {
-      result = createUnionMergePlan(
+      result = createUnionPlan(
           analyzer, unionStmt, unionStmt.getDistinctOperands());
       result = new AggregationNode(
           nodeIdGenerator_.getNextId(), result, unionStmt.getDistinctAggInfo());
@@ -1790,15 +1699,14 @@ public class Planner {
     }
     // create ALL tree
     if (unionStmt.hasAllOps()) {
-      MergeNode allMerge =
-          createUnionMergePlan(analyzer, unionStmt, unionStmt.getAllOperands());
+      UnionNode allMerge =
+          createUnionPlan(analyzer, unionStmt, unionStmt.getAllOperands());
       // for unionStmt, baseTblResultExprs = resultExprs
-      if (result != null) allMerge.addChild(result, unionStmt.getResultExprs());
+      if (result != null) allMerge.addChild(result,
+          unionStmt.getDistinctAggInfo().getGroupingExprs());
       result = allMerge;
     }
 
-    result = addOrderByLimit(analyzer, result, unionStmt.getSortInfo(),
-        unionStmt.getLimit(), -1, unionStmt.getOffset());
     return result;
   }
 
@@ -1860,6 +1768,7 @@ public class Planner {
       long perHostHbaseScanMem = 0L;
       long perHostHdfsScanMem = 0L;
       long perHostNonScanMem = 0L;
+
       for (int i = 0; i < planNodes.size(); ++i) {
         PlanNode node = planNodes.get(i);
         PlanFragment fragment = node.getFragment();
@@ -1879,6 +1788,7 @@ public class Planner {
           perHostNonScanMem += node.getPerHostMemCost();
         }
       }
+
       // The memory required by concurrent scans cannot exceed the upper memory bound
       // for that scan type.
       // TODO: In the future, we may want to restrict scanner concurrency based on a
@@ -1912,7 +1822,7 @@ public class Planner {
 
       // This plan node set might only have unpartitioned fragments.
       // Only set estimates if they are valid.
-      if (perHostMem > 0 && perHostVcores > 0) {
+      if (perHostMem >= 0 && perHostVcores >= 0) {
         this.perHostMem = perHostMem;
         this.perHostVcores = perHostVcores;
         return true;
@@ -2062,7 +1972,7 @@ public class Planner {
       rhsSet = null;
     }
 
-    // Assume that non-join, non-blocking nodes with multiple children (e.g., MergeNode)
+    // Assume that non-join, non-blocking nodes with multiple children (e.g., UnionNode)
     // consume their inputs in an arbitrary order (i.e., all child subtrees execute
     // concurrently).
     for (PlanNode child: node.getChildren()) {

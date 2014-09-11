@@ -14,7 +14,6 @@
 
 package com.cloudera.impala.catalog;
 
-import java.io.StringReader;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.List;
@@ -27,10 +26,7 @@ import org.apache.hadoop.hive.metastore.api.FieldSchema;
 import org.apache.hadoop.hive.ql.stats.StatsSetupConst;
 import org.apache.log4j.Logger;
 
-import com.cloudera.impala.analysis.CreateTableStmt;
-import com.cloudera.impala.analysis.SqlParser;
-import com.cloudera.impala.analysis.SqlScanner;
-import com.cloudera.impala.common.InternalException;
+import com.cloudera.impala.analysis.TableName;
 import com.cloudera.impala.thrift.TAccessLevel;
 import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TCatalogObjectType;
@@ -181,6 +177,12 @@ public abstract class Table implements CatalogObject {
       table = new View(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     } else if (msTbl.getSd().getInputFormat().equals(HBaseTable.getInputFormat())) {
       table = new HBaseTable(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
+    } else if (DataSourceTable.isDataSourceTable(msTbl)) {
+      // It's important to check if this is a DataSourceTable before HdfsTable because
+      // DataSourceTables are still represented by HDFS tables in the metastore but
+      // have a special table property to indicate that Impala should use an external
+      // data source.
+      table = new DataSourceTable(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     } else if (HdfsFileFormat.isHdfsFormatClass(msTbl.getSd().getInputFormat())) {
       table = new HdfsTable(id, msTbl, db, msTbl.getTableName(), msTbl.getOwner());
     }
@@ -276,36 +278,12 @@ public abstract class Table implements CatalogObject {
    *   - A type Impala can't understand at all, and a TableLoadingException is thrown.
    */
    protected ColumnType parseColumnType(FieldSchema fs) throws TableLoadingException {
-     // Wrap the type string in a CREATE TABLE stmt and use Impala's Parser
-     // to get the ColumnType.
-     // Pick a table name that can't be used.
-     String stmt = String.format("CREATE TABLE $DUMMY ($DUMMY %s)", fs.getType());
-     SqlScanner input = new SqlScanner(new StringReader(stmt));
-     SqlParser parser = new SqlParser(input);
-     CreateTableStmt createTableStmt;
-     try {
-       Object o = parser.parse().value;
-       if (!(o instanceof CreateTableStmt)) {
-         // Should never get here.
-         throw new InternalException("Couldn't parse create table stmt.");
-       }
-       createTableStmt = (CreateTableStmt) o;
-       if (createTableStmt.getColumnDescs().isEmpty()) {
-         // Should never get here.
-         throw new InternalException("Invalid create table stmt.");
-       }
-     } catch (Exception e) {
-       throw new TableLoadingException(String.format(
-           "Unsupported type '%s' in column '%s' of table '%s'",
-           fs.getType(), fs.getName(), getName()));
-     }
-     ColumnType type = createTableStmt.getColumnDescs().get(0).getColType();
+     ColumnType type = ColumnType.parseColumnType(fs);
      if (type == null) {
        throw new TableLoadingException(String.format(
            "Unsupported type '%s' in column '%s' of table '%s'",
            fs.getType(), fs.getName(), getName()));
      }
-     // Return type even if !isSupported() to allow the table loading to succeed.
      return type;
    }
 
@@ -318,8 +296,20 @@ public abstract class Table implements CatalogObject {
   public Db getDb() { return db_; }
   public String getName() { return name_; }
   public String getFullName() { return (db_ != null ? db_.getName() + "." : "") + name_; }
+  public TableName getTableName() { return new TableName(db_.getName(), name_); }
   public String getOwner() { return owner_; }
   public ArrayList<Column> getColumns() { return colsByPos_; }
+
+  /**
+   * Returns a list of the column names ordered by position.
+   */
+  public List<String> getColumnNames() {
+    List<String> colNames = Lists.<String>newArrayList();
+    for (Column col: colsByPos_) {
+      colNames.add(col.getName());
+    }
+    return colNames;
+  }
 
   /**
    * Subclasses should override this if they provide a storage handler class. Currently

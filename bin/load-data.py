@@ -12,7 +12,6 @@ import subprocess
 import sys
 import tempfile
 import time
-import getpass
 from itertools import product
 from optparse import OptionParser
 from Queue import Queue
@@ -75,8 +74,8 @@ GENERATE_SCHEMA_CMD = "generate-schema-statements.py --exploration_strategy=%s "
 # a datafile instead of doing INSERTs.
 # TODO: Adjust connection string for --use_kerberos=true appropriately.
 HIVE_CMD = os.path.join(os.environ['HIVE_HOME'], 'bin/beeline')
-HIVE_ARGS = '-n %s -u "jdbc:hive2://%s/default;" --verbose=true'\
-            % (getpass.getuser(), options.hive_hs2_hostport)
+HIVE_ARGS = '-u "jdbc:hive2://%s/default;auth=noSasl" --verbose=true'\
+            % (options.hive_hs2_hostport)
 HADOOP_CMD = os.path.join(os.environ['HADOOP_HOME'], 'bin/hadoop')
 
 def available_workloads(workload_dir):

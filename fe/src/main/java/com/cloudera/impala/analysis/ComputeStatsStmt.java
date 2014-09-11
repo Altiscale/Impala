@@ -23,8 +23,10 @@ import org.apache.log4j.Logger;
 import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.catalog.AuthorizationException;
 import com.cloudera.impala.catalog.Column;
+import com.cloudera.impala.catalog.ColumnType;
 import com.cloudera.impala.catalog.HBaseTable;
 import com.cloudera.impala.catalog.HdfsTable;
+import com.cloudera.impala.catalog.PrimitiveType;
 import com.cloudera.impala.catalog.Table;
 import com.cloudera.impala.catalog.View;
 import com.cloudera.impala.common.AnalysisException;
@@ -55,6 +57,10 @@ public class ComputeStatsStmt extends StatementBase {
   // Set during analysis.
   protected Table table_;
 
+  // The Null count is not currently being used in optimization or run-time,
+  // and compute stats runs 2x faster in many cases when not counting NULLs.
+  private static final boolean COUNT_NULLS = false;
+
   // Query for getting the per-partition row count and the total row count.
   // Set during analysis.
   protected String tableStatsQueryStr_;
@@ -73,9 +79,10 @@ public class ComputeStatsStmt extends StatementBase {
   public void analyze(Analyzer analyzer) throws AnalysisException,
       AuthorizationException {
     table_ = analyzer.getTable(tableName_, Privilege.ALTER);
+    String sqlTableName = table_.getTableName().toSql();
     if (table_ instanceof View) {
       throw new AnalysisException(String.format(
-          "COMPUTE STATS not allowed on a view: %s", table_.getFullName()));
+          "COMPUTE STATS not allowed on a view: %s", sqlTableName));
     }
 
     // Query for getting the per-partition row count and the total row count.
@@ -96,7 +103,7 @@ public class ComputeStatsStmt extends StatementBase {
       }
     }
     tableStatsQueryBuilder.append(Joiner.on(", ").join(tableStatsSelectList));
-    tableStatsQueryBuilder.append(" FROM " + table_.getFullName());
+    tableStatsQueryBuilder.append(" FROM " + sqlTableName);
     if (!groupByCols.isEmpty()) {
       tableStatsQueryBuilder.append(" GROUP BY ");
       tableStatsQueryBuilder.append(Joiner.on(", ").join(groupByCols));
@@ -113,28 +120,56 @@ public class ComputeStatsStmt extends StatementBase {
     int startColIdx = (table_ instanceof HBaseTable) ? 0 : table_.getNumClusteringCols();
     for (int i = startColIdx; i < table_.getColumns().size(); ++i) {
       Column c = table_.getColumns().get(i);
+      ColumnType ctype = c.getType();
+
       // Ignore columns with an invalid/unsupported type. For example, complex types in
       // an HBase-backed table will appear as invalid types.
-      if (!c.getType().isValid() || !c.getType().isSupported()) continue;
+      if (!ctype.isValid() || !ctype.isSupported()) continue;
+      // Skip decimal columns (see IMPALA-950)
+      if (ctype.getPrimitiveType() == PrimitiveType.DECIMAL) {
+        analyzer.addWarning("Decimal column stats not yet supported, skipping column '" +
+            c.getName() + "'");
+        continue;
+      }
       // NDV approximation function. Add explicit alias for later identification when
       // updating the Metastore.
       String colRefSql = ToSqlUtils.getIdentSql(c.getName());
       columnStatsSelectList.add("NDV(" + colRefSql + ") AS " + colRefSql);
-      // Count the number of NULL values.
-      columnStatsSelectList.add("COUNT(IF(" + colRefSql + " IS NULL, 1, NULL))");
+
+      if (COUNT_NULLS) {
+        // Count the number of NULL values.
+        columnStatsSelectList.add("COUNT(IF(" + colRefSql + " IS NULL, 1, NULL))");
+      } else {
+        // Using -1 to indicate "unknown". We need cast to BIGINT because backend expects
+        // an i64Val as the number of NULLs returned by the COMPUTE STATS column stats
+        // child query. See CatalogOpExecutor::SetColumnStats(). If we do not cast, then
+        // the -1 will be treated as TINYINT resulting a 0 to be placed in the #NULLs
+        // column (see IMPALA-1068).
+        columnStatsSelectList.add("CAST(-1 as BIGINT)");
+      }
+
       // For STRING columns also compute the max and avg string length.
-      if (c.getType().isStringType()) {
+      if (ctype.isStringType()) {
         columnStatsSelectList.add("MAX(length(" + colRefSql + "))");
         columnStatsSelectList.add("AVG(length(" + colRefSql + "))");
       } else {
-        // For non-STRING columns use -1 as the max/avg length to avoid having to
+        // For non-STRING columns we use the fixed size of the type.
+        // We store the same information for all types to avoid having to
         // treat STRING columns specially in the BE CatalogOpExecutor.
-        columnStatsSelectList.add("CAST(-1 as INT)");
-        columnStatsSelectList.add("CAST(-1 as DOUBLE)");
+        Integer typeSize = ctype.getPrimitiveType().getSlotSize();
+        columnStatsSelectList.add(typeSize.toString());
+        columnStatsSelectList.add("CAST(" + typeSize.toString() + " as DOUBLE)");
       }
     }
+
+    if (columnStatsSelectList.size() == 0) {
+      // Table doesn't have any columns that we can compute stats for
+      columnStatsQueryStr_ = null;
+      return;
+    }
+
     columnStatsQueryBuilder.append(Joiner.on(", ").join(columnStatsSelectList));
-    columnStatsQueryBuilder.append(" FROM " + table_.getFullName());
+    columnStatsQueryBuilder.append(" FROM " + sqlTableName);
     columnStatsQueryStr_ = columnStatsQueryBuilder.toString();
     LOG.debug(columnStatsQueryStr_);
   }
@@ -216,7 +251,11 @@ public class ComputeStatsStmt extends StatementBase {
     TComputeStatsParams params = new TComputeStatsParams();
     params.setTable_name(new TTableName(table_.getDb().getName(), table_.getName()));
     params.setTbl_stats_query(tableStatsQueryStr_);
-    params.setCol_stats_query(columnStatsQueryStr_);
+    if (columnStatsQueryStr_ != null) {
+      params.setCol_stats_query(columnStatsQueryStr_);
+    } else {
+      params.setCol_stats_queryIsSet(false);
+    }
     return params;
   }
 }

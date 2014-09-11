@@ -27,7 +27,7 @@ TESTDATA_ACTION=0
 TESTS_ACTION=1
 FORMAT_CLUSTER=0
 FORMAT_METASTORE=0
-TARGET_BUILD_TYPE=Release
+TARGET_BUILD_TYPE=Debug
 EXPLORATION_STRATEGY=core
 SNAPSHOT_FILE=
 
@@ -152,9 +152,9 @@ then
   $IMPALA_HOME/bin/build_thirdparty.sh $([ ${CLEAN_ACTION} -eq 0 ] && echo '-noclean')
 fi
 
-if [ -e $HADOOP_HOME/lib/native/libgplcompression.so ]
+if [ -e $HADOOP_LZO/build/native/Linux-*-*/lib/libgplcompression.so ]
 then
-  cp $HADOOP_HOME/lib/native/libgplcompression.* \
+  cp $HADOOP_LZO/build/native/Linux-*-*/lib/libgplcompression.* \
     $IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/lib/native/
 else
   echo "No hadoop-lzo found"
@@ -163,6 +163,11 @@ fi
 # option to clean everything first
 if [ $CLEAN_ACTION -eq 1 ]
 then
+  # clean the external data source project
+  cd ${IMPALA_HOME}/ext-data-source
+  rm -rf api/generated-sources/*
+  mvn clean
+
   # clean fe
   # don't use git clean because we need to retain Eclipse conf files
   cd $IMPALA_FE_DIR
@@ -174,12 +179,12 @@ then
   # clean be
   cd $IMPALA_HOME/be
   # remove everything listed in .gitignore
-  # git clean -Xdf
+  git clean -Xdf
 
   # clean shell build artifacts
   cd $IMPALA_HOME/shell
   # remove everything listed in .gitignore
-  # git clean -Xdf
+  git clean -Xdf
 
   # clean llvm
   rm -f $IMPALA_HOME/llvm-ir/impala*.ll
@@ -200,6 +205,7 @@ else
   ${IMPALA_HOME}/bin/create-test-configuration.sh
 fi
 
+
 # Generate all the make files from root.
 cd ${IMPALA_HOME}
 rm -f CMakeCache.txt
@@ -213,15 +219,14 @@ then
   (cd $IMPALA_LZO; cmake .; make)
 fi
 
-# Get Hadoop dependencies onto the classpath
-cd $IMPALA_FE_DIR
-mvn dependency:copy-dependencies
+# build the external data source API
+cd ${IMPALA_HOME}/ext-data-source
+mvn install -DskipTests
 
-# build frontend
-# Package first since any test failure will prevent the package phase from completing.
-# We need to do this before loading data so that hive can see the parquet input/output
-# classes.
-mvn -X package -DskipTests=true
+# build frontend and copy dependencies
+cd ${IMPALA_FE_DIR}
+mvn dependency:copy-dependencies
+mvn package -DskipTests=true
 
 # Build the shell tarball
 echo "Creating shell tarball"

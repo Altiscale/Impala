@@ -357,9 +357,11 @@ public class ParserTest {
     ParsesOk("select a from test order by a limit 10 offset 0");
     ParsesOk("select a from test order by a limit 10 offset 0 + 5 / 2");
     ParsesOk("select a from test order by a asc limit 10 offset 5");
+    ParsesOk("select a from test order by a offset 5");
     ParsesOk("select a from test limit 10 offset 5"); // Parses OK, doesn't analyze
-    ParserError("select a from test offset 5");
-    ParserError("select a from test order by a offset 5");
+    ParsesOk("select a from test offset 5"); // Parses OK, doesn't analyze
+    ParsesOk("select a from (select a from test offset 5) A"); // Doesn't analyze
+    ParsesOk("select a from (select a from test order by a offset 5) A");
     ParserError("select a from test order by a limit offset");
     ParserError("select a from test order by a limit offset 5");
   }
@@ -396,25 +398,44 @@ public class ParserTest {
     // Union with limit.
     ParsesOk("(select a from test) union (select a from test) " +
         "union (select a from test) union (select a from test) limit 10");
-    // Union with order by and limit.
+    // Union with order by, offset and limit.
     ParsesOk("(select a from test) union (select a from test) " +
         "union (select a from test) union (select a from test) order by a limit 10");
     ParsesOk("(select a from test) union (select a from test) " +
         "union (select a from test) union (select a from test) order by a " +
         "nulls first limit 10");
+    ParsesOk("(select a from test) union (select a from test) " +
+        "union (select a from test) union (select a from test) order by a " +
+        "nulls first offset 10");
+    ParserError("select a from test union (select a from test) " +
+        "union (select a from test) union (select a from test) offset 10");
     // Union with some select blocks in parenthesis, and others not.
     ParsesOk("(select a from test) union select a from test " +
         "union (select a from test) union select a from test");
     ParsesOk("select a from test union (select a from test) " +
         "union select a from test union (select a from test)");
-    // Union with order by and limit binding to last select.
+    // Union with order by, offset and limit binding to last select.
     ParsesOk("(select a from test) union (select a from test) " +
         "union select a from test union select a from test order by a limit 10");
+    ParsesOk("(select a from test) union (select a from test) " +
+        "union select a from test union select a from test order by a offset 10");
+    ParsesOk("(select a from test) union (select a from test) " +
+        "union select a from test union select a from test order by a");
     // Union with order by and limit.
     // Last select with order by and limit is in parenthesis.
     ParsesOk("select a from test union (select a from test) " +
         "union select a from test union (select a from test order by a limit 10) " +
         "order by a limit 1");
+    ParsesOk("select a from test union (select a from test) " +
+        "union select a from test union (select a from test order by a offset 10) " +
+        "order by a limit 1");
+    ParsesOk("select a from test union (select a from test) " +
+        "union select a from test union (select a from test order by a) " +
+        "order by a limit 1");
+    // Union with order by, offset in first operand.
+    ParsesOk("select a from test order by a union select a from test");
+    ParsesOk("select a from test order by a offset 5 union select a from test");
+    ParsesOk("select a from test offset 5 union select a from test");
     // Union with order by and limit.
     // Last select with order by and limit is not in parenthesis.
     ParsesOk("select a from test union select a from test " +
@@ -470,6 +491,8 @@ public class ParserTest {
     ParsesOk("values(1, 'a') limit 10");
     ParsesOk("values(1, 'a') order by 1");
     ParsesOk("values(1, 'a') order by 1 limit 10");
+    ParsesOk("values(1, 'a') order by 1 offset 10");
+    ParsesOk("values(1, 'a') offset 10");
     ParsesOk("values(1, 'a'), (2, 'b') order by 1 limit 10");
     ParsesOk("values((1, 'a'), (2, 'b')) order by 1 limit 10");
 
@@ -570,12 +593,9 @@ public class ParserTest {
     ParsesOk(String.format("select -%s", Double.toString(Double.MIN_VALUE)));
     ParsesOk(String.format("select -%s", Double.toString(Double.MAX_VALUE)));
 
-    // Java converts a float underflow to 0.0.
-    // Since there is no easy, reliable way to detect underflow,
-    // we don't consider it an error.
+    // Test overflow and underflow
     ParsesOk(String.format("select %s1", Double.toString(Double.MIN_VALUE)));
-    // java converts a float overflow to infinity, we consider it an error
-    ParserError(String.format("select %s1", Double.toString(Double.MAX_VALUE)));
+    ParsesOk(String.format("select %s1", Double.toString(Double.MAX_VALUE)));
   }
 
   @Test
@@ -658,30 +678,31 @@ public class ParserTest {
     ParsesOk("select a + + + 1 from t where a + + + 1", ArithmeticExpr.class);
 
     // float literals
-    ParsesOk("select +1.0 from t where +1.0", FloatLiteral.class);
-    ParsesOk("select +-1.0 from t where +-1.0", FloatLiteral.class);
+    ParsesOk("select +1.0 from t where +1.0", DecimalLiteral.class);
+    ParsesOk("select +-1.0 from t where +-1.0", DecimalLiteral.class);
     ParsesOk("select +1.-0 from t where +1.-0", ArithmeticExpr.class);
+
     // test scientific notation
-    ParsesOk("select 8e6 from t where 8e6", FloatLiteral.class);
-    ParsesOk("select +8e6 from t where +8e6", FloatLiteral.class);
-    ParsesOk("select 8e+6 from t where 8e+6", FloatLiteral.class);
-    ParsesOk("select -8e6 from t where -8e6", FloatLiteral.class);
-    ParsesOk("select 8e-6 from t where 8e-6", FloatLiteral.class);
-    ParsesOk("select -8e-6 from t where -8e-6", FloatLiteral.class);
+    ParsesOk("select 8e6 from t where 8e6", DecimalLiteral.class);
+    ParsesOk("select +8e6 from t where +8e6", DecimalLiteral.class);
+    ParsesOk("select 8e+6 from t where 8e+6", DecimalLiteral.class);
+    ParsesOk("select -8e6 from t where -8e6", DecimalLiteral.class);
+    ParsesOk("select 8e-6 from t where 8e-6", DecimalLiteral.class);
+    ParsesOk("select -8e-6 from t where -8e-6", DecimalLiteral.class);
     // with a decimal point
-    ParsesOk("select 4.5e2 from t where 4.5e2", FloatLiteral.class);
-    ParsesOk("select +4.5e2 from t where +4.5e2", FloatLiteral.class);
-    ParsesOk("select 4.5e+2 from t where 4.5e+2", FloatLiteral.class);
-    ParsesOk("select -4.5e2 from t where -4.5e2", FloatLiteral.class);
-    ParsesOk("select 4.5e-2 from t where 4.5e-2", FloatLiteral.class);
-    ParsesOk("select -4.5e-2 from t where -4.5e-2", FloatLiteral.class);
+    ParsesOk("select 4.5e2 from t where 4.5e2", DecimalLiteral.class);
+    ParsesOk("select +4.5e2 from t where +4.5e2", DecimalLiteral.class);
+    ParsesOk("select 4.5e+2 from t where 4.5e+2", DecimalLiteral.class);
+    ParsesOk("select -4.5e2 from t where -4.5e2", DecimalLiteral.class);
+    ParsesOk("select 4.5e-2 from t where 4.5e-2", DecimalLiteral.class);
+    ParsesOk("select -4.5e-2 from t where -4.5e-2", DecimalLiteral.class);
     // with a decimal point but without a number before the decimal
-    ParsesOk("select .7e9 from t where .7e9", FloatLiteral.class);
-    ParsesOk("select +.7e9 from t where +.7e9", FloatLiteral.class);
-    ParsesOk("select .7e+9 from t where .7e+9", FloatLiteral.class);
-    ParsesOk("select -.7e9 from t where -.7e9", FloatLiteral.class);
-    ParsesOk("select .7e-9 from t where .7e-9", FloatLiteral.class);
-    ParsesOk("select -.7e-9 from t where -.7e-9", FloatLiteral.class);
+    ParsesOk("select .7e9 from t where .7e9", DecimalLiteral.class);
+    ParsesOk("select +.7e9 from t where +.7e9", DecimalLiteral.class);
+    ParsesOk("select .7e+9 from t where .7e+9", DecimalLiteral.class);
+    ParsesOk("select -.7e9 from t where -.7e9", DecimalLiteral.class);
+    ParsesOk("select .7e-9 from t where .7e-9", DecimalLiteral.class);
+    ParsesOk("select -.7e-9 from t where -.7e-9", DecimalLiteral.class);
 
     // mixed signs
     ParsesOk("select -+-1 from t where -+-1", IntLiteral.class);
@@ -1191,6 +1212,12 @@ public class ParserTest {
     ParsesOk("SHOW SCHEMAS");
     ParsesOk("SHOW DATABASES LIKE 'pattern'");
     ParsesOk("SHOW SCHEMAS LIKE 'p*ttern'");
+    // Data sources
+    ParsesOk("SHOW DATA SOURCES");
+    ParsesOk("SHOW DATA SOURCES 'pattern'");
+    ParsesOk("SHOW DATA SOURCES LIKE 'pattern'");
+    ParsesOk("SHOW DATA SOURCES LIKE 'p*ttern'");
+    // Functions
     ParsesOk("SHOW FUNCTIONS");
     ParsesOk("SHOW FUNCTIONS LIKE 'pattern'");
     ParsesOk("SHOW FUNCTIONS LIKE 'p*ttern'");
@@ -1213,10 +1240,19 @@ public class ParserTest {
     ParsesOk("SHOW COLUMN STATS db.tbl");
     ParsesOk("SHOW COLUMN STATS `db`.`tbl`");
 
+    // Show partitions
+    ParsesOk("SHOW PARTITIONS tbl");
+    ParsesOk("SHOW PARTITIONS db.tbl");
+    ParsesOk("SHOW PARTITIONS `db`.`tbl`");
+
     // Missing arguments
     ParserError("SHOW");
     // Malformed pattern (no quotes)
     ParserError("SHOW TABLES tablename");
+    // Invalid SHOW DATA SOURCE statements
+    ParserError("SHOW DATA");
+    ParserError("SHOW SOURCE");
+    ParserError("SHOW DATA SOURCE LIKE NotStrLiteral");
     ParserError("SHOW UNKNOWN FUNCTIONS");
     // Missing table/column qualifier.
     ParserError("SHOW STATS tbl");
@@ -1431,6 +1467,18 @@ public class ParserTest {
     // Location needs to be a string literal
     ParserError("ALTER TABLE TestDb.Foo ADD PARTITION (i=1, s='Hello') LOCATION a/b");
 
+    // Caching ops
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN 'pool'");
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN 'pool'");
+    ParserError("ALTER TABLE Foo ADD PARTITION (j=2) CACHED 'pool'");
+    ParserError("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN");
+    ParserError("ALTER TABLE Foo ADD PARTITION (j=2) CACHED");
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (j=2) UNCACHED");
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (j=2) LOCATION 'a/b' UNCACHED");
+    ParsesOk("ALTER TABLE Foo ADD PARTITION (j=2) LOCATION 'a/b' CACHED IN 'pool'");
+    ParserError("ALTER TABLE Foo ADD PARTITION (j=2) CACHED IN 'pool' LOCATION 'a/b'");
+    ParserError("ALTER TABLE Foo ADD PARTITION (j=2) UNCACHED LOCATION 'a/b'");
+
     ParserError("ALTER TABLE Foo ADD IF EXISTS PARTITION (i=1, s='Hello')");
     ParserError("ALTER TABLE TestDb.Foo ADD (i=1, s='Hello')");
     ParserError("ALTER TABLE TestDb.Foo ADD (i=1)");
@@ -1440,6 +1488,8 @@ public class ParserTest {
     ParserError("ALTER TABLE TestDb.Foo ADD PARTITION ()");
     ParserError("ALTER Foo ADD PARTITION (i=1)");
     ParserError("ALTER TABLE ADD PARTITION (i=1)");
+    ParserError("ALTER TABLE ADD");
+    ParserError("ALTER TABLE DROP");
   }
 
   @Test
@@ -1554,6 +1604,12 @@ public class ParserTest {
         ParserError(String.format("ALTER TABLE Foo %s SET %s (a='b')", part, propType));
         ParserError(String.format("ALTER TABLE Foo %s SET %s (a=b)", part, propType));
       }
+    }
+
+    for (String cacheClause: Lists.newArrayList("UNCACHED", "CACHED in 'pool'")) {
+      ParsesOk("ALTER TABLE Foo SET " + cacheClause);
+      ParsesOk("ALTER TABLE Foo PARTITION(j=0) SET " + cacheClause);
+      ParserError("ALTER TABLE Foo PARTITION(j=0) " + cacheClause);
     }
   }
 
@@ -1681,12 +1737,14 @@ public class ParserTest {
     ParserError("CREATE TABLE T (i int) ESCAPED BY '\0'");
 
     // Order should be: [comment] [partition by cols] [row format] [serdeproperties (..)]
-    // [stored as FILEFORMAT] [location] [tblproperties (...)]
+    // [stored as FILEFORMAT] [location] [cache spec] [tblproperties (...)]
     ParserError("CREATE TABLE Foo (d double) COMMENT 'c' PARTITIONED BY (i int)");
     ParserError("CREATE TABLE Foo (d double) STORED AS TEXTFILE COMMENT 'c'");
     ParserError("CREATE TABLE Foo (d double) STORED AS TEXTFILE ROW FORMAT DELIMITED");
     ParserError("CREATE TABLE Foo (d double) ROW FORMAT DELIMITED COMMENT 'c'");
     ParserError("CREATE TABLE Foo (d double) LOCATION 'a' COMMENT 'c'");
+    ParserError("CREATE TABLE Foo (d double) UNCACHED LOCATION '/a/b'");
+    ParserError("CREATE TABLE Foo (d double) CACHED IN 'pool' LOCATION '/a/b'");
     ParserError("CREATE TABLE Foo (d double) LOCATION 'a' COMMENT 'c' STORED AS RCFILE");
     ParserError("CREATE TABLE Foo (d double) LOCATION 'a' STORED AS RCFILE");
     ParserError("CREATE TABLE Foo (d double) TBLPROPERTIES('a'='b') LOCATION 'a'");
@@ -1698,6 +1756,19 @@ public class ParserTest {
     ParserError("CREATE TABLE Foo (d double COMMENT c)");
     ParserError("CREATE TABLE Foo (d double COMMENT 'c') PARTITIONED BY (j COMMENT hi)");
     ParserError("CREATE TABLE Foo (d double) STORED AS 'TEXTFILE'");
+
+    // Caching
+    ParsesOk("CREATE TABLE Foo (i int) CACHED IN 'myPool'");
+    ParsesOk("CREATE TABLE Foo (i int) PARTITIONED BY(j int) CACHED IN 'myPool'");
+    ParsesOk("CREATE TABLE Foo (i int) PARTITIONED BY(j int) CACHED IN 'myPool'");
+    ParsesOk("CREATE TABLE Foo (i int) PARTITIONED BY(j int) LOCATION '/a' " +
+          "CACHED IN 'myPool'");
+    ParserError("CREATE TABLE Foo (i int) CACHED IN myPool");
+    ParserError("CREATE TABLE Foo (i int) PARTITIONED BY(j int) CACHED IN");
+    ParserError("CREATE TABLE Foo (i int) CACHED 'myPool'");
+    ParserError("CREATE TABLE Foo (i int) IN 'myPool'");
+    ParserError("CREATE TABLE Foo (i int) PARTITIONED BY(j int) CACHED IN 'myPool' " +
+        "LOCATION '/a'");
 
     // Invalid syntax
     ParserError("CREATE TABLE IF EXISTS Foo.Bar (i int)");
@@ -1715,6 +1786,75 @@ public class ParserTest {
     ParserError("CREATE EXTERNAL");
     ParserError("CREATE EXTERNAL TABLE Foo");
     ParserError("CREATE");
+
+    // Valid syntax for tables PRODUCED BY DATA SOURCE
+    ParsesOk("CREATE TABLE Foo (i int, s string) PRODUCED BY DATA SOURCE Bar");
+    ParsesOk("CREATE TABLE Foo (i int, s string) PRODUCED BY DATA SOURCE Bar(\"\")");
+    ParsesOk("CREATE TABLE Foo (i int) PRODUCED BY DATA SOURCE " +
+        "Bar(\"Foo \\!@#$%^&*()\")");
+    ParsesOk("CREATE TABLE IF NOT EXISTS Foo (i int) PRODUCED BY DATA SOURCE Bar(\"\")");
+
+    // Invalid syntax for tables PRODUCED BY DATA SOURCE
+    ParserError("CREATE TABLE Foo (i int) PRODUCED BY DATA Foo");
+    ParserError("CREATE TABLE Foo (i int) PRODUCED BY DATA SRC Foo");
+    ParserError("CREATE TABLE Foo (i int) PRODUCED BY DATA SOURCE Foo.Bar");
+    ParserError("CREATE TABLE Foo (i int) PRODUCED BY DATA SOURCE Foo()");
+    ParserError("CREATE EXTERNAL TABLE Foo (i int) PRODUCED BY DATA SOURCE Foo(\"\")");
+    ParserError("CREATE TABLE Foo (i int) PRODUCED BY DATA SOURCE Foo(\"\") " +
+        "LOCATION 'x'");
+    ParserError("CREATE TABLE Foo (i int) PRODUCED BY DATA SOURCE Foo(\"\") " +
+        "ROW FORMAT DELIMITED");
+    ParserError("CREATE TABLE Foo (i int) PARTITIONED BY (j string) PRODUCED BY DATA " +
+        "SOURCE Foo(\"\")");
+  }
+
+  @Test
+  public void TestCreateDataSource() {
+    ParsesOk("CREATE DATA SOURCE foo LOCATION '/foo.jar' CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    ParsesOk("CREATE DATA SOURCE foo LOCATION \"/foo.jar\" CLASS \"com.bar.Foo\" " +
+        "API_VERSION \"V1\"");
+    ParsesOk("CREATE DATA SOURCE foo LOCATION '/x/foo@hi_^!#.jar' CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+
+    ParserError("CREATE DATA foo LOCATION '/foo.jar' CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SRC foo.bar LOCATION '/foo.jar' CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo.bar LOCATION '/x/foo.jar' CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo LOCATION /x/foo.jar CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo LOCATION '/x/foo.jar' CLASS com.bar.Foo " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo LOCATION '/x/foo.jar' CLASS 'com.bar.Foo' " +
+        "API_VERSION V1");
+    ParserError("CREATE DATA SOURCE LOCATION '/x/foo.jar' CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo LOCATION CLASS 'com.bar.Foo' " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo LOCATION '/foo.jar' API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo LOCATION '/foo.jar' CLASS API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo LOCATION '/foo.jar' CLASS 'com.bar.Foo'");
+    ParserError("CREATE DATA SOURCE foo LOCATION '/foo.jar' CLASS 'Foo' API_VERSION");
+    ParserError("CREATE DATA SOURCE foo CLASS 'com.bar.Foo' LOCATION '/x/foo.jar' " +
+        "API_VERSION 'V1'");
+    ParserError("CREATE DATA SOURCE foo CLASS 'com.bar.Foo' API_VERSION 'V1' " +
+        "LOCATION '/x/foo.jar' ");
+    ParserError("CREATE DATA SOURCE foo API_VERSION 'V1' LOCATION '/x/foo.jar' " +
+        "CLASS 'com.bar.Foo'");
+  }
+
+  @Test
+  public void TestDropDataSource() {
+    ParsesOk("DROP DATA SOURCE foo");
+
+    ParserError("DROP DATA foo");
+    ParserError("DROP DATA SRC foo");
+    ParserError("DROP DATA SOURCE foo.bar");
+    ParserError("DROP DATA SOURCE");
   }
 
   @Test
@@ -2029,8 +2169,8 @@ public class ParserTest {
         "... b, c,c,c,c,c,c,c,c,c,a a a,c,c,c,c,c,c,c,cd,c,d,d,,c,...\n" +
         "                             ^\n" +
         "Encountered: IDENTIFIER\n" +
-        "Expected: CROSS, FROM, FULL, GROUP, HAVING, INNER, JOIN, LEFT, LIMIT, ON, " +
-        "ORDER, RIGHT, UNION, USING, WHERE, COMMA\n");
+        "Expected: CROSS, FROM, FULL, GROUP, HAVING, INNER, JOIN, LEFT, LIMIT, OFFSET, " +
+        "ON, ORDER, RIGHT, UNION, USING, WHERE, COMMA\n");
 
     // Long line: error close to the start
     ParserError("select a a a, b, c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,cd,c,d,d,,c, from t",
@@ -2038,8 +2178,8 @@ public class ParserTest {
         "select a a a, b, c,c,c,c,c,c,c,c,c,c,c,...\n" +
         "           ^\n" +
         "Encountered: IDENTIFIER\n" +
-        "Expected: CROSS, FROM, FULL, GROUP, HAVING, INNER, JOIN, LEFT, LIMIT, ON, " +
-        "ORDER, RIGHT, UNION, USING, WHERE, COMMA\n");
+        "Expected: CROSS, FROM, FULL, GROUP, HAVING, INNER, JOIN, LEFT, LIMIT, OFFSET, " +
+        "ON, ORDER, RIGHT, UNION, USING, WHERE, COMMA\n");
 
     // Long line: error close to the end
     ParserError("select a, b, c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,c,cd,c,d,d, ,c, from t",
@@ -2050,6 +2190,19 @@ public class ParserTest {
         "Expected: CASE, CAST, FALSE, " +
         "IF, INTERVAL, NOT, NULL, TRUE, IDENTIFIER\n");
 
+    // Parsing identifiers that have different names printed as EXPECTED
+    ParserError("DROP DATA SRC foo",
+        "Syntax error in line 1:\n" +
+        "DROP DATA SRC foo\n" +
+        "          ^\n" +
+        "Encountered: IDENTIFIER\n" +
+        "Expected: SOURCE\n");
+    ParserError("SHOW DATA SRCS",
+        "Syntax error in line 1:\n" +
+        "SHOW DATA SRCS\n" +
+        "          ^\n" +
+        "Encountered: IDENTIFIER\n" +
+        "Expected: SOURCES\n");
   }
 
   @Test

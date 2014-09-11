@@ -53,6 +53,7 @@ SlotDescriptor::SlotDescriptor(const TSlotDescriptor& tdesc)
     tuple_offset_(tdesc.byteOffset),
     null_indicator_offset_(tdesc.nullIndicatorByte, tdesc.nullIndicatorBit),
     slot_idx_(tdesc.slotIdx),
+    slot_size_(type_.GetByteSize()),
     field_idx_(-1),
     is_materialized_(tdesc.isMaterialized),
     is_null_fn_(NULL),
@@ -75,12 +76,16 @@ TableDescriptor::TableDescriptor(const TTableDescriptor& tdesc)
     database_(tdesc.dbName),
     id_(tdesc.id),
     num_cols_(tdesc.numCols),
-    num_clustering_cols_(tdesc.numClusteringCols) {
+    num_clustering_cols_(tdesc.numClusteringCols),
+    col_names_(tdesc.colNames) {
 }
 
 string TableDescriptor::DebugString() const {
   stringstream out;
   out << "#cols=" << num_cols_ << " #clustering_cols=" << num_clustering_cols_;
+  out << " col_names=[";
+  out << join(col_names_, ":");
+  out << "]";
   return out.str();
 }
 
@@ -93,9 +98,10 @@ HdfsPartitionDescriptor::HdfsPartitionDescriptor(const THdfsPartition& thrift_pa
     block_size_(thrift_partition.blockSize),
     location_(thrift_partition.location),
     compression_(thrift_partition.compression),
+    id_(thrift_partition.id),
     exprs_prepared_(false),
     file_format_(thrift_partition.fileFormat),
-    object_pool_(pool)  {
+    object_pool_(pool) {
 
   for (int i = 0; i < thrift_partition.partitionKeyExprs.size(); ++i) {
     Expr* expr;
@@ -127,11 +133,16 @@ string HdfsPartitionDescriptor::DebugString() const {
   return out.str();
 }
 
+string DataSourceTableDescriptor::DebugString() const {
+  stringstream out;
+  out << "DataSourceTable(" << TableDescriptor::DebugString() << ")";
+  return out.str();
+}
+
 HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc,
     ObjectPool* pool)
   : TableDescriptor(tdesc),
     hdfs_base_dir_(tdesc.hdfsTable.hdfsBaseDir),
-    col_names_(tdesc.hdfsTable.colNames),
     null_partition_key_value_(tdesc.hdfsTable.nullPartitionKeyValue),
     null_column_value_(tdesc.hdfsTable.nullColumnValue),
     object_pool_(pool) {
@@ -148,12 +159,7 @@ HdfsTableDescriptor::HdfsTableDescriptor(const TTableDescriptor& tdesc,
 string HdfsTableDescriptor::DebugString() const {
   stringstream out;
   out << "HdfsTable(" << TableDescriptor::DebugString()
-      << " hdfs_base_dir='" << hdfs_base_dir_ << "'"
-      << " col_names=[";
-
-  out << join(col_names_, ":");
-
-  out << "]";
+      << " hdfs_base_dir='" << hdfs_base_dir_ << "'";
   out << " partitions=[";
   vector<string> partition_strings;
   map<int64_t, HdfsPartitionDescriptor*>::const_iterator it;
@@ -323,6 +329,9 @@ Status DescriptorTbl::Create(ObjectPool* pool, const TDescriptorTable& thrift_tb
         break;
       case TTableType::HBASE_TABLE:
         desc = pool->Add(new HBaseTableDescriptor(tdesc));
+        break;
+      case TTableType::DATA_SOURCE_TABLE:
+        desc = pool->Add(new DataSourceTableDescriptor(tdesc));
         break;
       default:
         DCHECK(false) << "invalid table type: " << tdesc.tableType;

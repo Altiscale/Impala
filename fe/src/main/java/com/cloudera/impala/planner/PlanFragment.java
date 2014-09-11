@@ -22,15 +22,18 @@ import org.slf4j.LoggerFactory;
 
 import com.cloudera.impala.analysis.Analyzer;
 import com.cloudera.impala.analysis.Expr;
+import com.cloudera.impala.analysis.JoinOperator;
+import com.cloudera.impala.analysis.SlotRef;
 import com.cloudera.impala.analysis.TupleId;
 import com.cloudera.impala.common.InternalException;
 import com.cloudera.impala.common.NotImplementedException;
+import com.cloudera.impala.common.Pair;
+import com.cloudera.impala.planner.HashJoinNode.DistributionMode;
 import com.cloudera.impala.thrift.TExplainLevel;
 import com.cloudera.impala.thrift.TPartitionType;
 import com.cloudera.impala.thrift.TPlanFragment;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Predicates;
-import com.google.common.collect.Lists;
+import com.google.common.math.LongMath;
 
 /**
  * A PlanFragment is part of a tree of such fragments that together make
@@ -94,6 +97,7 @@ public class PlanFragment {
    * different fragment.
    */
   private void setFragmentInPlanTree(PlanNode node) {
+    if (node == null) return;
     node.setFragment(this);
     if (!(node instanceof ExchangeNode)) {
       for (PlanNode child : node.getChildren()) {
@@ -109,24 +113,19 @@ public class PlanFragment {
   /**
    * Finalize plan tree and create stream sink, if needed.
    */
-  public void finalize(Analyzer analyzer, boolean validateFileFormats)
+  public void finalize(Analyzer analyzer)
       throws InternalException, NotImplementedException {
-    if (planRoot_ != null) setRowTupleIds(planRoot_, null);
+    if (planRoot_ != null) {
+      setRowTupleIds(planRoot_, null);
+      computeCanAddSlotFilters(planRoot_);
+    }
+
     if (destNode_ != null) {
       Preconditions.checkState(sink_ == null);
       // we're streaming to an exchange node
       DataStreamSink streamSink = new DataStreamSink(destNode_, outputPartition_);
       streamSink.setFragment(this);
       sink_ = streamSink;
-    }
-
-    if (planRoot_ != null && validateFileFormats) {
-      // verify that after partition pruning hdfs partitions only use supported formats
-      ArrayList<HdfsScanNode> hdfsScans = Lists.newArrayList();
-      planRoot_.collect(Predicates.instanceOf(HdfsScanNode.class), hdfsScans);
-      for (HdfsScanNode hdfsScanNode: hdfsScans) {
-        hdfsScanNode.validateFileFormat();
-      }
     }
   }
 
@@ -155,7 +154,7 @@ public class PlanFragment {
     if (node instanceof ScanNode || node instanceof ExchangeNode) {
       // nothing to propagate for leaves
       return;
-    } else if (node instanceof AggregationNode || node instanceof MergeNode) {
+    } else if (node instanceof AggregationNode || node instanceof UnionNode) {
       for (PlanNode child: node.getChildren()) {
         // row composition changes at an aggregation node
         setRowTupleIds(child, null);
@@ -178,6 +177,57 @@ public class PlanFragment {
   }
 
   /**
+   * Returns true and sets node.canAddPredicate, if we can add single-slot filters at
+   * execution time (i.e. after Prepare() to the plan tree rooted at this node.
+   * That is, 'node' can add filters that can be evaluated at nodes below.
+   *
+   * We compute this by walking the tree bottom up.
+   *
+   * TODO: move this to PlanNode.init() which is normally responsible for computing
+   * internal state of PlanNodes. We can't do this currently since we need the
+   * distrubutionMode() set on HashJoin nodes. Once we call init() properly for
+   * repartitioned joins, this logic can move to init().
+   */
+  private boolean computeCanAddSlotFilters(PlanNode node) {
+    if (node instanceof HashJoinNode) {
+      HashJoinNode hashJoinNode = (HashJoinNode)node;
+      boolean childResult = computeCanAddSlotFilters(node.getChild(0));
+      if (!childResult) return false;
+      if (hashJoinNode.getJoinOp().equals(JoinOperator.FULL_OUTER_JOIN) ||
+          hashJoinNode.getJoinOp().equals(JoinOperator.LEFT_OUTER_JOIN)) {
+        // Never correct to push through an outer join on the probe side. We can't
+        // filter those rows out.
+        return false;
+      }
+      // We can't push down predicates for partitioned joins yet.
+      // TODO: this can be hugely helpful to avoid network traffic. Implement this.
+      if (hashJoinNode.getDistributionMode() == DistributionMode.PARTITIONED) {
+        return false;
+      }
+
+      List<Pair<Expr, Expr>> joinConjuncts = hashJoinNode.getEqJoinConjuncts();
+      // We can only add these filters for conjuncts of the form:
+      // <probe_slot> = *. If the hash join has any equal join conjuncts in this form,
+      // mark the hash join node.
+      for (Pair<Expr, Expr> c: joinConjuncts) {
+        if (c.first instanceof SlotRef) {
+          hashJoinNode.setAddProbeFilters(true);
+          break;
+        }
+      }
+      // Even if this join cannot add predicates, return true so the parent node can.
+      return true;
+    } else if (node instanceof HdfsScanNode) {
+      return true;
+    } else {
+      for (PlanNode child : node.getChildren()) {
+        computeCanAddSlotFilters(child);
+      }
+      return false;
+    }
+  }
+
+  /**
    * Estimates the per-node number of distinct values of exprs based on the data
    * partition of this fragment and its number of nodes. Returns -1 for an invalid
    * estimate, e.g., because getNumDistinctValues() failed on one of the exprs.
@@ -196,16 +246,16 @@ public class PlanFragment {
         break;
       }
       if (dataPartition_.getPartitionExprs().contains(expr)) {
-        result *= Math.max((double) numDistinct / (double) numNodes, 1L);
-      } else {
-        result *= numDistinct;
+        numDistinct = (long)Math.max((double) numDistinct / (double) numNodes, 1L);
       }
+      result = PlanNode.multiplyCardinalities(result, numDistinct);
     }
     return result;
   }
 
   public TPlanFragment toThrift() {
     TPlanFragment result = new TPlanFragment();
+    result.setDisplay_name(fragmentId_.toString());
     if (planRoot_ != null) result.setPlan(planRoot_.treeToThrift());
     if (outputExprs_ != null) {
       result.setOutput_exprs(Expr.treesToThrift(outputExprs_));

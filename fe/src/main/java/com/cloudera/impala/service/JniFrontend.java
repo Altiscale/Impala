@@ -18,7 +18,6 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
-import java.net.URI;
 import java.net.URL;
 import java.net.URLConnection;
 import java.util.Enumeration;
@@ -49,6 +48,7 @@ import com.cloudera.impala.authorization.AuthorizationConfig;
 import com.cloudera.impala.authorization.ImpalaInternalAdminUser;
 import com.cloudera.impala.authorization.Privilege;
 import com.cloudera.impala.authorization.User;
+import com.cloudera.impala.catalog.DataSource;
 import com.cloudera.impala.catalog.Function;
 import com.cloudera.impala.common.FileSystemUtil;
 import com.cloudera.impala.common.ImpalaException;
@@ -58,17 +58,21 @@ import com.cloudera.impala.thrift.TCatalogObject;
 import com.cloudera.impala.thrift.TDescribeTableParams;
 import com.cloudera.impala.thrift.TDescribeTableResult;
 import com.cloudera.impala.thrift.TExecRequest;
+import com.cloudera.impala.thrift.TGetDataSrcsParams;
+import com.cloudera.impala.thrift.TGetDataSrcsResult;
 import com.cloudera.impala.thrift.TGetDbsParams;
 import com.cloudera.impala.thrift.TGetDbsResult;
 import com.cloudera.impala.thrift.TGetFunctionsParams;
 import com.cloudera.impala.thrift.TGetFunctionsResult;
+import com.cloudera.impala.thrift.TGetHadoopConfigRequest;
+import com.cloudera.impala.thrift.TGetHadoopConfigResponse;
 import com.cloudera.impala.thrift.TGetTablesParams;
 import com.cloudera.impala.thrift.TGetTablesResult;
 import com.cloudera.impala.thrift.TLoadDataReq;
 import com.cloudera.impala.thrift.TLoadDataResp;
 import com.cloudera.impala.thrift.TLogLevel;
 import com.cloudera.impala.thrift.TMetadataOpRequest;
-import com.cloudera.impala.thrift.TQueryContext;
+import com.cloudera.impala.thrift.TQueryCtx;
 import com.cloudera.impala.thrift.TResultSet;
 import com.cloudera.impala.thrift.TShowStatsParams;
 import com.cloudera.impala.thrift.TTableName;
@@ -87,11 +91,6 @@ public class JniFrontend {
   private final static TBinaryProtocol.Factory protocolFactory_ =
       new TBinaryProtocol.Factory();
   private final Frontend frontend_;
-
-  // Required minimum value (in milliseconds) for the HDFS config
-  // 'dfs.client.file-block-storage-locations.timeout.millis'
-  private static final long MIN_DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS =
-      10 * 1000;
 
   /**
    * Create a new instance of the Jni Frontend.
@@ -116,11 +115,11 @@ public class JniFrontend {
    */
   public byte[] createExecRequest(byte[] thriftQueryContext)
       throws ImpalaException {
-    TQueryContext queryCxt = new TQueryContext();
-    JniUtil.deserializeThrift(protocolFactory_, queryCxt, thriftQueryContext);
+    TQueryCtx queryCtx = new TQueryCtx();
+    JniUtil.deserializeThrift(protocolFactory_, queryCtx, thriftQueryContext);
 
     StringBuilder explainString = new StringBuilder();
-    TExecRequest result = frontend_.createExecRequest(queryCxt, explainString);
+    TExecRequest result = frontend_.createExecRequest(queryCtx, explainString);
     LOG.debug(explainString.toString());
 
     // TODO: avoid creating serializer for each query?
@@ -167,9 +166,9 @@ public class JniFrontend {
    * This call is thread-safe.
    */
   public String getExplainPlan(byte[] thriftQueryContext) throws ImpalaException {
-    TQueryContext queryCtxt = new TQueryContext();
-    JniUtil.deserializeThrift(protocolFactory_, queryCtxt, thriftQueryContext);
-    String plan = frontend_.getExplainString(queryCtxt);
+    TQueryCtx queryCtx = new TQueryCtx();
+    JniUtil.deserializeThrift(protocolFactory_, queryCtx, thriftQueryContext);
+    String plan = frontend_.getExplainString(queryCtx);
     LOG.debug("Explain plan: " + plan);
     return plan;
   }
@@ -221,6 +220,36 @@ public class JniFrontend {
     TGetDbsResult result = new TGetDbsResult();
     result.setDbs(dbs);
 
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    try {
+      return serializer.serialize(result);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
+  }
+
+  /**
+   * Returns a list of data sources matching an optional pattern.
+   * The argument is a serialized TGetDataSrcsResult object.
+   * The return type is a serialised TGetDataSrcsResult object.
+   * @see Frontend#getDataSrcs
+   */
+  public byte[] getDataSrcMetadata(byte[] thriftParams) throws ImpalaException {
+    TGetDataSrcsParams params = new TGetDataSrcsParams();
+    JniUtil.deserializeThrift(protocolFactory_, params, thriftParams);
+
+    TGetDataSrcsResult result = new TGetDataSrcsResult();
+    List<DataSource> dataSources = frontend_.getDataSrcs(params.pattern);
+    result.setData_src_names(Lists.<String>newArrayListWithCapacity(dataSources.size()));
+    result.setLocations(Lists.<String>newArrayListWithCapacity(dataSources.size()));
+    result.setClass_names(Lists.<String>newArrayListWithCapacity(dataSources.size()));
+    result.setApi_versions(Lists.<String>newArrayListWithCapacity(dataSources.size()));
+    for (DataSource dataSource: dataSources) {
+      result.addToData_src_names(dataSource.getName());
+      result.addToLocations(dataSource.getLocation().toUri().getPath());
+      result.addToClass_names(dataSource.getClassName());
+      result.addToApi_versions(dataSource.getApiVersion());
+    }
     TSerializer serializer = new TSerializer(protocolFactory_);
     try {
       return serializer.serialize(result);
@@ -379,6 +408,24 @@ public class JniFrontend {
     return output.toString();
   }
 
+  /**
+   * Returns the corresponding config value for the given key as a serialized
+   * TGetHadoopConfigResponse. If the config value is null, the 'value' field in the
+   * thrift response object will not be set.
+   */
+  public byte[] getHadoopConfig(byte[] serializedRequest) throws ImpalaException {
+    TGetHadoopConfigRequest request = new TGetHadoopConfigRequest();
+    JniUtil.deserializeThrift(protocolFactory_, request, serializedRequest);
+    TGetHadoopConfigResponse result = new TGetHadoopConfigResponse();
+    result.setValue(CONF.get(request.getName()));
+    TSerializer serializer = new TSerializer(protocolFactory_);
+    try {
+      return serializer.serialize(result);
+    } catch (TException e) {
+      throw new InternalException(e.getMessage());
+    }
+  }
+
   public class CdhVersion implements Comparable<CdhVersion> {
     private final int major;
     private final int minor;
@@ -475,9 +522,11 @@ public class JniFrontend {
     }
 
     try {
-      URI nnUri = getCurrentNameNodeAddress();
-      if (nnUri == null) return null;
-      URL nnWebUi = new URL(nnUri.toURL(), "/dfshealth.jsp");
+      String nnUrl = getCurrentNameNodeAddress();
+      if (nnUrl == null) {
+        return null;
+      }
+      URL nnWebUi = new URL("http://" + nnUrl + "/dfshealth.jsp");
       URLConnection conn = nnWebUi.openConnection();
       BufferedReader in = new BufferedReader(
           new InputStreamReader(conn.getInputStream()));
@@ -506,7 +555,7 @@ public class JniFrontend {
    *
    * @return Returns http address or null if failure.
    */
-  private URI getCurrentNameNodeAddress() throws Exception {
+  private String getCurrentNameNodeAddress() throws Exception {
     // get the filesystem object to verify it is an HDFS system
     FileSystem fs;
     fs = FileSystem.get(CONF);
@@ -514,7 +563,7 @@ public class JniFrontend {
       LOG.error("FileSystem is " + fs.getUri());
       return null;
     }
-    return DFSUtil.getInfoServer(HAUtil.getAddressOfActive(fs), CONF, "http");
+    return DFSUtil.getInfoServer(HAUtil.getAddressOfActive(fs), CONF, false);
   }
 
   /**
@@ -676,15 +725,13 @@ public class JniFrontend {
       errorCause.append(" is not enabled.\n");
     }
 
-    // dfs.client.file-block-storage-locations.timeout.millis should be >= 10 seconds
-    int dfsClientFileBlockStorageLocationsTimeoutMs = conf.getInt(
-        DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS,
-        DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS_DEFAULT);
-    if (dfsClientFileBlockStorageLocationsTimeoutMs <
-        MIN_DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS) {
+    // dfs.client.file-block-storage-locations.timeout should be >= 500
+    // TODO: OPSAPS-12765 - it should be >= 3000, but use 500 for now until CM refresh
+    if (conf.getInt(DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT,
+        DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_DEFAULT) < 500) {
       errorCause.append(prefix);
-      errorCause.append(DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT_MS);
-      errorCause.append(" is too low. It should be at least 10 seconds.\n");
+      errorCause.append(DFSConfigKeys.DFS_CLIENT_FILE_BLOCK_STORAGE_LOCATIONS_TIMEOUT);
+      errorCause.append(" is too low. It should be at least 3000.\n");
     }
 
     if (errorCause.length() > 0) {

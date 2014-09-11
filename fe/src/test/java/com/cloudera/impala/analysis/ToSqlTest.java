@@ -18,6 +18,7 @@ import static org.junit.Assert.fail;
 
 import org.junit.Test;
 
+import com.cloudera.impala.common.AnalysisException;
 import com.cloudera.impala.testutil.TestUtils;
 import com.google.common.base.Preconditions;
 
@@ -31,12 +32,12 @@ public class ToSqlTest extends AnalyzerTest {
   private final String[] joinTypes_ = new String[] {"INNER JOIN", "LEFT OUTER JOIN",
       "RIGHT OUTER JOIN", "FULL OUTER JOIN", "LEFT SEMI JOIN"};
 
-  private static AnalysisContext.AnalysisResult analyze(String query) {
+  private static AnalysisContext.AnalysisResult analyze(String query, String defaultDb) {
     try {
-      AnalysisContext analysisCtxt =
-          new AnalysisContext(catalog_, TestUtils.createQueryContext());
-      analysisCtxt.analyze(query);
-      AnalysisContext.AnalysisResult analysisResult = analysisCtxt.getAnalysisResult();
+      AnalysisContext analysisCtx = new AnalysisContext(catalog_,
+          TestUtils.createQueryContext(defaultDb, System.getProperty("user.name")));
+      analysisCtx.analyze(query);
+      AnalysisContext.AnalysisResult analysisResult = analysisCtx.getAnalysisResult();
       Preconditions.checkNotNull(analysisResult.getStmt());
       return analysisResult;
     } catch (Exception e) {
@@ -47,13 +48,19 @@ public class ToSqlTest extends AnalyzerTest {
   }
 
   private void testToSql(String query, String expected) {
-    AnalysisContext.AnalysisResult analysisResult = analyze(query);
+    testToSql(query, System.getProperty("user.name"), expected);
+  }
+
+  private void testToSql(String query, String defaultDb, String expected) {
+    AnalysisContext.AnalysisResult analysisResult = analyze(query, defaultDb);
     String actual = analysisResult.getStmt().toSql();
     if (!actual.equals(expected)) {
-      fail("Expected: " + expected + "\n Actual: " + actual + "\n");
+      String msg = "Expected: " + expected + "\n  Actual: " + actual + "\n";
+      System.err.println(msg);
+      fail(msg);
     }
     // Try to parse and analyze the resulting SQL to ensure its validity.
-    AnalyzesOk(actual);
+    AnalyzesOk(actual, createAnalyzer(defaultDb));
   }
 
   private void runTestTemplate(String sql, String expectedSql, String[]... testDims) {
@@ -73,26 +80,81 @@ public class ToSqlTest extends AnalyzerTest {
     }
   }
 
- @Test
- public void selectListTest() {
-   testToSql("select 1234, 1234.0, 1234.0 + 1, 1234.0 + 1.0, 1 + 1, \"abc\" " +
-       "from functional.alltypes",
-       "SELECT 1234, 1234.0, 1234.0 + 1.0, 1234.0 + 1.0, 1 + 1, 'abc' " +
-       "FROM functional.alltypes");
-   // Test aliases.
-   testToSql("select 1234 i, 1234.0 as j, (1234.0 + 1) k, (1234.0 + 1.0) as l " +
-       "from functional.alltypes",
-       "SELECT 1234 i, 1234.0 j, (1234.0 + 1.0) k, (1234.0 + 1.0) l " +
-       "FROM functional.alltypes");
-   // Test select without from.
-   testToSql("select 1234 i, 1234.0 as j, (1234.0 + 1) k, (1234.0 + 1.0) as l",
-       "SELECT 1234 i, 1234.0 j, (1234.0 + 1.0) k, (1234.0 + 1.0) l");
-   // Test select without from.
-   testToSql("select null, 1234 < 5678, 1234.0 < 5678.0, 1234 < null " +
-       "from functional.alltypes",
-       "SELECT NULL, 1234 < 5678, 1234.0 < 5678.0, 1234 < NULL " +
-       "FROM functional.alltypes");
- }
+  @Test
+  public void selectListTest() {
+    testToSql("select 1234, 1234.0, 1234.0 + 1, 1234.0 + 1.0, 1 + 1, \"abc\" " +
+        "from functional.alltypes",
+        "SELECT 1234, 1234.0, 1234.0 + 1, 1234.0 + 1.0, 1 + 1, 'abc' " +
+        "FROM functional.alltypes");
+    // Test aliases.
+    testToSql("select 1234 i, 1234.0 as j, (1234.0 + 1) k, (1234.0 + 1.0) as l " +
+        "from functional.alltypes",
+        "SELECT 1234 i, 1234.0 j, (1234.0 + 1) k, (1234.0 + 1.0) l " +
+        "FROM functional.alltypes");
+    // Test select without from.
+    testToSql("select 1234 i, 1234.0 as j, (1234.0 + 1) k, (1234.0 + 1.0) as l",
+        "SELECT 1234 i, 1234.0 j, (1234.0 + 1) k, (1234.0 + 1.0) l");
+    // Test select without from.
+    testToSql("select null, 1234 < 5678, 1234.0 < 5678.0, 1234 < null " +
+        "from functional.alltypes",
+        "SELECT NULL, 1234 < 5678, 1234.0 < 5678.0, 1234 < NULL " +
+        "FROM functional.alltypes");
+  }
+
+  @Test
+  public void TestTableAliases() throws AnalysisException {
+    String[] tables = new String[] { "alltypes", "alltypes_view" };
+    String[] columns = new String[] { "int_col", "*" };
+
+    for (String tbl: tables) {
+      for (String col: columns) {
+        // Test implicit table aliases with unqualified table/view name.
+        // Unqualified table/view name is fully qualified in toSql().
+        // Regression tests for IMPALA-962.
+        testToSql(String.format("select %s from %s", col, tbl), "functional",
+            String.format("SELECT %s FROM functional.%s", col, tbl));
+        testToSql(String.format("select %s.%s from %s", tbl, col, tbl), "functional",
+            String.format("SELECT %s.%s FROM functional.%s", tbl, col, tbl));
+        testToSql(String.format("select functional.%s.%s from %s", tbl, col, tbl),
+            "functional",
+            String.format("SELECT functional.%s.%s FROM functional.%s", tbl, col, tbl));
+
+        // Test implicit table aliases with fully-qualified table/view name.
+        testToSql(String.format("select %s from functional.%s", col, tbl),
+            String.format("SELECT %s FROM functional.%s", col, tbl));
+        testToSql(String.format("select %s.%s from functional.%s", tbl, col, tbl),
+            String.format("SELECT %s.%s FROM functional.%s", tbl, col, tbl));
+        testToSql(String.format("select functional.%s.%s from functional.%s",
+            tbl, col, tbl),
+            String.format("SELECT functional.%s.%s FROM functional.%s", tbl, col, tbl));
+
+        // Explicit table alias.
+        testToSql(String.format("select %s from functional.%s a", col, tbl),
+            String.format("SELECT %s FROM functional.%s a", col, tbl));
+        testToSql(String.format("select a.%s from functional.%s a", col, tbl),
+            String.format("SELECT a.%s FROM functional.%s a", col, tbl));
+      }
+    }
+
+    for (String t1: tables) {
+      for (String t2: tables) {
+        if (t1 == t2) continue;
+        for (String col: columns) {
+          // Multiple implicit fully-qualified aliases work.
+          testToSql(String.format(
+              "select functional.%s.%s, functional.%s.%s " +
+                  "from functional.%s, functional.%s", t1, col, t2, col, t1, t2),
+              String.format("SELECT functional.%s.%s, functional.%s.%s " +
+                  "FROM functional.%s, functional.%s", t1, col, t2, col, t1, t2));
+        }
+      }
+    }
+
+    // Unqualified '*' is not ambiguous.
+    testToSql("select * from functional.alltypes " +
+        "cross join functional_parquet.alltypes",
+        "SELECT * FROM functional.alltypes CROSS JOIN functional_parquet.alltypes");
+  }
 
   /**
    * Tests quoting of identifiers for view compatibility with Hive,
@@ -372,7 +434,7 @@ public class ToSqlTest extends AnalyzerTest {
         "SELECT t1.id, t2.id FROM " +
         "(SELECT id, string_col FROM functional.alltypes) t1, " +
         "(SELECT id, float_col FROM functional.alltypes) t2 " +
-        "WHERE t1.id = t2.id AND t1.string_col = 'abc' AND t2.float_col < 10.0");
+        "WHERE t1.id = t2.id AND t1.string_col = 'abc' AND t2.float_col < 10");
   }
 
   @Test
@@ -513,11 +575,11 @@ public class ToSqlTest extends AnalyzerTest {
     testToSql("select 1 * 1, (1 * 1), 2 / 2, (2 / 2), 3 % 3, (3 % 3), " +
         "4 DIV 4, (4 DIV 4), 5 + 5, (5 + 5), 6 - 6, (6 - 6), 7 & 7, (7 & 7), " +
         "8 | 8, (8 | 8), 9 ^ 9, (9 ^ 9), ~10, (~10)",
-        "SELECT 1 * 1, (1 * 1), 2.0 / 2.0, (2.0 / 2.0), 3 % 3, (3 % 3), " +
+        "SELECT 1 * 1, (1 * 1), 2 / 2, (2 / 2), 3 % 3, (3 % 3), " +
          "4 DIV 4, (4 DIV 4), 5 + 5, (5 + 5), 6 - 6, (6 - 6), 7 & 7, (7 & 7), " +
         "8 | 8, (8 | 8), 9 ^ 9, (9 ^ 9), ~10, (~10)");
     testToSql("select (((1 + 2) * (3 - 4) + 6) / 7)",
-        "SELECT (((1 + 2) * (3 - 4) + 6) / 7.0)");
+        "SELECT (((1 + 2) * (3 - 4) + 6) / 7)");
 
     // CaseExpr.
     // Single case without else clause. No case expr.
@@ -618,6 +680,6 @@ public class ToSqlTest extends AnalyzerTest {
    */
   @Test
   public void testDecimal() {
-    //testToSql("select cast(1 as decimal)", "SELECT CAST(1 AS DECIMAL(9,0))");
+    testToSql("select cast(1 as decimal)", "SELECT CAST(1 AS DECIMAL(9,0))");
   }
 }
