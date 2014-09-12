@@ -17,7 +17,7 @@
 # setup your environment. If $IMPALA_HOME is undefined
 # this script will set it to the current working directory.
 
-export JAVA_HOME=${JAVA_HOME-/usr/java/default}
+export JAVA_HOME=${JAVA_HOME:-/usr/java/default}
 if [ ! -d $JAVA_HOME ] ; then
   export JAVA_HOME="/usr/lib/jvm/java-openjdk"
   echo "ok - trying to look for openjdk path $JAVA_HOME"
