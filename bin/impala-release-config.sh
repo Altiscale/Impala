@@ -12,12 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-
 # Source this file from the $IMPALA_HOME directory to
 # setup your environment. If $IMPALA_HOME is undefined
 # this script will set it to the current working directory.
 
-export JAVA_HOME=${JAVA_HOME-/usr/java/default}
+export JAVA_HOME=${JAVA_HOME:-/usr/java/default}
 if [ ! -d $JAVA_HOME ] ; then
   export JAVA_HOME="/usr/lib/jvm/java-openjdk"
   echo "ok - trying to look for openjdk path $JAVA_HOME"
@@ -27,20 +26,6 @@ if [ ! -d $JAVA_HOME ] ; then
   fi
 fi
 echo "ok - exist JAVA_HOME=$JAVA_HOME"
-
-# Default hadoop and hive version is 2.4.1 and 0.12.0
-if [ "x${HADOOP_VERSION}" = "x" ] ; then
-  export HADOOP_VERSION=2.4.1
-  echo "ok - applying HADOOP_VERSION=$HADOOP_VERSION"
-fi
-if [ "x${HIVE_VERSION}" = "x" ] ; then
-  export HIVE_VERSION=0.12.0
-  echo "ok - applying HIVE_VERSION=$HIVE_VERSION"
-fi
-
-if [ "x${IMPALA_VERSION}" = "x" ] ; then
-  export IMPALA_VERSION=1.3.1
-fi
 
 if [ -z $IMPALA_HOME ]; then
     this=${0/-/} # login-shells often have leading '-' chars
@@ -71,11 +56,11 @@ if [ -z $IMPALA_HOME ]; then
     fi
 fi
 
-export CDH_MAJOR_VERSION=5
-HADOOP_LZO_JAR=`find /opt/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
-export HADOOP_LZO=${HADOOP_LZO-/opt/hadoop-$HADOOP_VERSION}
-export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
-export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-~/impala-auxiliary-tests}
+export CDH_MAJOR_VERSION=4
+HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
+export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$HADOOP_VERSION}
+export IMPALA_LZO=${IMPALA_LZO:-~/Impala-lzo}
+export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME:-~/impala-auxiliary-tests}
 
 # Directory where local cluster logs will go when running tests or loading data
 export IMPALA_TEST_CLUSTER_LOG_DIR=${IMPALA_HOME}/cluster_logs
@@ -90,16 +75,17 @@ export IMPALA_OPENLDAP_VERSION=2.4.25
 export IMPALA_SQUEASEL_VERSION=3.3
 
 export IMPALA_HADOOP_VERSION=$HADOOP_VERSION
-export IMPALA_HADOOP_OLD_VERSION=2.0.5-alpha
-export IMPALA_HBASE_VERSION=0.96.1.1-cdh5.0.2
+export IMPALA_HADOOP_OLD_VERSION=2.0.0-cdh4.5.0
+export IMPALA_HBASE_VERSION=0.94.6-cdh4.5.0
 export IMPALA_HIVE_VERSION=$HIVE_VERSION
-export IMPALA_SENTRY_VERSION=1.2.0-cdh5.0.2
-export IMPALA_LLAMA_VERSION=1.0.0-cdh5.0.2
-
-export IMPALA_AVRO_VERSION=1.7.4
-export IMPALA_PARQUET_VERSION=1.2.5
+export IMPALA_SENTRY_VERSION=1.1.0
 export IMPALA_THRIFT_VERSION=0.9.0
+export IMPALA_AVRO_VERSION=1.7.4
 export IMPALA_LLVM_VERSION=3.3
+export IMPALA_PARQUET_VERSION=1.2.5
+export IMPALA_PARQUET_HADOOP_VERSION=1.5.0
+export IMPALA_PARQUET_FORMAT_VERSION=2.1.0
+export IMPALA_LLAMA_VERSION=1.0.0-cdh5.0.0-SNAPSHOT
 
 export IMPALA_FE_DIR=$IMPALA_HOME/fe
 export IMPALA_BE_DIR=$IMPALA_HOME/be
@@ -109,7 +95,6 @@ export IMPALA_DATASET_DIR=$IMPALA_HOME/testdata/datasets
 export IMPALA_AUX_DATASET_DIR=$IMPALA_AUX_TEST_HOME/testdata/datasets
 export IMPALA_COMMON_DIR=$IMPALA_HOME/common
 export PATH=$IMPALA_HOME/bin:$PATH
-
 export HADOOP_HOME=/opt/hadoop
 if [ ! -d "$HADOOP_HOME" ] ; then
   export HADOOP_HOME=/opt/hadoop-$HADOOP_VERSION
@@ -125,11 +110,6 @@ if [ ! -d "$HADOOP_CONF_DIR" ] ; then
   fi
 fi
 
-export MINI_DFS_BASE_DATA_DIR=$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data
-export PATH=$HADOOP_HOME/bin:$PATH
-
-export LLAMA_HOME=$IMPALA_HOME/thirdparty/llama-${IMPALA_LLAMA_VERSION}/
-
 export HIVE_HOME=/opt/hive
 if [ ! -d "$HIVE_HOME" ] ; then
   export HIVE_HOME=/opt/hive-$HIVE_VERSION
@@ -144,22 +124,22 @@ if [ ! -d "$HIVE_CONF_DIR" ] ; then
     echo "error - $HIVE_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
 fi
+export MINI_DFS_BASE_DATA_DIR=$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data
+export PATH=$HADOOP_HOME/bin:$PATH
 
+export LLAMA_HOME=$IMPALA_HOME/thirdparty/llama-${IMPALA_LLAMA_VERSION}/
+
+export HIVE_HOME=$IMPALA_HOME/thirdparty/hive-${IMPALA_HIVE_VERSION}/
 export PATH=$HIVE_HOME/bin:$PATH
+# export HIVE_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 
 ### Hive looks for jar files in a single directory from HIVE_AUX_JARS_PATH plus
 ### any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)
 export HIVE_AUX_JARS_PATH=${IMPALA_FE_DIR}/target
-export AUX_CLASSPATH=$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar
+export AUX_CLASSPATH=$HADOOP_LZO_JAR
 
 export HBASE_HOME=$IMPALA_HOME/thirdparty/hbase-${IMPALA_HBASE_VERSION}/
 export PATH=$HBASE_HOME/bin:$PATH
-
-# Add the jars so hive can create hbase tables.
-export AUX_CLASSPATH=$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-common-${IMPALA_HBASE_VERSION}-SNAPSHOT.jar
-export AUX_CLASSPATH=$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-client-${IMPALA_HBASE_VERSION}-SNAPSHOT.jar
-export AUX_CLASSPATH=$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-server-${IMPALA_HBASE_VERSION}-SNAPSHOT.jar
-export AUX_CLASSPATH=$AUX_CLASSPATH:$HBASE_HOME/lib/hbase-protocol-${IMPALA_HBASE_VERSION}-SNAPSHOT.jar
 
 GPERFTOOLS_HOME=${IMPALA_HOME}/thirdparty/gperftools-${IMPALA_GPERFTOOLS_VERSION}/
 export PPROF_PATH="${PPROF_PATH:-${GPERFTOOLS_HOME}/src/pprof}"
@@ -181,6 +161,7 @@ export IMPALA_BUILD_THREADS=`nproc`
 # TODO: figure out how to turn this off only the stuff that can't run with it.
 #LIBHDFS_OPTS="-Xcheck:jni -Xcheck:nabounds"
 # - Points to the location of libbackend.so.
+LIBHDFS_OPTS="${LIBHDFS_OPTS:-}"
 LIBHDFS_OPTS="${LIBHDFS_OPTS} -Djava.library.path=${HADOOP_HOME}/lib/native/"
 # READER BEWARE: This always points to the debug build.
 # TODO: Consider having cmake scripts change this value depending on
@@ -197,23 +178,21 @@ LIB_JAVA=`find ${JAVA_HOME}/   -name libjava.so | head -1`
 LIB_JSIG=`find ${JAVA_HOME}/   -name libjsig.so | head -1`
 LIB_JVM=` find ${JAVA_HOME}/   -name libjvm.so  | head -1`
 LIB_HDFS=`find ${HADOOP_HOME}/ -name libhdfs.so | head -1`
+LD_LIBRARY_PATH="${LD_LIBRARY_PATH-}"
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:`dirname ${LIB_JAVA}`:`dirname ${LIB_JSIG}`"
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:`dirname ${LIB_JVM}`:`dirname ${LIB_HDFS}`"
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${IMPALA_HOME}/be/build/debug/service"
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${IMPALA_HOME}/thirdparty/snappy-${IMPALA_SNAPPY_VERSION}/build/lib"
 LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:$IMPALA_LZO/build"
-LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:/usr/lib/impala/lib"
 export LD_LIBRARY_PATH
+LD_PRELOAD="${LD_PRELOAD-}"
 export LD_PRELOAD="${LD_PRELOAD}:${LIB_JSIG}"
 
+CLASSPATH="${CLASSPATH-}"
 CLASSPATH=$IMPALA_FE_DIR/target/dependency:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/target/classes:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/src/test/resources:$CLASSPATH
-CLASSPATH=$HADOOP_LZO_JAR:$CLASSPATH:$HADOOP_CONF_DIR:$HIVE_CONF_DIR
-for jar in `find /usr/lib/impala/lib/ -type f -name "*.jar"`
-do
-  CLASSPATH=$CLASSPATH:$jar
-done
+CLASSPATH=$HADOOP_LZO_JAR:$CLASSPATH
 export CLASSPATH
 
 # Setup aliases

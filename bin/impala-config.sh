@@ -18,9 +18,14 @@
 
 export JAVA_HOME=${JAVA_HOME:-/usr/java/default}
 if [ ! -d $JAVA_HOME ] ; then
+  export JAVA_HOME="/usr/lib/jvm/java-openjdk"
+  echo "ok - trying to look for openjdk path $JAVA_HOME"
+  if [ ! -d $JAVA_HOME ] ; then
     echo "Error! JAVA_HOME must be set to the location of your JDK!"
     exit 1
+  fi
 fi
+echo "ok - exist JAVA_HOME=$JAVA_HOME"
 
 if [ -z $IMPALA_HOME ]; then
     this=${0/-/} # login-shells often have leading '-' chars
@@ -52,9 +57,10 @@ if [ -z $IMPALA_HOME ]; then
 fi
 
 export CDH_MAJOR_VERSION=4
-export HADOOP_LZO=${HADOOP_LZO-~/hadoop-lzo}
-export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
-export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-~/impala-auxiliary-tests}
+HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
+export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$HADOOP_VERSION}
+export IMPALA_LZO=${IMPALA_LZO:-~/Impala-lzo}
+export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME:-~/impala-auxiliary-tests}
 
 # Directory where local cluster logs will go when running tests or loading data
 export IMPALA_TEST_CLUSTER_LOG_DIR=${IMPALA_HOME}/cluster_logs
@@ -68,9 +74,10 @@ export IMPALA_CYRUS_SASL_VERSION=2.1.23
 export IMPALA_OPENLDAP_VERSION=2.4.25
 export IMPALA_SQUEASEL_VERSION=3.3
 
-export IMPALA_HADOOP_VERSION=2.0.0-cdh4.5.0
+export IMPALA_HADOOP_VERSION=$HADOOP_VERSION
+export IMPALA_HADOOP_OLD_VERSION=2.0.0-cdh4.5.0
 export IMPALA_HBASE_VERSION=0.94.6-cdh4.5.0
-export IMPALA_HIVE_VERSION=0.10.0-cdh4.5.0
+export IMPALA_HIVE_VERSION=$HIVE_VERSION
 export IMPALA_SENTRY_VERSION=1.1.0
 export IMPALA_THRIFT_VERSION=0.9.0
 export IMPALA_AVRO_VERSION=1.7.4
@@ -88,9 +95,21 @@ export IMPALA_DATASET_DIR=$IMPALA_HOME/testdata/datasets
 export IMPALA_AUX_DATASET_DIR=$IMPALA_AUX_TEST_HOME/testdata/datasets
 export IMPALA_COMMON_DIR=$IMPALA_HOME/common
 export PATH=$IMPALA_HOME/bin:$PATH
+export HADOOP_HOME=/opt/hadoop
+if [ ! -d "$HADOOP_HOME" ] ; then
+  export HADOOP_HOME=/opt/hadoop-$HADOOP_VERSION
+  if [ ! -d "$HADOOP_HOME" ] ; then
+    echo "error - $HADOOP_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
+export HADOOP_CONF_DIR=/etc/hadoop
+if [ ! -d "$HADOOP_CONF_DIR" ] ; then
+  export HADOOP_CONF_DIR=/etc/hadoop-$HADOOP_VERSION
+  if [ ! -d "$HADOOP_CONF_DIR" ] ; then
+    echo "error - $HADOOP_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+  fi
+fi
 
-export HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/
-export HADOOP_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 export MINI_DFS_BASE_DATA_DIR=$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data
 export PATH=$HADOOP_HOME/bin:$PATH
 
@@ -103,7 +122,7 @@ export HIVE_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 ### Hive looks for jar files in a single directory from HIVE_AUX_JARS_PATH plus
 ### any jars in AUX_CLASSPATH. (Or a list of jars in HIVE_AUX_JARS_PATH.)
 export HIVE_AUX_JARS_PATH=${IMPALA_FE_DIR}/target
-export AUX_CLASSPATH=$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar
+export AUX_CLASSPATH=$HADOOP_LZO_JAR
 
 export HBASE_HOME=$IMPALA_HOME/thirdparty/hbase-${IMPALA_HBASE_VERSION}/
 export PATH=$HBASE_HOME/bin:$PATH
@@ -159,7 +178,7 @@ CLASSPATH="${CLASSPATH-}"
 CLASSPATH=$IMPALA_FE_DIR/target/dependency:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/target/classes:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/src/test/resources:$CLASSPATH
-CLASSPATH=$HADOOP_LZO/build/hadoop-lzo-0.4.15.jar:$CLASSPATH
+CLASSPATH=$HADOOP_LZO_JAR:$CLASSPATH
 export CLASSPATH
 
 # Setup aliases

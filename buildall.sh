@@ -179,12 +179,12 @@ then
   # clean be
   cd $IMPALA_HOME/be
   # remove everything listed in .gitignore
-  git clean -Xdf
+  # git clean -Xdf
 
   # clean shell build artifacts
   cd $IMPALA_HOME/shell
   # remove everything listed in .gitignore
-  git clean -Xdf
+  # git clean -Xdf
 
   # clean llvm
   rm -f $IMPALA_HOME/llvm-ir/impala*.ll
@@ -226,7 +226,7 @@ mvn install -DskipTests
 # build frontend and copy dependencies
 cd ${IMPALA_FE_DIR}
 mvn dependency:copy-dependencies
-mvn package -DskipTests=true
+mvn -X package -DskipTests=true
 
 # Build the shell tarball
 echo "Creating shell tarball"
