@@ -27,7 +27,7 @@ TESTDATA_ACTION=0
 TESTS_ACTION=1
 FORMAT_CLUSTER=0
 FORMAT_METASTORE=0
-TARGET_BUILD_TYPE=Debug
+TARGET_BUILD_TYPE=Release
 EXPLORATION_STRATEGY=core
 SNAPSHOT_FILE=
 
@@ -152,10 +152,11 @@ then
   $IMPALA_HOME/bin/build_thirdparty.sh $([ ${CLEAN_ACTION} -eq 0 ] && echo '-noclean')
 fi
 
-if [ -e $HADOOP_LZO/build/native/Linux-*-*/lib/libgplcompression.so ]
+if [ -e $HADOOP_HOME/lib/native/libgplcompression.so ]
 then
-  cp $HADOOP_LZO/build/native/Linux-*-*/lib/libgplcompression.* \
-    $IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/lib/native/
+  echo "ok - files are identical in the right location, nothing to copy here, just apply them"
+  # cp $HADOOP_LZO/build/native/Linux-*-*/lib/libgplcompression.* \
+  #  $IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/lib/native/
 else
   echo "No hadoop-lzo found"
 fi
