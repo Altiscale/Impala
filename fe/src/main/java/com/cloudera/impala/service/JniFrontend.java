@@ -18,6 +18,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
+import java.net.URI;
 import java.net.URL;
 import java.net.URLConnection;
 import java.util.Enumeration;
@@ -522,11 +523,9 @@ public class JniFrontend {
     }
 
     try {
-      String nnUrl = getCurrentNameNodeAddress();
-      if (nnUrl == null) {
-        return null;
-      }
-      URL nnWebUi = new URL("http://" + nnUrl + "/dfshealth.jsp");
+      URI nnUri = getCurrentNameNodeAddress();
+      if (nnUri == null) return null;
+      URL nnWebUi = new URL(nnUri.toURL(), "/dfshealth.jsp");            
       URLConnection conn = nnWebUi.openConnection();
       BufferedReader in = new BufferedReader(
           new InputStreamReader(conn.getInputStream()));
@@ -555,7 +554,7 @@ public class JniFrontend {
    *
    * @return Returns http address or null if failure.
    */
-  private String getCurrentNameNodeAddress() throws Exception {
+  private URI getCurrentNameNodeAddress() throws Exception {
     // get the filesystem object to verify it is an HDFS system
     FileSystem fs;
     fs = FileSystem.get(CONF);
