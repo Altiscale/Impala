@@ -563,7 +563,7 @@ public class JniFrontend {
       LOG.error("FileSystem is " + fs.getUri());
       return null;
     }
-    return DFSUtil.getInfoServer(HAUtil.getAddressOfActive(fs), CONF, false);
+    return DFSUtil.getInfoServer(HAUtil.getAddressOfActive(fs), CONF, "http");
   }
 
   /**
