@@ -34,7 +34,7 @@ if [ "x${HADOOP_VERSION}" = "x" ] ; then
   echo "ok - applying HADOOP_VERSION=$HADOOP_VERSION"
 fi
 if [ "x${HIVE_VERSION}" = "x" ] ; then
-  export HIVE_VERSION=0.12.0
+  export HIVE_VERSION=0.13.1
   echo "ok - applying HIVE_VERSION=$HIVE_VERSION"
 fi
 
@@ -68,10 +68,10 @@ if [ -z $IMPALA_HOME ]; then
 fi
 
 export CDH_MAJOR_VERSION=5
-HADOOP_LZO_JAR=`find /opt/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
-export HADOOP_LZO=${HADOOP_LZO-/opt/hadoop-$HADOOP_VERSION}
-export IMPALA_LZO=${IMPALA_LZO-~/Impala-lzo}
-export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME-~/impala-auxiliary-tests}
+HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
+export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$HADOOP_VERSION}
+export IMPALA_LZO=${IMPALA_LZO:-~/Impala-lzo}
+export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME:-~/impala-auxiliary-tests}
 
 # Directory where local cluster logs will go when running tests or loading data
 export IMPALA_TEST_CLUSTER_LOG_DIR=${IMPALA_HOME}/cluster_logs
