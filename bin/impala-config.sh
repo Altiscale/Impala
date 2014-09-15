@@ -29,9 +29,9 @@ fi
 echo "ok - exist JAVA_HOME=$JAVA_HOME"
 
 # Default hadoop and hive version is 2.4.1 and 0.12.0
-if [ "x${HADOOP_VERSION}" = "x" ] ; then
-  export HADOOP_VERSION=2.4.1
-  echo "ok - applying HADOOP_VERSION=$HADOOP_VERSION"
+if [ "x${ALTISCALE_HADOOP_VERSION}" = "x" ] ; then
+  export ALTISCALE_HADOOP_VERSION=2.4.1
+  echo "ok - applying ALTISCALE_HADOOP_VERSION=$ALTISCALE_HADOOP_VERSION"
 fi
 if [ "x${HIVE_VERSION}" = "x" ] ; then
   export HIVE_VERSION=0.13.1
@@ -68,8 +68,8 @@ if [ -z $IMPALA_HOME ]; then
 fi
 
 export CDH_MAJOR_VERSION=5
-HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
-export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$HADOOP_VERSION}
+HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${ALTISCALE_HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
+export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$ALTISCALE_HADOOP_VERSION}
 export IMPALA_LZO=${IMPALA_LZO:-~/Impala-lzo}
 export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME:-~/impala-auxiliary-tests}
 
@@ -85,7 +85,8 @@ export IMPALA_CYRUS_SASL_VERSION=2.1.23
 export IMPALA_OPENLDAP_VERSION=2.4.25
 export IMPALA_SQUEASEL_VERSION=3.3
 
-export IMPALA_HADOOP_VERSION=$HADOOP_VERSION
+export ALTISCALE_HADOOP_VERSION=$ALTISCALE_HADOOP_VERSION
+export IMPALA_HADOOP_VERSION=2.3.0-cdh5.1.2
 export IMPALA_HBASE_VERSION=0.98.1-cdh5.1.2
 export IMPALA_HIVE_VERSION=$HIVE_VERSION
 export IMPALA_SENTRY_VERSION=1.3.0-cdh5.1.2
@@ -113,14 +114,14 @@ if [ ! -d "$IMPALA_HADOOP_HOME" ] ; then
 fi
 export HADOOP_HOME=/opt/hadoop
 if [ ! -d "$HADOOP_HOME" ] ; then
-  export HADOOP_HOME=/opt/hadoop-$HADOOP_VERSION
+  export HADOOP_HOME=/opt/hadoop-$ALTISCALE_HADOOP_VERSION
   if [ ! -d "$HADOOP_HOME" ] ; then
     echo "error - $HADOOP_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
 fi
 export HADOOP_CONF_DIR=/etc/hadoop
 if [ ! -d "$HADOOP_CONF_DIR" ] ; then
-  export HADOOP_CONF_DIR=/etc/hadoop-$HADOOP_VERSION
+  export HADOOP_CONF_DIR=/etc/hadoop-$ALTISCALE_HADOOP_VERSION
   if [ ! -d "$HADOOP_CONF_DIR" ] ; then
     echo "error - $HADOOP_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
