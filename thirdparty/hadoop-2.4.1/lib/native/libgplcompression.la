@@ -38,4 +38,4 @@ dlopen=''
 dlpreopen=''
 
 # Directory that this library needs to be installed in:
-libdir='/mnt/ebs1/jenkins/workspace/hadoop-buildrpm-2.4.1-HD-395/hadoop-lzo/target/native/Linux-amd64-64/../install/lib'
+libdir='/mnt/ebs1/jenkins/workspace/hadoop-buildrpm-3.0.0/hadoop-lzo/target/native/Linux-amd64-64/../install/lib'
