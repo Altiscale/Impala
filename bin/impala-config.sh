@@ -33,9 +33,9 @@ if [ "x${ALTISCALE_HADOOP_VERSION}" = "x" ] ; then
   export ALTISCALE_HADOOP_VERSION=2.4.1
   echo "ok - applying ALTISCALE_HADOOP_VERSION=$ALTISCALE_HADOOP_VERSION"
 fi
-if [ "x${HIVE_VERSION}" = "x" ] ; then
-  export HIVE_VERSION=0.12.0
-  echo "ok - applying HIVE_VERSION=$HIVE_VERSION"
+if [ "x${ALTISCALE_HIVE_VERSION}" = "x" ] ; then
+  export ALTISCALE_HIVE_VERSION=0.12.0
+  echo "ok - applying ALTISCALE_HIVE_VERSION=$ALTISCALE_HIVE_VERSION"
 fi
 
 if [ -z $IMPALA_HOME ]; then
@@ -87,7 +87,7 @@ export IMPALA_SQUEASEL_VERSION=3.3
 
 export IMPALA_HADOOP_VERSION=2.3.0-cdh5.1.0
 export IMPALA_HBASE_VERSION=0.98.1-cdh5.1.0
-export IMPALA_HIVE_VERSION=$HIVE_VERSION
+export IMPALA_HIVE_VERSION=0.12.0-cdh5.1.0
 export IMPALA_SENTRY_VERSION=1.3.0-cdh5.1.0
 export IMPALA_LLAMA_VERSION=1.0.0-cdh5.1.0
 export IMPALA_AVRO_VERSION=1.7.4
@@ -131,16 +131,16 @@ export PATH=$HADOOP_HOME/bin:$PATH
 
 export LLAMA_HOME=$IMPALA_HOME/thirdparty/llama-${IMPALA_LLAMA_VERSION}/
 
-export HIVE_HOME=/opt/hive
+export HIVE_HOME=$IMPALA_HOME/thirdparty/hive-${IMPALA_HIVE_VERSION}/
 if [ ! -d "$HIVE_HOME" ] ; then
-  export HIVE_HOME=/opt/hive-$HIVE_VERSION
+  export HIVE_HOME=/opt/hive-$ALTISCALE_HIVE_VERSION
   if [ ! -d "$HIVE_HOME" ] ; then
     echo "error - $HIVE_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
 fi
 export HIVE_CONF_DIR=/etc/hive
 if [ ! -d "$HIVE_CONF_DIR" ] ; then
-  export HIVE_CONF_DIR=/etc/hive-$HIVE_VERSION
+  export HIVE_CONF_DIR=/etc/hive-$ALTISCALE_HIVE_VERSION
   if [ ! -d "$HIVE_CONF_DIR" ] ; then
     echo "error - $HIVE_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
