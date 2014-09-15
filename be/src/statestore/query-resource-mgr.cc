@@ -75,7 +75,7 @@ void ResourceResolver::CreateLocalLlamaNodeMapping(
 QueryResourceMgr::QueryResourceMgr(const TUniqueId& reservation_id,
     const TNetworkAddress& local_resource_location, const TUniqueId& query_id)
     : reservation_id_(reservation_id), query_id_(query_id),
-      local_resource_location_(local_resource_location), exit_(false), callback_count_(0),
+      local_resource_location_(local_resource_location), exit_(false),
       threads_running_(0), vcores_(0) {
   max_vcore_oversubscription_ratio_ = FLAGS_max_vcore_oversubscription_ratio;
 }
@@ -143,18 +143,9 @@ void QueryResourceMgr::NotifyThreadUsageChange(int delta) {
   if (AboveVcoreSubscriptionThreshold()) threads_changed_cv_.notify_all();
 }
 
-int32_t QueryResourceMgr::AddVcoreAvailableCb(const VcoreAvailableCb& callback) {
+void QueryResourceMgr::AddVcoreAvailableCb(const VcoreAvailableCb& callback) {
   lock_guard<mutex> l(callbacks_lock_);
-  callbacks_[callback_count_] = callback;
-  callbacks_it_ = callbacks_.begin();
-  return callback_count_++;
-}
-
-void QueryResourceMgr::RemoveVcoreAvailableCb(int32_t callback_id) {
-  lock_guard<mutex> l(callbacks_lock_);
-  CallbackMap::iterator it = callbacks_.find(callback_id);
-  DCHECK(it != callbacks_.end()) << "Could not find callback with id: " << callback_id;
-  callbacks_.erase(it);
+  callbacks_.push_back(callback);
   callbacks_it_ = callbacks_.begin();
 }
 
@@ -217,7 +208,7 @@ void QueryResourceMgr::AcquireVcoreResources(
     {
       lock_guard<mutex> l(callbacks_lock_);
       if (callbacks_.size() != 0) {
-        callbacks_it_->second();
+        (*callbacks_it_)();
         if (++callbacks_it_ == callbacks_.end()) callbacks_it_ = callbacks_.begin();
       }
     }

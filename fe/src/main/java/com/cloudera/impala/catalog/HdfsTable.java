@@ -515,7 +515,8 @@ public class HdfsTable extends Table {
       }
 
       Column col = new Column(s.getName(), type, s.getComment(), pos);
-      addColumn(col);
+      colsByPos_.add(col);
+      colsByName_.put(s.getName(), col);
       ++pos;
 
       // Load and set column stats in col.
@@ -632,12 +633,12 @@ public class HdfsTable extends Table {
         int i = 0;
         for (String partitionKey: msPartition.getValues()) {
           uniquePartitionKeys[i].add(partitionKey);
-          ColumnType type = getColumns().get(keyValues.size()).getType();
           // Deal with Hive's special NULL partition key.
           if (partitionKey.equals(nullPartitionKeyValue_)) {
             keyValues.add(new NullLiteral());
             ++numNullKeys[i];
           } else {
+            ColumnType type = colsByPos_.get(keyValues.size()).getType();
             try {
               LiteralExpr expr = LiteralExpr.create(partitionKey, type);
               keyValues.add(expr);
@@ -672,7 +673,7 @@ public class HdfsTable extends Table {
 
       // update col stats for partition key cols
       for (int i = 0; i < numClusteringCols_; ++i) {
-        ColumnStats stats = getColumns().get(i).getStats();
+        ColumnStats stats = colsByPos_.get(i).getStats();
         stats.setNumNulls(numNullKeys[i]);
         stats.setNumDistinctValues(uniquePartitionKeys[i].size());
         LOG.debug("#col=" + Integer.toString(i) + " stats=" + stats.toString());
@@ -1097,37 +1098,31 @@ public class HdfsTable extends Table {
 
   @Override
   public TTableDescriptor toThriftDescriptor() {
-    // Create thrift descriptors to send to the BE.  The BE does not
-    // need any information below the THdfsPartition level.
     TTableDescriptor tableDesc = new TTableDescriptor(id_.asInt(), TTableType.HDFS_TABLE,
-        getColumns().size(), numClusteringCols_, name_, db_.getName());
-    tableDesc.setHdfsTable(getTHdfsTable(false));
+        colsByPos_.size(), numClusteringCols_, name_, db_.getName());
+    tableDesc.setHdfsTable(getHdfsTable());
     tableDesc.setColNames(getColumnNames());
     return tableDesc;
   }
 
   @Override
   public TTable toThrift() {
-    // Send all metadata between the catalog service and the FE.
     TTable table = super.toThrift();
     table.setTable_type(TTableType.HDFS_TABLE);
-    table.setHdfs_table(getTHdfsTable(true));
+    table.setHdfs_table(getHdfsTable());
     return table;
   }
 
-  private THdfsTable getTHdfsTable(boolean includeFileDesc) {
+  private THdfsTable getHdfsTable() {
     Map<Long, THdfsPartition> idToPartition = Maps.newHashMap();
     for (HdfsPartition partition: partitions_) {
-      idToPartition.put(partition.getId(), partition.toThrift(includeFileDesc));
+      idToPartition.put(partition.getId(), partition.toThrift(true));
     }
+
     THdfsTable hdfsTable = new THdfsTable(hdfsBaseDir_, getColumnNames(),
         nullPartitionKeyValue_, nullColumnValue_, idToPartition);
     hdfsTable.setAvroSchema(avroSchema_);
-    if (includeFileDesc) {
-      // Network addresses are used only by THdfsFileBlocks which are inside
-      // THdfsFileDesc, so include network addreses only when including THdfsFileDesc.
-      hdfsTable.setNetwork_addresses(hostList_);
-    }
+    hdfsTable.setNetwork_addresses(hostList_);
     return hdfsTable;
   }
 
@@ -1186,7 +1181,7 @@ public class HdfsTable extends Table {
     result.setSchema(resultSchema);
     for (int i = 0; i < numClusteringCols_; ++i) {
       // Add the partition-key values as strings for simplicity.
-      Column partCol = getColumns().get(i);
+      Column partCol = colsByPos_.get(i);
       TColumn colDesc = new TColumn(partCol.getName(), partCol.getType().toThrift());
       resultSchema.addToColumns(colDesc);
     }

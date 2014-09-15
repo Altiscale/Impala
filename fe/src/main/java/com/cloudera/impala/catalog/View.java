@@ -71,7 +71,8 @@ public class View extends Table {
         }
         ColumnType type = parseColumnType(s);
         Column col = new Column(s.getName(), type, s.getComment(), i);
-        addColumn(col);
+        colsByPos_.add(col);
+        colsByName_.put(s.getName(), col);
       }
       // These fields are irrelevant for views.
       numClusteringCols_ = 0;

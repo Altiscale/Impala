@@ -71,10 +71,10 @@ public abstract class Table implements CatalogObject {
 
   // colsByPos[i] refers to the ith column in the table. The first numClusteringCols are
   // the clustering columns.
-  private final ArrayList<Column> colsByPos_;
+  protected final ArrayList<Column> colsByPos_;
 
   // map from lowercase column name to Column object.
-  private final Map<String, Column> colsByName_;
+  protected final Map<String, Column> colsByName_;
 
   // The lastDdlTime for this table; -1 if not set
   protected long lastDdlTime_;
@@ -107,16 +107,6 @@ public abstract class Table implements CatalogObject {
    */
   public abstract void load(Table oldValue, HiveMetaStoreClient client,
       org.apache.hadoop.hive.metastore.api.Table msTbl) throws TableLoadingException;
-
-  public void addColumn(Column col) {
-    colsByPos_.add(col);
-    colsByName_.put(col.getName().toLowerCase(), col);
-  }
-
-  public void clearColumns() {
-    colsByPos_.clear();
-    colsByName_.clear();
-  }
 
   /**
    * Updates the lastDdlTime for this Table, if the new value is greater
@@ -214,7 +204,6 @@ public abstract class Table implements CatalogObject {
           TableId.createInvalidId(), parentDb, thriftTable.getTbl_name());
     }
     newTable.loadFromThrift(thriftTable);
-    newTable.validate();
     return newTable;
   }
 
@@ -243,19 +232,6 @@ public abstract class Table implements CatalogObject {
     // Default to READ_WRITE access if the field is not set.
     accessLevel_ = thriftTable.isSetAccess_level() ? thriftTable.getAccess_level() :
         TAccessLevel.READ_WRITE;
-  }
-
-  /**
-   * Checks preconditions for this table to function as expected. Currently only checks
-   * that all entries in colsByName_ use lower case keys.
-   */
-  public void validate() throws TableLoadingException {
-    for (String colName: colsByName_.keySet()) {
-      if (!colName.equals(colName.toLowerCase())) {
-        throw new TableLoadingException(
-            "Expected lower case column name but found: " + colName);
-      }
-    }
   }
 
   public TTable toThrift() {
@@ -292,7 +268,7 @@ public abstract class Table implements CatalogObject {
     return catalogObject;
   }
 
-  /**
+  /*
    * Gets the ColumnType from the given FieldSchema by using Impala's SqlParser.
    * Throws a TableLoadingException if the FieldSchema could not be parsed.
    * The type can either be:

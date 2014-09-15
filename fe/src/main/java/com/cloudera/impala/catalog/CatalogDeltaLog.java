@@ -61,12 +61,7 @@ public class CatalogDeltaLog {
    * catalog.
    */
   public synchronized void garbageCollect(long currentCatalogVersion) {
-    // Nothing will be garbage collected so avoid creating a new object.
-    if (!removedCatalogObjects_.isEmpty() &&
-        removedCatalogObjects_.firstKey() < currentCatalogVersion) {
-      removedCatalogObjects_ = new TreeMap<Long, TCatalogObject>(
-          removedCatalogObjects_.tailMap(currentCatalogVersion));
-    }
+    removedCatalogObjects_ = removedCatalogObjects_.tailMap(currentCatalogVersion);
   }
 
   /**

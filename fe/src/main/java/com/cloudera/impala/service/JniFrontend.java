@@ -82,7 +82,6 @@ import com.cloudera.impala.util.GlogAppender;
 import com.cloudera.impala.util.TSessionStateUtil;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Maps;
 
 /**
  * JNI-callable interface onto a wrapped Frontend instance. The main point is to serialise
@@ -103,15 +102,15 @@ public class JniFrontend {
    * Create a new instance of the Jni Frontend.
    */
   public JniFrontend(boolean lazy, String serverName, String authorizationPolicyFile,
-      String sentryConfigFile, String authPolicyProviderClass, int impalaLogLevel,
-      int otherLogLevel) throws InternalException {
+      String sentryConfigFile, int impalaLogLevel, int otherLogLevel)
+      throws InternalException {
     GlogAppender.Install(TLogLevel.values()[impalaLogLevel],
         TLogLevel.values()[otherLogLevel]);
 
     // Validate the authorization configuration before initializing the Frontend.
     // If there are any configuration problems Impala startup will fail.
     AuthorizationConfig authConfig = new AuthorizationConfig(serverName,
-        authorizationPolicyFile, sentryConfigFile, authPolicyProviderClass);
+        authorizationPolicyFile, sentryConfigFile);
     authConfig.validateConfig();
     if (authConfig.isEnabled()) {
       LOG.info("Authorization is 'ENABLED' using %s",

@@ -85,8 +85,7 @@ HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
       disks_accessed_bitmap_(TCounterType::UNIT, 0),
       done_(false),
       all_ranges_started_(false),
-      counters_running_(false),
-      rm_callback_id_(0) {
+      counters_running_(false) {
   max_materialized_row_batches_ = FLAGS_max_row_batches;
   if (max_materialized_row_batches_ <= 0) {
     // TODO: This parameter has an U-shaped effect on performance: increasing the value
@@ -532,7 +531,7 @@ Status HdfsScanNode::Open(RuntimeState* state) {
       bind<void>(mem_fn(&HdfsScanNode::ThreadTokenAvailableCb), this, _1));
 
   if (runtime_state_->query_resource_mgr() != NULL) {
-    rm_callback_id_ = runtime_state_->query_resource_mgr()->AddVcoreAvailableCb(
+    runtime_state_->query_resource_mgr()->AddVcoreAvailableCb(
         bind<void>(mem_fn(&HdfsScanNode::ThreadTokenAvailableCb), this,
             runtime_state_->resource_pool()));
   }
@@ -617,10 +616,6 @@ void HdfsScanNode::Close(RuntimeState* state) {
   SetDone();
 
   state->resource_pool()->SetThreadAvailableCb(NULL);
-  if (state->query_resource_mgr() != NULL) {
-    state->query_resource_mgr()->RemoveVcoreAvailableCb(rm_callback_id_);
-  }
-
   scanner_threads_.JoinAll();
 
   // All conjuncts should have been released
