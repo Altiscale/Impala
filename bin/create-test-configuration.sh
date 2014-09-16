@@ -67,10 +67,10 @@ if [ $CREATE_METASTORE -eq 1 ]; then
   set -e
   createdb -U hiveuser hive_$METASTORE_DB
 
-  if [ "x${HIVE_VERSION}" = "x0.12.0" ] ; then
+  if [ "x${ALTISCALE_HIVE_VERSION}" = "x0.12.0" ] ; then
     psql -U hiveuser -d hive_$METASTORE_DB \
        -f ${HIVE_HOME}/scripts/metastore/upgrade/postgres/hive-schema-0.12.0.postgres.sql
-  elif [ "x${HIVE_VERSION}" = "x0.13.1" ] ; then
+  elif [ "x${ALTISCALE_HIVE_VERSION}" = "x0.13.1" ] ; then
     psql -U hiveuser -d hive_$METASTORE_DB \
        -f ${HIVE_HOME}/scripts/metastore/upgrade/postgres/hive-schema-0.13.0.postgres.sql
   fi
