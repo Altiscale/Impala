@@ -57,8 +57,8 @@ if [ -z $IMPALA_HOME ]; then
 fi
 
 export CDH_MAJOR_VERSION=4
-HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
-export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$HADOOP_VERSION}
+HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${ALTISCALE_HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
+export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$ALTISCALE_HADOOP_VERSION}
 export IMPALA_LZO=${IMPALA_LZO:-~/Impala-lzo}
 export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME:-~/impala-auxiliary-tests}
 
@@ -95,13 +95,16 @@ export IMPALA_DATASET_DIR=$IMPALA_HOME/testdata/datasets
 export IMPALA_AUX_DATASET_DIR=$IMPALA_AUX_TEST_HOME/testdata/datasets
 export IMPALA_COMMON_DIR=$IMPALA_HOME/common
 export PATH=$IMPALA_HOME/bin:$PATH
-export HADOOP_HOME=/opt/hadoop
-if [ ! -d "$HADOOP_HOME" ] ; then
-  export HADOOP_HOME=/opt/hadoop-$HADOOP_VERSION
-  if [ ! -d "$HADOOP_HOME" ] ; then
-    echo "error - $HADOOP_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
+
+export IMPALA_HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-$IMPALA_HADOOP_VERSION
+if [ ! -d "$IMPALA_HADOOP_HOME" ] ; then
+  export IMPALA_HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-$IMPALA_HADOOP_VERSION
+  if [ ! -d "$IMPALA_HADOOP_HOME" ] ; then
+    echo "error - $IMPALA_HADOOP_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
 fi
+export HADOOP_HOME=$IMPALA_HADOOP_HOME
+
 export HADOOP_CONF_DIR=/etc/hadoop
 if [ ! -d "$HADOOP_CONF_DIR" ] ; then
   export HADOOP_CONF_DIR=/etc/hadoop-$HADOOP_VERSION
@@ -186,6 +189,7 @@ export CLASSPATH
 alias gerrit-verify-merge="${IMPALA_AUX_TEST_HOME}/jenkins/gerrit-verify-merge.sh"
 
 echo "IMPALA_HOME            = $IMPALA_HOME"
+echo "IMPALA_HADOOP_HOME     = $IMPALA_HADOOP_HOME"
 echo "HADOOP_HOME            = $HADOOP_HOME"
 echo "HADOOP_CONF_DIR        = $HADOOP_CONF_DIR"
 echo "MINI_DFS_BASE_DATA_DIR = $MINI_DFS_BASE_DATA_DIR"
