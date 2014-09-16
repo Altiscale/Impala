@@ -103,7 +103,7 @@ if [ ! -d "$IMPALA_HADOOP_HOME" ] ; then
     echo "error - $IMPALA_HADOOP_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
 fi
-export HADOOP_HOME=$IMPALA_HADOOP_HOME
+export HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-$IMPALA_HADOOP_VERSION
 
 export HADOOP_CONF_DIR=/etc/hadoop
 if [ ! -d "$HADOOP_CONF_DIR" ] ; then
