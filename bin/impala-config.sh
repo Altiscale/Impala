@@ -107,7 +107,7 @@ export HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-$IMPALA_HADOOP_VERSION
 
 export HADOOP_CONF_DIR=/etc/hadoop
 if [ ! -d "$HADOOP_CONF_DIR" ] ; then
-  export HADOOP_CONF_DIR=/etc/hadoop-$HADOOP_VERSION
+  export HADOOP_CONF_DIR=/etc/hadoop-$ALTISCALE_HADOOP_VERSION
   if [ ! -d "$HADOOP_CONF_DIR" ] ; then
     echo "error - $HADOOP_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi

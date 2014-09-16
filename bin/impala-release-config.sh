@@ -57,8 +57,8 @@ if [ -z $IMPALA_HOME ]; then
 fi
 
 export CDH_MAJOR_VERSION=4
-HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
-export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$HADOOP_VERSION}
+HADOOP_LZO_JAR=`find ${IMPALA_HOME}/thirdparty/hadoop-${ALTISCALE_HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
+export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$ALTISCALE_HADOOP_VERSION}
 export IMPALA_LZO=${IMPALA_LZO:-~/Impala-lzo}
 export IMPALA_AUX_TEST_HOME=${IMPALA_AUX_TEST_HOME:-~/impala-auxiliary-tests}
 
@@ -74,7 +74,7 @@ export IMPALA_CYRUS_SASL_VERSION=2.1.23
 export IMPALA_OPENLDAP_VERSION=2.4.25
 export IMPALA_SQUEASEL_VERSION=3.3
 
-export IMPALA_HADOOP_VERSION=$HADOOP_VERSION
+export IMPALA_HADOOP_VERSION=$ALTISCALE_HADOOP_VERSION
 export IMPALA_HADOOP_OLD_VERSION=2.0.0-cdh4.5.0
 export IMPALA_HBASE_VERSION=0.94.6-cdh4.5.0
 export IMPALA_HIVE_VERSION=$HIVE_VERSION
@@ -97,14 +97,14 @@ export IMPALA_COMMON_DIR=$IMPALA_HOME/common
 export PATH=$IMPALA_HOME/bin:$PATH
 export HADOOP_HOME=/opt/hadoop
 if [ ! -d "$HADOOP_HOME" ] ; then
-  export HADOOP_HOME=/opt/hadoop-$HADOOP_VERSION
+  export HADOOP_HOME=/opt/hadoop-$ALTISCALE_HADOOP_VERSION
   if [ ! -d "$HADOOP_HOME" ] ; then
     echo "error - $HADOOP_HOME doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
 fi
 export HADOOP_CONF_DIR=/etc/hadoop
 if [ ! -d "$HADOOP_CONF_DIR" ] ; then
-  export HADOOP_CONF_DIR=/etc/hadoop-$HADOOP_VERSION
+  export HADOOP_CONF_DIR=/etc/hadoop-$ALTISCALE_HADOOP_VERSION
   if [ ! -d "$HADOOP_CONF_DIR" ] ; then
     echo "error - $HADOOP_CONF_DIR doesn't exist, the installation may not be complete for build process, symbolic link wasn't created"
   fi
