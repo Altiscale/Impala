@@ -35,7 +35,7 @@
 # . /etc/default/hadoop
 
 if [ "x${IMPALA_HOME}" = "x" ] ; then
-  export IMPALA_HOME=/opt/alti-impala-1.3.1
+  export IMPALA_HOME=/opt/impala
 fi
 
 . ${IMPALA_HOME}/bin/impala-release-config.sh
