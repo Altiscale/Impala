@@ -67,6 +67,8 @@ if [ -z $IMPALA_HOME ]; then
     fi
 fi
 
+export IMPALA_CONF_DIR=/etc/impala/conf
+
 export CDH_MAJOR_VERSION=5
 HADOOP_LZO_JAR=`find /opt/hadoop-${ALTISCALE_HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
 export HADOOP_LZO=${HADOOP_LZO:-/opt/hadoop-$ALTISCALE_HADOOP_VERSION}
@@ -234,6 +236,7 @@ echo "HADOOP_CONF_DIR        = $HADOOP_CONF_DIR"
 echo "MINI_DFS_BASE_DATA_DIR = $MINI_DFS_BASE_DATA_DIR"
 echo "HIVE_HOME              = $HIVE_HOME"
 echo "HIVE_CONF_DIR          = $HIVE_CONF_DIR"
+echo "IMPALA_CONF_DIR        = $IMPALA_CONF_DIR"
 echo "HBASE_HOME             = $HBASE_HOME"
 echo "HBASE_CONF_DIR         = $HBASE_CONF_DIR"
 echo "PPROF_PATH             = $PPROF_PATH"
@@ -246,3 +249,5 @@ echo "PYTHONPATH             = $PYTHONPATH"
 echo "JAVA_HOME              = $JAVA_HOME"
 echo "LD_LIBRARY_PATH        = $LD_LIBRARY_PATH"
 echo "LD_PRELOAD             = $LD_PRELOAD"
+
+
