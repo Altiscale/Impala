@@ -71,6 +71,8 @@ if [ -z $IMPALA_HOME ]; then
     fi
 fi
 
+export IMPALA_CONF_DIR=/etc/impala/conf
+
 export CDH_MAJOR_VERSION=5
 HADOOP_LZO_JAR=`find /opt/hadoop-${HADOOP_VERSION}/share/hadoop/common/lib/ -type f -name "hadoop-lzo*.jar" | head -1`
 export HADOOP_LZO=${HADOOP_LZO-/opt/hadoop-$HADOOP_VERSION}
@@ -209,7 +211,7 @@ export LD_PRELOAD="${LD_PRELOAD}:${LIB_JSIG}"
 CLASSPATH=$IMPALA_FE_DIR/target/dependency:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/target/classes:$CLASSPATH
 CLASSPATH=$IMPALA_FE_DIR/src/test/resources:$CLASSPATH
-CLASSPATH=$HADOOP_LZO_JAR:$CLASSPATH:$HADOOP_CONF_DIR:$HIVE_CONF_DIR
+CLASSPATH=$HADOOP_LZO_JAR:$CLASSPATH:$IMPALA_CONF_DIR:$HADOOP_CONF_DIR:$HIVE_CONF_DIR
 for jar in `find /usr/lib/impala/lib/ -type f -name "*.jar"`
 do
   CLASSPATH=$CLASSPATH:$jar
@@ -224,6 +226,7 @@ echo "IMPALA_HOME            = $IMPALA_HOME"
 echo "HADOOP_HOME            = $HADOOP_HOME"
 echo "HADOOP_CONF_DIR        = $HADOOP_CONF_DIR"
 echo "MINI_DFS_BASE_DATA_DIR = $MINI_DFS_BASE_DATA_DIR"
+echo "IMPALA_CONF_DIR        = $IMPALA_CONF_DIR"
 echo "HIVE_HOME              = $HIVE_HOME"
 echo "HIVE_CONF_DIR          = $HIVE_CONF_DIR"
 echo "HBASE_HOME             = $HBASE_HOME"
