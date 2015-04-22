@@ -104,6 +104,7 @@ import org.apache.hadoop.hive.serde2.SerDeException;
 import org.apache.hadoop.hive.serde2.lazy.LazySimpleSerDe;
 import org.apache.hadoop.mapred.InputFormat;
 import org.apache.hadoop.util.StringUtils;
+import org.apache.hadoop.security.UserGroupInformation;
 import org.apache.thrift.TException;
 
 import com.google.common.collect.Sets;
@@ -123,6 +124,7 @@ public class Hive {
 
   private HiveConf conf = null;
   private IMetaStoreClient metaStoreClient;
+  private UserGroupInformation owner;
 
   private static ThreadLocal<Hive> hiveDB = new ThreadLocal<Hive>() {
     @Override
@@ -179,7 +181,11 @@ public class Hive {
    */
   public static Hive get(HiveConf c, boolean needsRefresh) throws HiveException {
     Hive db = hiveDB.get();
-    if (db == null || needsRefresh) {
+    if (db == null || needsRefresh || !db.isCurrentUserOwner()) {
+      if (db != null) {
+        LOG.debug("Creating new db. db = " + db + ", needsRefresh = " + needsRefresh +
+          ", db.isCurrentUserOwner = " + db.isCurrentUserOwner());
+      }
       closeCurrent();
       c.set("fs.scheme.class", "dfs");
       Hive newdb = new Hive(c);
@@ -192,6 +198,11 @@ public class Hive {
 
   public static Hive get() throws HiveException {
     Hive db = hiveDB.get();
+    if (db != null && !db.isCurrentUserOwner()) {
+      LOG.debug("Creating new db. db.isCurrentUserOwner = " + db.isCurrentUserOwner());
+      db.close();
+      db = null;
+    }
     if (db == null) {
       db = new Hive(new HiveConf(Hive.class));
       hiveDB.set(db);
@@ -217,6 +228,17 @@ public class Hive {
   private Hive(HiveConf c) throws HiveException {
     conf = c;
   }
+
+
+  private boolean isCurrentUserOwner() throws HiveException {
+    try {
+      return owner == null || owner.equals(UserGroupInformation.getCurrentUser());
+    } catch(IOException e) {
+      throw new HiveException("Error getting current user: " + e.getMessage(), e);
+    }
+  }
+
+
 
   /**
    * closes the connection to metastore for the calling thread
@@ -850,6 +872,23 @@ public class Hive {
 
   /**
    * Drops table along with the data in it. If the table doesn't exist then it
+   * is a no-op. If ifPurge option is specified it is passed to the
+   * hdfs command that removes table data from warehouse to make it skip trash.
+   *
+   * @param tableName
+   *          table to drop
+   * @param ifPurge
+   *          completely purge the table (skipping trash) while removing data from warehouse
+   * @throws HiveException
+   *           thrown if the drop fails
+   */
+  public void dropTable(String tableName, boolean ifPurge) throws HiveException {
+    String[] names = Utilities.getDbTableName(tableName);
+    dropTable(names[0], names[1], true, true, ifPurge);
+  }
+
+  /**
+   * Drops table along with the data in it. If the table doesn't exist then it
    * is a no-op
    *
    * @param tableName
@@ -859,7 +898,7 @@ public class Hive {
    */
   public void dropTable(String tableName) throws HiveException {
     Table t = newTable(tableName);
-    dropTable(t.getDbName(), t.getTableName(), true, true);
+    dropTable(t.getDbName(), t.getTableName(), true, true, false);
   }
 
   /**
@@ -874,7 +913,7 @@ public class Hive {
    *           thrown if the drop fails
    */
   public void dropTable(String dbName, String tableName) throws HiveException {
-    dropTable(dbName, tableName, true, true);
+    dropTable(dbName, tableName, true, true, false);
   }
 
   /**
@@ -885,14 +924,31 @@ public class Hive {
    * @param deleteData
    *          deletes the underlying data along with metadata
    * @param ignoreUnknownTab
-   *          an exception if thrown if this is falser and table doesn't exist
+   *          an exception is thrown if this is false and the table doesn't exist
    * @throws HiveException
    */
   public void dropTable(String dbName, String tableName, boolean deleteData,
       boolean ignoreUnknownTab) throws HiveException {
+    dropTable(dbName, tableName, deleteData, ignoreUnknownTab, false);
+  }
 
+  /**
+   * Drops the table.
+   *
+   * @param dbName
+   * @param tableName
+   * @param deleteData
+   *          deletes the underlying data along with metadata
+   * @param ignoreUnknownTab
+   *          an exception is thrown if this is false and the table doesn't exist
+   * @param ifPurge
+   *          completely purge the table skipping trash while removing data from warehouse
+   * @throws HiveException
+   */
+  public void dropTable(String dbName, String tableName, boolean deleteData,
+      boolean ignoreUnknownTab, boolean ifPurge) throws HiveException {
     try {
-      getMSC().dropTable(dbName, tableName, deleteData, ignoreUnknownTab);
+      getMSC().dropTable(dbName, tableName, deleteData, ignoreUnknownTab, ifPurge);
     } catch (NoSuchObjectException e) {
       if (!ignoreUnknownTab) {
         throw new HiveException(e);
@@ -1685,6 +1741,7 @@ private void constructOneLBLocationMap(FileStatus fSta,
   public List<Partition> dropPartitions(String dbName, String tblName,
       List<DropTableDesc.PartSpec> partSpecs,  boolean deleteData, boolean ignoreProtection,
       boolean ifExists) throws HiveException {
+    //TODO: add support for ifPurge
     try {
       Table tbl = getTable(dbName, tblName);
       List<ObjectPair<Integer, byte[]>> partExprs =
@@ -2462,6 +2519,13 @@ private void constructOneLBLocationMap(FileStatus fSta,
   @Unstable
   public IMetaStoreClient getMSC() throws MetaException {
     if (metaStoreClient == null) {
+      try {
+        owner = UserGroupInformation.getCurrentUser();
+      } catch(IOException e) {
+        String msg = "Error getting current user: " + e.getMessage();
+        LOG.error(msg, e);
+        throw new MetaException(msg + "\n" + StringUtils.stringifyException(e));
+      }
       metaStoreClient = createMetaStoreClient();
     }
     return metaStoreClient;

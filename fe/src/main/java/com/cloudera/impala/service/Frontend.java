@@ -682,14 +682,21 @@ public class Frontend {
         tablesMissingStats.add(scanNode.getTupleDesc().getTableName().toThrift());
       }
     }
+    queryExecRequest.setHost_list(analysisResult.getAnalyzer().getHostIndex().getList());
     for (TTableName tableName: tablesMissingStats) {
       queryCtx.addToTables_missing_stats(tableName);
     }
 
     // Compute resource requirements after scan range locations because the cost
     // estimates of scan nodes rely on them.
-    planner.computeResourceReqs(fragments, true, queryCtx.request.query_options,
-        queryExecRequest);
+    try {
+      planner.computeResourceReqs(fragments, true, queryCtx.request.query_options,
+          queryExecRequest);
+    } catch (Exception e) {
+      // Turn exceptions into a warning to allow the query to execute.
+      LOG.error("Failed to compute resource requirements for query\n" +
+          queryCtx.request.getStmt(), e);
+    }
 
     // The fragment at this point has all state set, serialize it to thrift.
     for (PlanFragment fragment: fragments) {

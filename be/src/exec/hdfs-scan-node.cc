@@ -24,6 +24,7 @@
 #include <sstream>
 #include <boost/algorithm/string.hpp>
 #include <boost/foreach.hpp>
+#include <boost/filesystem.hpp>
 
 #include <hdfs.h>
 
@@ -85,7 +86,8 @@ HdfsScanNode::HdfsScanNode(ObjectPool* pool, const TPlanNode& tnode,
       disks_accessed_bitmap_(TCounterType::UNIT, 0),
       done_(false),
       all_ranges_started_(false),
-      counters_running_(false) {
+      counters_running_(false),
+      rm_callback_id_(0) {
   max_materialized_row_batches_ = FLAGS_max_row_batches;
   if (max_materialized_row_batches_ <= 0) {
     // TODO: This parameter has an U-shaped effect on performance: increasing the value
@@ -415,19 +417,21 @@ Status HdfsScanNode::Prepare(RuntimeState* state) {
   for (int i = 0; i < scan_range_params_->size(); ++i) {
     DCHECK((*scan_range_params_)[i].scan_range.__isset.hdfs_file_split);
     const THdfsFileSplit& split = (*scan_range_params_)[i].scan_range.hdfs_file_split;
-    const string& path = split.path;
     partition_id_set.insert(split.partition_id);
+    HdfsPartitionDescriptor* partition_desc =
+        hdfs_table_->GetPartition(split.partition_id);
+    filesystem::path file_path(partition_desc->location());
+    file_path.append(split.file_name, filesystem::path::codecvt());
+    const string& native_file_path = file_path.native();
 
     HdfsFileDesc* file_desc = NULL;
-    FileDescMap::iterator file_desc_it = file_descs_.find(path);
+    FileDescMap::iterator file_desc_it = file_descs_.find(native_file_path);
     if (file_desc_it == file_descs_.end()) {
       // Add new file_desc to file_descs_ and per_type_files_
-      file_desc = runtime_state_->obj_pool()->Add(new HdfsFileDesc(path));
-      file_descs_[path] = file_desc;
+      file_desc = runtime_state_->obj_pool()->Add(new HdfsFileDesc(native_file_path));
+      file_descs_[native_file_path] = file_desc;
       file_desc->file_length = split.file_length;
 
-      HdfsPartitionDescriptor* partition_desc =
-          hdfs_table_->GetPartition(split.partition_id);
       if (partition_desc == NULL) {
         stringstream ss;
         ss << "Could not find partition with id: " << split.partition_id;
@@ -531,7 +535,7 @@ Status HdfsScanNode::Open(RuntimeState* state) {
       bind<void>(mem_fn(&HdfsScanNode::ThreadTokenAvailableCb), this, _1));
 
   if (runtime_state_->query_resource_mgr() != NULL) {
-    runtime_state_->query_resource_mgr()->AddVcoreAvailableCb(
+    rm_callback_id_ = runtime_state_->query_resource_mgr()->AddVcoreAvailableCb(
         bind<void>(mem_fn(&HdfsScanNode::ThreadTokenAvailableCb), this,
             runtime_state_->resource_pool()));
   }
@@ -616,6 +620,10 @@ void HdfsScanNode::Close(RuntimeState* state) {
   SetDone();
 
   state->resource_pool()->SetThreadAvailableCb(NULL);
+  if (state->query_resource_mgr() != NULL) {
+    state->query_resource_mgr()->RemoveVcoreAvailableCb(rm_callback_id_);
+  }
+
   scanner_threads_.JoinAll();
 
   // All conjuncts should have been released

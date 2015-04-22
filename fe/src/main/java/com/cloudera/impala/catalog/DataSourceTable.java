@@ -15,6 +15,7 @@
 package com.cloudera.impala.catalog;
 
 import java.util.List;
+import java.util.Set;
 
 import org.apache.hadoop.hive.metastore.HiveMetaStoreClient;
 import org.apache.hadoop.hive.metastore.api.FieldSchema;
@@ -142,8 +143,7 @@ public class DataSourceTable extends Table {
     for (FieldSchema s: fieldSchemas) {
       Column col = new Column(s.getName(), parseColumnType(s), s.getComment(), pos);
       Preconditions.checkArgument(isSupportedColumnType(col.getType()));
-      colsByPos_.add(col);
-      colsByName_.put(s.getName(), col);
+      addColumn(col);
       ++pos;
     }
   }
@@ -217,9 +217,9 @@ public class DataSourceTable extends Table {
   }
 
   @Override
-  public TTableDescriptor toThriftDescriptor() {
+  public TTableDescriptor toThriftDescriptor(Set<Long> referencedPartitions) {
     TTableDescriptor tableDesc = new TTableDescriptor(id_.asInt(),
-        TTableType.DATA_SOURCE_TABLE, colsByPos_.size(), numClusteringCols_, name_,
+        TTableType.DATA_SOURCE_TABLE, getColumns().size(), numClusteringCols_, name_,
         db_.getName());
     tableDesc.setDataSourceTable(getDataSourceTable());
     tableDesc.setColNames(getColumnNames());

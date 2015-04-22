@@ -14,6 +14,16 @@ Release 2.4.1 - 2014-06-23
 
   BUG FIXES 
 
+    HD-725. 200-04-05.sc1 hdfs_balancer - Dispatcher thread failed (Chris+raviprak)
+
+    HDFS-6462. NFS: fsstat request fails with the secure hdfs (brandonli)
+
+    HDFS-7309. XMLUtils.mangleXmlString doesn't seem to handle less than sign.
+    (Colin Patrick McCabe via raviprak)
+
+    HDFS-7287. The OfflineImageViewer (OIV) can output invalid XML depending on
+    the filename (Ravi Prakash via Colin P. McCabe)
+
     HDFS-6189. Multiple HDFS tests fail on Windows attempting to use a test
     root path containing a colon.  (cnauroth via szetszwo) 
 
@@ -91,6 +101,9 @@ Release 2.4.1 - 2014-06-23
 
     HDFS-6527. Edit log corruption due to defered INode removal. (kihwal and
     jing9 via jing9)
+    
+    HDFS-7232. Populate hostname in httpfs audit log (Zoran Dimitrijevic 
+    via aw)
 
 Release 2.4.0 - 2014-04-07 
 

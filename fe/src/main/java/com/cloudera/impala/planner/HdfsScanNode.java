@@ -31,6 +31,7 @@ import com.cloudera.impala.analysis.Analyzer;
 import com.cloudera.impala.analysis.BinaryPredicate;
 import com.cloudera.impala.analysis.BinaryPredicate.Operator;
 import com.cloudera.impala.analysis.CompoundPredicate;
+import com.cloudera.impala.analysis.DescriptorTable;
 import com.cloudera.impala.analysis.Expr;
 import com.cloudera.impala.analysis.InPredicate;
 import com.cloudera.impala.analysis.IsNullPredicate;
@@ -98,9 +99,6 @@ public class HdfsScanNode extends ScanNode {
   // Partitions that are filtered in for scanning by the key ranges
   private final ArrayList<HdfsPartition> partitions_ = Lists.newArrayList();
 
-  // List of scan-range locations. Populated in init().
-  private List<TScanRangeLocations> scanRanges_;
-
   // Total number of bytes from partitions_
   private long totalBytes_ = 0;
 
@@ -147,8 +145,7 @@ public class HdfsScanNode extends ScanNode {
     computeStats(analyzer);
 
     // compute scan range locations
-    computeScanRangeLocations(analyzer.getQueryCtx().getRequest().getQuery_options()
-        .getMax_scan_range_length());
+    computeScanRangeLocations(analyzer);
 
     // TODO: do we need this?
     assignedConjuncts_ = analyzer.getAssignedConjuncts();
@@ -158,7 +155,9 @@ public class HdfsScanNode extends ScanNode {
    * Computes scan ranges (hdfs splits) plus their storage locations, including volume
    * ids, based on the given maximum number of bytes each scan range should scan.
    */
-  private void computeScanRangeLocations(long maxScanRangeLength) {
+  private void computeScanRangeLocations(Analyzer analyzer) {
+    long maxScanRangeLength = analyzer.getQueryCtx().getRequest().getQuery_options()
+        .getMax_scan_range_length();
     scanRanges_ = Lists.newArrayList();
     for (HdfsPartition partition: partitions_) {
       Preconditions.checkState(partition.getId() >= 0);
@@ -171,29 +170,22 @@ public class HdfsScanNode extends ScanNode {
             // TODO: do something meaningful with that
             continue;
           }
-
-          // Look up the network addresses of all hosts (datanodes) that contain
-          // replicas of this block.
-          List<TNetworkAddress> blockNetworkAddresses =
-              new ArrayList<TNetworkAddress>(replicaHostIdxs.size());
-          for (Integer replicaHostId: replicaHostIdxs) {
-            TNetworkAddress blockNetworkAddress =
-                partition.getTable().getNetworkAddressByIdx(replicaHostId);
-            Preconditions.checkNotNull(blockNetworkAddress);
-            blockNetworkAddresses.add(blockNetworkAddress);
-          }
-
-          // record host/ports and volume ids
-          Preconditions.checkState(blockNetworkAddresses.size() > 0);
+          // Collect the network address and volume ID of all replicas of this block.
           List<TScanRangeLocation> locations = Lists.newArrayList();
-          for (int i = 0; i < blockNetworkAddresses.size(); ++i) {
+          for (int i = 0; i < replicaHostIdxs.size(); ++i) {
             TScanRangeLocation location = new TScanRangeLocation();
-            location.setServer(blockNetworkAddresses.get(i));
+            // Translate from the host index (local to the HdfsTable) to network address.
+            Integer tableHostIdx = replicaHostIdxs.get(i);
+            TNetworkAddress networkAddress =
+                partition.getTable().getHostIndex().getEntry(tableHostIdx);
+            Preconditions.checkNotNull(networkAddress);
+            // Translate from network address to the global (to this request) host index.
+            Integer globalHostIdx = analyzer.getHostIndex().getIndex(networkAddress);
+            location.setHost_idx(globalHostIdx);
             location.setVolume_id(block.getDiskId(i));
             location.setIs_cached(block.isCached(i));
             locations.add(location);
           }
-
           // create scan ranges, taking into account maxScanRangeLength
           long currentOffset = block.getOffset();
           long remainingLength = block.getLength();
@@ -204,8 +196,7 @@ public class HdfsScanNode extends ScanNode {
             }
             TScanRange scanRange = new TScanRange();
             scanRange.setHdfs_file_split(new THdfsFileSplit(
-                new Path(partition.getLocation(), fileDesc.getFileName()).toString(),
-                currentOffset, currentLength, partition.getId(),
+                fileDesc.getFileName(), currentOffset, currentLength, partition.getId(),
                 fileDesc.getFileLength()));
             TScanRangeLocations scanRangeLocations = new TScanRangeLocations();
             scanRangeLocations.scan_range = scanRange;
@@ -474,11 +465,11 @@ public class HdfsScanNode extends ScanNode {
    */
   private void prunePartitions(Analyzer analyzer)
       throws InternalException, AuthorizationException {
+    DescriptorTable descTbl = analyzer.getDescTbl();
     // loop through all partitions and prune based on applicable conjuncts;
     // start with creating a collection of partition filters for the applicable conjuncts
     List<SlotId> partitionSlots = Lists.newArrayList();
-    for (SlotDescriptor slotDesc:
-        analyzer.getDescTbl().getTupleDesc(tupleIds_.get(0)).getSlots()) {
+    for (SlotDescriptor slotDesc: descTbl.getTupleDesc(tupleIds_.get(0)).getSlots()) {
       Preconditions.checkState(slotDesc.getColumn() != null);
       if (slotDesc.getColumn().getPosition() < tbl_.getNumClusteringCols()) {
         partitionSlots.add(slotDesc.getId());
@@ -533,7 +524,10 @@ public class HdfsScanNode extends ScanNode {
     // Populate the list of valid partitions to process
     HashMap<Long, HdfsPartition> partitionMap = tbl_.getPartitionMap();
     for (Long id: matchingPartitionIds) {
-      partitions_.add(partitionMap.get(id));
+      HdfsPartition partition = partitionMap.get(id);
+      Preconditions.checkNotNull(partition);
+      partitions_.add(partition);
+      descTbl.addReferencedPartition(tbl_, partition.getId());
     }
   }
 
@@ -651,12 +645,6 @@ public class HdfsScanNode extends ScanNode {
     // TODO: retire this once the migration to the new plan is complete
     msg.hdfs_scan_node = new THdfsScanNode(desc_.getId().asInt());
     msg.node_type = TPlanNodeType.HDFS_SCAN_NODE;
-  }
-
-  @Override
-  public List<TScanRangeLocations> getScanRangeLocations() {
-    Preconditions.checkNotNull(scanRanges_, "Need to call init() first.");
-    return scanRanges_;
   }
 
   @Override
