@@ -642,13 +642,25 @@ public class CatalogOpExecutor {
       case TIMESTAMP: // Hive and Impala use LongColumnStatsData for timestamps.
         // TODO: Gather and set the min/max values stats as well. The planner
         // currently does not rely on them.
-        colStatsData.setLongStats(new LongColumnStatsData(numNulls, ndvs));
+        // Altiscale SI-164: use supported constructor
+        // for hive 0.13.1 compatibility.
+        LongColumnStatsData lcsd = new LongColumnStatsData();
+        lcsd.clear();
+        lcsd.setNumNulls(numNulls);
+        lcsd.setNumDVs(ndvs);
+        colStatsData.setLongStats(lcsd);
         break;
       case FLOAT:
       case DOUBLE:
         // TODO: Gather and set the min/max values stats as well. The planner
         // currently does not rely on them.
-        colStatsData.setDoubleStats(new DoubleColumnStatsData(numNulls, ndvs));
+        // Altiscale SI-164: use supported constructor
+        // for hive 0.13.1 compatibility.
+        DoubleColumnStatsData dcsd = new DoubleColumnStatsData();
+        dcsd.clear();
+        dcsd.setNumNulls(numNulls);
+        dcsd.setNumDVs(ndvs);
+        colStatsData.setDoubleStats(dcsd);
         break;
       case STRING:
         long maxStrLen = colStats.getMax_size();
@@ -660,7 +672,9 @@ public class CatalogOpExecutor {
         // TODO: Gather and set the min/max values stats as well. The planner
         // currently does not rely on them.
         colStatsData.setDecimalStats(
-            new DecimalColumnStatsData(numNulls, ndvs));
+            // Altiscale SI-164: set lowValue = highValue = null
+            // for hive 0.13.1 compatibility.
+            new DecimalColumnStatsData(null, null, numNulls, ndvs));
         break;
       default:
         return null;
