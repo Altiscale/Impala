@@ -82,7 +82,7 @@ export IMPALA_CYRUS_SASL_INSTALL_DIR=/tmp/impala-build/cyrus-sasl-${IMPALA_CYRUS
 
 export IMPALA_HADOOP_VERSION=2.4.1
 export IMPALA_HBASE_VERSION=0.98.6-cdh5.3.2
-export IMPALA_HIVE_VERSION=0.13.1-cdh5.3.2
+export IMPALA_HIVE_VERSION=0.13.1
 export IMPALA_SENTRY_VERSION=1.4.0-cdh5.3.2
 export IMPALA_LLAMA_VERSION=1.0.0-cdh5.3.2
 export IMPALA_AVRO_VERSION=1.7.4
@@ -110,7 +110,7 @@ export MINIKDC_HOME=$IMPALA_HOME/thirdparty/llama-minikdc-${IMPALA_MINIKDC_VERSI
 export SENTRY_HOME=$IMPALA_HOME/thirdparty/sentry-${IMPALA_SENTRY_VERSION}
 export SENTRY_CONF_DIR=$IMPALA_HOME/fe/src/test/resources
 
-export HIVE_HOME=$IMPALA_HOME/thirdparty/hive-${IMPALA_HIVE_VERSION}/
+export HIVE_HOME=/opt/hive-0.13.1
 export PATH=$HIVE_HOME/bin:$PATH
 export HIVE_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 
