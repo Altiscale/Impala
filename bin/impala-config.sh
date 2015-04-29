@@ -80,7 +80,7 @@ export IMPALA_SQUEASEL_VERSION=3.3
 # packaging jobs, the path contains ~ so we'll just install somewhere else.
 export IMPALA_CYRUS_SASL_INSTALL_DIR=/tmp/impala-build/cyrus-sasl-${IMPALA_CYRUS_SASL_VERSION}/build
 
-export IMPALA_HADOOP_VERSION=2.5.0-cdh5.3.2
+export IMPALA_HADOOP_VERSION=2.4.1
 export IMPALA_HBASE_VERSION=0.98.6-cdh5.3.2
 export IMPALA_HIVE_VERSION=0.13.1-cdh5.3.2
 export IMPALA_SENTRY_VERSION=1.4.0-cdh5.3.2
@@ -100,7 +100,7 @@ export IMPALA_AUX_DATASET_DIR=$IMPALA_AUX_TEST_HOME/testdata/datasets
 export IMPALA_COMMON_DIR=$IMPALA_HOME/common
 export PATH=$IMPALA_HOME/bin:$PATH
 
-export HADOOP_HOME=$IMPALA_HOME/thirdparty/hadoop-${IMPALA_HADOOP_VERSION}/
+export HADOOP_HOME=/opt/hadoop-2.4.1
 export HADOOP_CONF_DIR=$IMPALA_FE_DIR/src/test/resources
 export MINI_DFS_BASE_DATA_DIR=$IMPALA_HOME/cdh-${CDH_MAJOR_VERSION}-hdfs-data
 export PATH=$HADOOP_HOME/bin:$PATH
