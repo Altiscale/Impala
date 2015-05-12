@@ -71,11 +71,45 @@
       <version>${hadoop.version}</version>
     </dependency>
 
+    <!-- Altiscale: add explicit dependencies associated with Hadoop version BEGIN -->
+
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-mapreduce-client-common</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-mapreduce-client-jobclient</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-mapreduce-client-shuffle</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-yarn-client</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+
     <dependency>
       <groupId>org.apache.hadoop</groupId>
       <artifactId>hadoop-yarn-api</artifactId>
       <version>${hadoop.version}</version>
     </dependency>
+
+    <dependency>
+      <groupId>org.apache.hadoop</groupId>
+      <artifactId>hadoop-yarn-server-nodemanager</artifactId>
+      <version>${hadoop.version}</version>
+    </dependency>
+
+    <!-- Altiscale: add explicit dependencies associated with Hadoop version END -->
 
     <dependency>
       <groupId>org.apache.hadoop</groupId>
