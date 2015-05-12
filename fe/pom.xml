@@ -109,6 +109,12 @@
       <version>${hadoop.version}</version>
     </dependency>
 
+    <dependency>
+      <groupId>org.apache.hive</groupId>
+      <artifactId>hive-beeline</artifactId>
+      <version>${hive.version}</version>
+    </dependency>
+
     <!-- Altiscale: add explicit dependencies associated with Hadoop version END -->
 
     <dependency>
