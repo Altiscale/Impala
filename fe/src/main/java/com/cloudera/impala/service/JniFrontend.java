@@ -531,7 +531,9 @@ public class JniFrontend {
 
     if (guessedCdhVersion == null) {
       // Do not run any additional checks because we cannot determine the CDH version
-      LOG.warn("Cannot detect CDH version. Skipping Hadoop configuration checks");
+      // Altiscale: This message is expected, and there for should be
+      // at info level, not warning level.
+      LOG.info("Cannot detect CDH version. Skipping Hadoop configuration checks");
       return output.toString();
     }
 
